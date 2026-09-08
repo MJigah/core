@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
@@ -223,8 +223,40 @@ pub async fn run_with_shutdown(
     });
 
     loop {
+        // Poll every contract concurrently, as documented: one slow or failing
+        // Horizon response must not hold up the others. Each task owns its own
+        // cursor entry and the results are merged back afterwards.
+        let mut set = tokio::task::JoinSet::new();
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            let client = client.clone();
+            let contract = contract.clone();
+            let cursor = cursors.get(&contract.contract_id).cloned();
+            set.spawn(async move {
+                let mut local: HashMap<String, String> = HashMap::new();
+                if let Some(c) = cursor {
+                    local.insert(contract.contract_id.clone(), c);
+                }
+                let result = poll_contract(&client, &contract, &mut local, dry_run).await;
+                let advanced = local.get(&contract.contract_id).cloned();
+                (contract.contract_id.clone(), advanced, result)
+            });
+        }
+
+        let mut results = Vec::with_capacity(cfg.contracts.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((id, advanced, result)) => {
+                    if let Some(c) = advanced {
+                        cursors.insert(id, c);
+                    }
+                    results.push(result);
+                }
+                Err(e) => error!(error = %e, "contract polling task panicked"),
+            }
+        }
+
+        for result in results {
+            match result {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -323,6 +355,18 @@ async fn poll_contract(
             warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
             return Ok((0, 0));
+        }
+
+        // Only 429 is special-cased above; every other non-success status used to
+        // fall through to `.json()`, so a 5xx surfaced as a parse error and the
+        // real status code was lost.
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(anyhow!(
+                "Horizon request to {} failed with HTTP {}",
+                url,
+                status
+            ));
         }
 
         let page: HorizonPage = response
@@ -915,7 +959,10 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false)
+        // dry_run: this test covers pagination, not delivery. Sending 201 real
+        // webhooks at an unmocked endpoint made each one retry with exponential
+        // backoff, which took ~20 minutes of CI time. Alerts are still counted.
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, true)
             .await
             .unwrap();
         assert_eq!(txs, 201);

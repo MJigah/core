@@ -136,7 +136,9 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_connection_verbose: None,
     };
 
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    // Under a 1s poll interval this window must stay inside a single cycle, or
+    // the mock below sees two requests instead of the one it expects.
+    let _ = tokio::time::timeout(Duration::from_millis(900), txwatch_poller::run(cfg)).await;
 }
 
 #[tokio::test]
@@ -180,7 +182,9 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_connection_verbose: None,
     };
 
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    // Under a 1s poll interval this window must stay inside a single cycle, or
+    // the mock below sees two requests instead of the one it expects.
+    let _ = tokio::time::timeout(Duration::from_millis(900), txwatch_poller::run(cfg)).await;
 }
 
 /// AnyTransaction rule fires and webhook is called exactly once.
@@ -872,9 +876,25 @@ async fn contracts_polled_concurrently() {
         cursor_file: None,
     };
 
+    // `run` loops forever, so timing a `timeout` around it just measures the
+    // timeout window. Drive the shutdown-aware entry point instead and stop the
+    // clock once both contracts have delivered, which is what "concurrent"
+    // actually means here.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let start = std::time::Instant::now();
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
-    let elapsed = start.elapsed();
+    let handle = tokio::spawn(txwatch_poller::run_with_shutdown(cfg, false, shutdown_rx));
+
+    let elapsed = loop {
+        if receiver.received_requests().await.unwrap_or_default().len() >= 2 {
+            break start.elapsed();
+        }
+        if start.elapsed() > Duration::from_millis(5000) {
+            break start.elapsed();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(2000), handle).await;
 
     // Sequential polling would take ≥ 2 × DELAY_MS. Concurrent polling takes ≈ DELAY_MS.
     // We allow generous headroom (1.8×) to avoid flakiness on slow CI.
