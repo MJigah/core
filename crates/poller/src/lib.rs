@@ -19,6 +19,9 @@ use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
+pub mod db_snapshot;
+pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
+
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
 
 #[cfg(feature = "metrics")]
