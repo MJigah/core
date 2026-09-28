@@ -440,3 +440,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-39 -->
+- #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
+
+<!-- handsoff-issue-41 -->
+- #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive
