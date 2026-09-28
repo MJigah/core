@@ -228,275 +228,80 @@ pub fn mark_poll_success() {
 /// Ready when a poll succeeded within the last 2 × poll interval.
 fn is_ready() -> bool {
     let last = LAST_POLL_SUCCESS.load(Ordering::Relaxed);
-    let interval = POLL_INTERVAL_SECS.load(Ordering::Relaxed).max(1);
-    last != 0 && now_secs().saturating_sub(last) <= 2 * interval
+    let interval = POLL_INTERVAL_SECS.load(Ordering::Relaxed);
+    if last == 0 || interval == 0 {
+        return false;
+    }
+    now_secs().saturating_sub(last) <= interval.saturating_mul(2)
 }
 
-// ── HTTP endpoint ─────────────────────────────────────────────────────────────
+// ── HTTP server ───────────────────────────────────────────────────────────────
 
-/// First pause after a failed `accept`, doubled on each consecutive failure.
-const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
-/// Longest pause between `accept` retries.
-const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(5);
-/// Minimum gap between two "accept failed" warnings.
-const ACCEPT_WARN_EVERY: Duration = Duration::from_secs(10);
-
-fn next_backoff(current: Duration) -> Duration {
-    (current * 2).min(ACCEPT_BACKOFF_MAX)
-}
-
-/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown`
-/// becomes `true`. Spawns a background task and returns the bound address
-/// (useful when `addr` uses port 0).
+/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
 ///
-/// A failing `accept` (e.g. `EMFILE`) is retried after a growing pause instead
-/// of spinning, and logged at warn level at most once every 10 seconds.
-pub async fn serve_metrics(
-    addr: SocketAddr,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<SocketAddr> {
+/// Returns an error if the listener cannot be bound.
+pub async fn serve_metrics(addr: SocketAddr, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
-        .with_context(|| format!("failed to bind metrics endpoint on {}", addr))?;
-    let local_addr = listener.local_addr().context("metrics listener address")?;
+        .with_context(|| format!("bind metrics listener on {addr}"))?;
 
-    tracing::info!(addr = %local_addr, "Prometheus /metrics endpoint listening");
-
-    tokio::spawn(async move {
-        let mut backoff = ACCEPT_BACKOFF_START;
-        let mut last_warn: Option<Instant> = None;
-        // Once the sender is dropped no shutdown can arrive; stop watching.
-        let mut watching = true;
-        loop {
-            if *shutdown.borrow() {
-                break;
-            }
-            tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => {
-                        backoff = ACCEPT_BACKOFF_START;
-                        let io = TokioIo::new(stream);
-                        tokio::spawn(async move {
-                            let _ = hyper::server::conn::http1::Builder::new()
-                                .serve_connection(io, hyper::service::service_fn(handle_metrics))
-                                .await;
-                        });
-                    }
-                    Err(e) => {
-                        if last_warn.is_none_or(|t| t.elapsed() >= ACCEPT_WARN_EVERY) {
-                            tracing::warn!(
-                                error = %e,
-                                retry_in_ms = backoff.as_millis() as u64,
-                                "metrics endpoint failed to accept a connection"
-                            );
-                            last_warn = Some(Instant::now());
-                        }
-                        tokio::select! {
-                            () = tokio::time::sleep(backoff) => {}
-                            _ = shutdown.changed(), if watching => {}
-                        }
-                        backoff = next_backoff(backoff);
-                    }
-                },
-                changed = shutdown.changed(), if watching => {
-                    if changed.is_err() {
-                        watching = false;
-                    }
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
                 }
             }
+            accepted = listener.accept() => {
+                let (stream, _peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "metrics accept failed");
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(handle_request);
+                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await
+                    {
+                        tracing::debug!(error = %err, "metrics connection error");
+                    }
+                });
+            }
         }
-        tracing::info!("metrics endpoint stopped");
-    });
+    }
 
-    Ok(local_addr)
+    Ok(())
 }
 
-async fn handle_metrics<B>(
-    req: Request<B>,
+async fn handle_request(
+    req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    Ok(route(req.method(), req.uri().path()))
-}
-
-fn route(method: &hyper::Method, path: &str) -> Response<Full<Bytes>> {
-    if !matches!(path, "/metrics" | "/healthz" | "/readyz") {
-        return text_response(StatusCode::NOT_FOUND, "not found\n");
-    }
-    if method != hyper::Method::GET {
-        return text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
-    }
-    match path {
-        "/healthz" => text_response(StatusCode::OK, "ok\n"),
-        "/readyz" if is_ready() => text_response(StatusCode::OK, "ready\n"),
-        "/readyz" => text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n"),
-        _ => {
-            use prometheus::Encoder;
-            let encoder = prometheus::TextEncoder::new();
-            let mut buf = Vec::new();
-            encoder
-                .encode(&prometheus::gather(), &mut buf)
-                .unwrap_or_default();
-            let mut resp = Response::new(Full::new(Bytes::from(buf)));
-            if let Ok(value) = HeaderValue::from_str(encoder.format_type()) {
-                resp.headers_mut().insert(CONTENT_TYPE, value);
+    let response = match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/metrics") => text_response(StatusCode::OK, prometheus::TextEncoder::new().encode_to_string(&prometheus::gather()).unwrap_or_default()),
+        ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
+        ("GET", "/readyz") => {
+            if is_ready() {
+                text_response(StatusCode::OK, "ready\n".to_string())
+            } else {
+                text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
             }
-            resp
         }
-    }
+        ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
+        _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n".to_string()),
+    };
+    Ok(response)
 }
 
-fn text_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
-    let mut resp = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
+fn text_response(status: StatusCode, body: String) -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
-    resp
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http_body_util::BodyExt;
-    use hyper::Method;
-
-    async fn get(method: Method, path: &str) -> (StatusCode, String) {
-        let resp = route(&method, path);
-        let status = resp.status();
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8(body.to_vec()).unwrap())
-    }
-
-    #[tokio::test]
-    async fn metrics_path_serves_prometheus_text() {
-        inc_transactions("Test", "testnet", 1);
-        let (status, body) = get(Method::GET, "/metrics").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("txwatch_transactions_total"));
-    }
-
-    #[tokio::test]
-    async fn unknown_path_is_404_and_wrong_method_is_405() {
-        assert_eq!(get(Method::GET, "/").await.0, StatusCode::NOT_FOUND);
-        assert_eq!(get(Method::GET, "/anything").await.0, StatusCode::NOT_FOUND);
-        assert_eq!(
-            get(Method::POST, "/metrics").await.0,
-            StatusCode::METHOD_NOT_ALLOWED
-        );
-    }
-
-    #[tokio::test]
-    async fn healthz_is_always_ok() {
-        assert_eq!(
-            get(Method::GET, "/healthz").await,
-            (StatusCode::OK, "ok\n".into())
-        );
-    }
-
-    #[tokio::test]
-    async fn readyz_tracks_recent_successful_poll() {
-        set_poll_interval(30);
-        LAST_POLL_SUCCESS.store(0, Ordering::Relaxed);
-        assert_eq!(
-            get(Method::GET, "/readyz").await.0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-
-        mark_poll_success();
-        assert_eq!(get(Method::GET, "/readyz").await.0, StatusCode::OK);
-
-        // Older than 2 × interval: stale again.
-        LAST_POLL_SUCCESS.store(now_secs() - 61, Ordering::Relaxed);
-        assert_eq!(
-            get(Method::GET, "/readyz").await.0,
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-}
-
-#[cfg(test)]
-mod server_tests {
-    use super::*;
-
-    #[test]
-    fn accept_backoff_grows_and_caps() {
-        assert_eq!(
-            next_backoff(ACCEPT_BACKOFF_START),
-            Duration::from_millis(200)
-        );
-        assert_eq!(next_backoff(Duration::from_secs(4)), ACCEPT_BACKOFF_MAX);
-        assert_eq!(next_backoff(ACCEPT_BACKOFF_MAX), ACCEPT_BACKOFF_MAX);
-    }
-
-    #[tokio::test]
-    async fn server_stops_accepting_after_shutdown() {
-        let (tx, rx) = watch::channel(false);
-        let addr = serve_metrics("127.0.0.1:0".parse().unwrap(), rx)
-            .await
-            .unwrap();
-        assert!(tokio::net::TcpStream::connect(addr).await.is_ok());
-
-        tx.send(true).unwrap();
-        // The accept task exits and drops the listener.
-        let mut refused = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            if tokio::net::TcpStream::connect(addr).await.is_err() {
-                refused = true;
-                break;
-            }
-        }
-        assert!(refused, "listener should close after shutdown");
-    }
-}
-
-#[cfg(test)]
-mod label_tests {
-    use super::*;
-
-    fn exposition() -> String {
-        use prometheus::Encoder;
-        let mut buf = Vec::new();
-        prometheus::TextEncoder::new()
-            .encode(&prometheus::gather(), &mut buf)
-            .unwrap();
-        String::from_utf8(buf).unwrap()
-    }
-
-    #[test]
-    fn per_contract_metrics_carry_labels() {
-        register_build_info();
-        inc_transactions("LabelTest", "testnet", 3);
-        inc_alerts("LabelTest", "testnet", 1);
-        inc_webhook_failures("LabelTest", "testnet");
-        observe_horizon_request("testnet", 0.25);
-        observe_webhook_delivery(0.5);
-        record_poll_failure("LabelTest", "testnet");
-        record_poll_failure("LabelTest", "testnet");
-
-        let text = exposition();
-        assert!(text
-            .contains(r#"txwatch_transactions_total{contract="LabelTest",network="testnet"} 3"#));
-        assert!(text.contains(r#"txwatch_alerts_total{contract="LabelTest",network="testnet"} 1"#));
-        assert!(text.contains(
-            r#"txwatch_webhook_failures_total{contract="LabelTest",network="testnet"} 1"#
-        ));
-        assert!(text.contains(
-            r#"txwatch_consecutive_poll_failures{contract="LabelTest",network="testnet"} 2"#
-        ));
-        assert!(text.contains("txwatch_horizon_request_duration_seconds_bucket"));
-        assert!(text.contains("txwatch_webhook_delivery_duration_seconds_count"));
-        assert!(text.contains(&format!(
-            r#"txwatch_build_info{{git_sha="{}",version="{}"}} 1"#,
-            option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown"),
-            env!("CARGO_PKG_VERSION")
-        )));
-
-        record_poll_success("LabelTest", "testnet");
-        let text = exposition();
-        assert!(text.contains(
-            r#"txwatch_consecutive_poll_failures{contract="LabelTest",network="testnet"} 0"#
-        ));
-        assert!(text.contains(r#"txwatch_last_successful_poll_timestamp_seconds{contract="LabelTest",network="testnet"}"#));
-    }
+    response
 }

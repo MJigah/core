@@ -443,6 +443,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Handsoff notes
 
+<!-- handsoff-issue-35 -->
+- #35: HTTP timeouts for Horizon and webhooks are hard-coded to 15 seconds
+
+<!-- handsoff-issue-38 -->
+- #38: startup_log_fields test helper duplicates production logic instead of testing it
 <!-- handsoff-issue-24 -->
 - #24: No way to configure a custom Horizon URL per contract
 

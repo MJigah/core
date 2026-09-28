@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use txwatch_config::{AlertRule, Network, WatchedContract};
+use txwatch_poller::ContractState;
 use txwatch_config::{AlertRule, Network, RuleEntry, WatchedContract};
 
 pub fn rule(r: AlertRule) -> RuleEntry {
@@ -34,6 +36,12 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         webhooks: Vec::new(),
         batch_alerts: false,
     }
+}
+
+/// Construct a fresh per-contract state for tests, mirroring how each
+/// contract's task owns its own `ContractState`.
+pub fn contract_state(contract_id: &str) -> ContractState {
+    ContractState::new(contract_id.to_string())
 }
 
 pub fn tx_page(hash: &str, paging_token: &str, successful: bool) -> serde_json::Value {
