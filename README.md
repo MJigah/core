@@ -408,3 +408,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-27 -->
 - #27: A corrupt cursor_file silently resets every contract to "now"
+
+<!-- handsoff-issue-28 -->
+- #28: Ctrl-C waits for webhook retries to finish before shutting down
