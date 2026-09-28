@@ -23,6 +23,17 @@ serde_json     = { workspace = true }
 anyhow         = { workspace = true }
 chrono         = { workspace = true }
 tracing        = { workspace = true }
+
+[dev-dependencies]
+proptest   = "1"
+serde_json = { workspace = true }
 sha2           = { workspace = true }
 hex            = { workspace = true }
 stellar-xdr    = { version = "21", optional = true, default-features = false, features = ["std", "curr"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "evaluate"
+harness = false
