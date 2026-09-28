@@ -325,6 +325,8 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: true,
                 paging_token: "1".into(),
                 fee_charged: None,
+                source_account: None,
+                fee_account: None,
                 ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
@@ -342,6 +344,8 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: false,
                 paging_token: "2".into(),
                 fee_charged: None,
+                source_account: None,
+                fee_account: None,
                 ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
@@ -398,6 +402,8 @@ async fn large_transfer_fires_above_threshold() {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            source_account: None,
+            fee_account: None,
             ..Default::default()
             envelope_xdr: None,
             result_xdr: None,
@@ -457,6 +463,8 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true,
                 paging_token: "1".into(),
                 fee_charged: None,
+                source_account: None,
+                fee_account: None,
                 ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
@@ -474,6 +482,8 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true,
                 paging_token: "2".into(),
                 fee_charged: None,
+                source_account: None,
+                fee_account: None,
                 ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
@@ -579,6 +589,8 @@ async fn high_fee_rule_fires_on_fee_charged() {
             successful: true,
             paging_token: "1".into(),
             fee_charged: Some("50000".into()),
+            source_account: None,
+            fee_account: None,
             ..Default::default()
             envelope_xdr: None,
             result_xdr: None,

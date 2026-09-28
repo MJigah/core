@@ -195,9 +195,25 @@ webhook_url = "https://hooks.example.com/my-webhook"
   [[contracts.rules]]
   type           = "AdminFunctionCalled"
   function_names = ["set_admin", "upgrade", "initialize"]
+  webhook_url    = "https://hooks.example.com/critical-webhook"
+  severity       = "critical"
 
   [[contracts.rules]]
-  type = "TransactionFailed"
+  type    = "TransactionFailed"
+  enabled = false
+
+  [[contracts.rules]]
+  type  = "SourceAccount"
+  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+
+  [[contracts.rules]]
+  type = "All"
+  [[contracts.rules.rules]]
+  type          = "FunctionCalled"
+  function_name = "withdraw"
+  [[contracts.rules.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 50000
 ```
 
 ---
@@ -211,6 +227,17 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
+| `HighFee` | Transaction fee exceeds configured threshold |
+| `SourceAccount` | Transaction source account matches an allow/deny list |
+| `All` | All nested rules match (logical AND) |
+| `Any` | Any nested rule matches (logical OR) |
+| `Not` | Nested rule does not match (logical NOT) |
+
+Every rule entry also supports:
+- `enabled = false` — silence a rule without removing it; shown as `(disabled)` in `txwatch validate`
+- `webhook_url` — per-rule webhook URL override (falls back to the contract's URL)
+- `webhook_secret` — per-rule webhook secret override
+- `severity` — `info`, `warning`, or `critical`; included in the alert payload
 | `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
 | `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
 
@@ -240,6 +267,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "amount_stroops":   150000000000000,
   "amount_xlm_decimal": "15000.0000000",
   "fee_charged_stroops": 50000,
+  "source_account":   "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+  "severity":         "critical",
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
@@ -273,6 +302,8 @@ service. See [Multiple destinations](docs/configuration.md#multiple-destinations
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `source_account` — the G-address that submitted the transaction; omitted from the payload when not present on the Horizon record.
+- `severity` — the severity level set on the matching rule (`"info"`, `"warning"`, or `"critical"`); omitted when not configured.
 - `amount_xlm` — transfer amount in whole XLM (truncated integer, e.g. `9999` for a 9,999.99 XLM transfer), or `null`. Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting.
 - `amount_stroops` — raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null`.
 - `amount_xlm_decimal` — transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null`. Use this instead of `amount_xlm` when precision matters.

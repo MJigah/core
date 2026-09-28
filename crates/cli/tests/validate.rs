@@ -318,6 +318,7 @@ webhook_secret = "super-secret-value"
       "poll_interval_seconds": 10,
       "rules": [
         {
+          "enabled": true,
           "type": "AnyTransaction"
         }
       ],
