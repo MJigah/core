@@ -408,3 +408,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-24 -->
 - #24: No way to configure a custom Horizon URL per contract
+
+<!-- handsoff-issue-26 -->
+- #26: Allow a starting cursor or ledger instead of always starting from "now"
