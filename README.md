@@ -403,3 +403,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-27 -->
+- #27: A corrupt cursor_file silently resets every contract to "now"
