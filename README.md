@@ -403,3 +403,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-35 -->
+- #35: HTTP timeouts for Horizon and webhooks are hard-coded to 15 seconds
