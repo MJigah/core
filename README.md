@@ -408,3 +408,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-39 -->
 - #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
+
+<!-- handsoff-issue-41 -->
+- #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive
