@@ -443,6 +443,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Handsoff notes
 
+<!-- handsoff-issue-24 -->
+- #24: No way to configure a custom Horizon URL per contract
+
+<!-- handsoff-issue-26 -->
+- #26: Allow a starting cursor or ledger instead of always starting from "now"
 <!-- handsoff-issue-33 -->
 - #33: http_connection_verbose is parsed but never used
 
