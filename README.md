@@ -403,3 +403,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-24 -->
+- #24: No way to configure a custom Horizon URL per contract
