@@ -26,6 +26,8 @@ use txwatch_notifier::send_to_destination;
 use txwatch_notifier::{send_webhook, send_webhook_batch, MAX_BATCH_SIZE};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
+pub mod db_snapshot;
+pub use db_snapshot::{PostgresSnapshotRoutine, SnapshotMetadata};
 pub mod event_stream;
 pub use event_stream::{EventFilter, GetEventsParams, SorobanEvent, SorobanEventStreamer};
 pub mod plan_cache;
