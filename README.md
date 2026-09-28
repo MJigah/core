@@ -443,6 +443,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Handsoff notes
 
+<!-- handsoff-issue-27 -->
+- #27: A corrupt cursor_file silently resets every contract to "now"
+
+<!-- handsoff-issue-28 -->
+- #28: Ctrl-C waits for webhook retries to finish before shutting down
 <!-- handsoff-issue-39 -->
 - #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
 
