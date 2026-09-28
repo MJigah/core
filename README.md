@@ -408,3 +408,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-33 -->
 - #33: http_connection_verbose is parsed but never used
+
+<!-- handsoff-issue-34 -->
+- #34: http_tcp_keepalive_secs = 0 does not disable keepalive
