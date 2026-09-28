@@ -11,6 +11,11 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+# Enables decoding of Soroban envelope_xdr / result_xdr via the stellar-xdr crate.
+soroban-xdr = ["dep:stellar-xdr"]
+
 [dependencies]
 txwatch-config = { path = "../config", version = "0.1.0" }
 serde          = { workspace = true }
@@ -20,3 +25,4 @@ chrono         = { workspace = true }
 tracing        = { workspace = true }
 sha2           = { workspace = true }
 hex            = { workspace = true }
+stellar-xdr    = { version = "21", optional = true, default-features = false, features = ["std", "curr"] }
