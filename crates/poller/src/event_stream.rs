@@ -6,6 +6,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+/// Client name sent to Horizon/RPC operators for identification and fair rate limiting.
+const CLIENT_NAME: &str = "txwatch";
+/// Client version sent to Horizon/RPC operators for identification.
+const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// JSON-RPC 2.0 Request envelope.
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<T> {
@@ -96,7 +101,7 @@ impl SorobanEventStreamer {
             contract_ids,
             last_cursor: None,
             current_ledger: start_ledger,
-            client: Client::builder().build().unwrap_or_default(),
+            client: build_client(),
         }
     }
 
@@ -164,9 +169,34 @@ impl SorobanEventStreamer {
     }
 }
 
+/// Builds a reqwest client that identifies txwatch to Horizon/RPC operators.
+fn build_client() -> Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_str(&format!("{}/{}", CLIENT_NAME, CLIENT_VERSION))
+            .expect("valid user-agent header"),
+    );
+    headers.insert(
+        "X-Client-Name",
+        reqwest::header::HeaderValue::from_static(CLIENT_NAME),
+    );
+    headers.insert(
+        "X-Client-Version",
+        reqwest::header::HeaderValue::from_static(CLIENT_VERSION),
+    );
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_event_filter_serialization() {
@@ -179,5 +209,31 @@ mod tests {
         assert!(json.contains("contractIds"));
         assert!(json.contains("type"));
         assert!(json.contains("topics"));
+    }
+
+    #[tokio::test]
+    async fn test_horizon_requests_send_identifying_headers() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("User-Agent", format!("{}/{}", CLIENT_NAME, CLIENT_VERSION).as_str()))
+            .and(header("X-Client-Name", CLIENT_NAME))
+            .and(header("X-Client-Version", CLIENT_VERSION))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "events": [],
+                    "latestLedger": 42
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec![], 1);
+        let events = streamer.fetch_events().await.unwrap();
+        assert!(events.is_empty());
     }
 }
