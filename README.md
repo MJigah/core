@@ -195,9 +195,25 @@ webhook_url = "https://hooks.example.com/my-webhook"
   [[contracts.rules]]
   type           = "AdminFunctionCalled"
   function_names = ["set_admin", "upgrade", "initialize"]
+  webhook_url    = "https://hooks.example.com/critical-webhook"
+  severity       = "critical"
 
   [[contracts.rules]]
-  type = "TransactionFailed"
+  type    = "TransactionFailed"
+  enabled = false
+
+  [[contracts.rules]]
+  type  = "SourceAccount"
+  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+
+  [[contracts.rules]]
+  type = "All"
+  [[contracts.rules.rules]]
+  type          = "FunctionCalled"
+  function_name = "withdraw"
+  [[contracts.rules.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 50000
 ```
 
 ---
@@ -211,6 +227,17 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
+| `HighFee` | Transaction fee exceeds configured threshold |
+| `SourceAccount` | Transaction source account matches an allow/deny list |
+| `All` | All nested rules match (logical AND) |
+| `Any` | Any nested rule matches (logical OR) |
+| `Not` | Nested rule does not match (logical NOT) |
+
+Every rule entry also supports:
+- `enabled = false` — silence a rule without removing it; shown as `(disabled)` in `txwatch validate`
+- `webhook_url` — per-rule webhook URL override (falls back to the contract's URL)
+- `webhook_secret` — per-rule webhook secret override
+- `severity` — `info`, `warning`, or `critical`; included in the alert payload
 | `HighFee` | Transaction fee is greater than or equal to `threshold_stroops` (or `threshold_xlm`) |
 | `EventEmitted` | The transaction emitted a contract event whose first topic is a given symbol |
 
@@ -225,6 +252,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
 ```json
 {
+  "schema_version":     1,
+  "alert_id":           "a3f1bc20e94d77c1a3f1bc20e94d77c1",
   "alert_id":         "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":            "My Escrow Contract",
   "contract_id":      "CAAA...",
@@ -238,10 +267,13 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "amount_stroops":   150000000000000,
   "amount_xlm_decimal": "15000.0000000",
   "fee_charged_stroops": 50000,
+  "source_account":   "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+  "severity":         "critical",
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "resolved":         false
   "matched_events":   [],
   "suppressed_count": 0
 }
@@ -251,6 +283,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Type: application/json`
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
+- `X-TxWatch-Alert-Id: <alert_id>` (same value as the `alert_id` body field — usable for deduplication without parsing the body)
 - `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
 - `X-TxWatch-Secret: <webhook_secret>` (optional, only when `webhook_secret` is configured — the raw secret; verify the signature instead where possible)
 - Any custom headers from `webhook_headers` (e.g. `Authorization: Bearer ${TOKEN}`)
@@ -262,11 +295,15 @@ service. See [Multiple destinations](docs/configuration.md#multiple-destinations
 [Webhook formats](docs/configuration.md#webhook-formats).
 
 **Fields:**
+- `schema_version` — integer version of this payload shape (currently `1`). Additive changes (new optional fields) keep the same version; breaking changes (field removals or renames) bump it. Receivers should use this to detect incompatible changes.
+- `alert_id` — stable, deterministic identifier derived from `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256 prefix (32 hex chars). Identical for every retry of the same alert. Receivers should deduplicate on this value.
 - `alert_id` — stable ID of this alert (same contract, transaction and rule → same ID); use it to de-duplicate redeliveries
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `source_account` — the G-address that submitted the transaction; omitted from the payload when not present on the Horizon record.
+- `severity` — the severity level set on the matching rule (`"info"`, `"warning"`, or `"critical"`); omitted when not configured.
 - `amount_xlm` — transfer amount in whole XLM (truncated integer, e.g. `9999` for a 9,999.99 XLM transfer), or `null`. Kept for backward compatibility — use `amount_xlm_decimal` for precise accounting.
 - `amount_stroops` — raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null`.
 - `amount_xlm_decimal` — transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null`. Use this instead of `amount_xlm` when precision matters.
@@ -411,3 +448,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 <!-- handsoff-issue-28 -->
 - #28: Ctrl-C waits for webhook retries to finish before shutting down
+<!-- handsoff-issue-39 -->
+- #39: Tests sleep in real time for back-offs, slowing the suite by many seconds
+
+<!-- handsoff-issue-41 -->
+- #41: FunctionCalled is case-sensitive while AdminFunctionCalled is case-insensitive

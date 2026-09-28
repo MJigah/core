@@ -53,6 +53,8 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `contract_id`    | string          | yes      | Stellar contract StrKey (`C…`, 56 characters). The address is fully decoded: characters outside `A–Z2–7` (lowercase, `0`, `1`, `8`, `9`), a non-contract version byte (e.g. a `G…` account) and a bad checksum are each reported as a distinct error. |
 | `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
+| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `enabled`        | bool            | no       | Default `true`. Set `false` to pause monitoring this contract without removing it. Shown as `(disabled)` in `txwatch validate`. |
 | `webhook_url`    | string          | see below | `http://` or `https://` URL with a host that receives alerts. Shorthand for one destination, described by the `webhook_*` fields below. Required unless `webhooks` has at least one entry. |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
@@ -245,7 +247,27 @@ Alert payloads and logs report such contracts with `network = "custom"`. See `do
 
 ## `[[contracts.rules]]`
 
-At least one rule is required per contract. All matching rules fire independently.
+At least one rule is required per contract. All matching enabled rules fire independently.
+
+Every rule entry supports these optional fields:
+
+| Field            | Type   | Default | Description |
+|------------------|--------|---------|-------------|
+| `enabled`        | bool   | `true`  | Set `false` to silence a rule without removing it. Shown as `(disabled)` in `txwatch validate`. |
+| `webhook_url`    | string | unset   | Override the contract-level `webhook_url` for this rule only. |
+| `webhook_secret` | string | unset   | Override the contract-level `webhook_secret` for this rule only. |
+| `severity`       | string | unset   | One of `info`, `warning`, `critical`. Included as `severity` in the alert payload when set. |
+
+These fields can be combined with any rule type:
+
+```toml
+[[contracts.rules]]
+type        = "AdminFunctionCalled"
+function_names = ["set_admin", "upgrade"]
+enabled     = true
+webhook_url = "https://pagerduty.example.com/alert"
+severity    = "critical"
+```
 
 Every rule accepts an optional `cooldown_seconds` (0–604800). After the rule fires for a contract, further
 matches within that many seconds are suppressed and counted; the next alert that is sent carries the count in
@@ -287,14 +309,36 @@ threshold_xlm = 10000          # must be > 0
 ```
 
 ### `FunctionCalled`
-Fires when the Soroban invocation calls exactly `function_name` (case-sensitive).
+Fires when the Soroban invocation calls exactly `function_name` (case-sensitive) by default.
 Function names must be valid Soroban symbols: at most 32 characters from `[a-zA-Z0-9_]`
 (no spaces, hyphens or surrounding whitespace). The same applies to `AdminFunctionCalled`.
+
+An optional `match` field controls how `function_name` is compared to the invoked function:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"exact"` (default) | The invoked name must equal `function_name` exactly |
+| `"prefix"` | The invoked name must start with `function_name` |
+| `"glob"` | The invoked name must match the glob pattern in `function_name` (`*` = any sequence, `?` = one character) |
+
+Prefix and exact patterns must be valid Soroban symbols. Glob patterns may additionally contain
+`*` and `?`; all other characters must be `[a-zA-Z0-9_]` and the pattern must be ≤ 64 characters.
 
 ```toml
 [[contracts.rules]]
 type          = "FunctionCalled"
 function_name = "withdraw"
+# match = "exact"   # default; omit for backward compatibility
+
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "admin_"
+match         = "prefix"          # fires on admin_set_fee, admin_pause, etc.
+
+[[contracts.rules]]
+type          = "FunctionCalled"
+function_name = "admin_*"
+match         = "glob"            # same as prefix example above
 ```
 
 ### `AdminFunctionCalled`
@@ -317,6 +361,63 @@ type              = "HighFee"
 threshold_stroops = 1000000
 ```
 
+### `SourceAccount`
+Fires based on the transaction source account (the G-address that signed and submitted the transaction).
+
+| Field   | Type         | Required | Description |
+|---------|--------------|----------|-------------|
+| `allow` | [G-address]  | no       | If set, only fire when source is one of these addresses. |
+| `deny`  | [G-address]  | no       | If set, fire when source is one of these addresses. |
+
+At least one of `allow` or `deny` must be provided. Each entry must be a valid 56-character Stellar G-address.
+
+```toml
+# Only alert when called by an unexpected account (not the known admin)
+[[contracts.rules]]
+type  = "SourceAccount"
+deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+```
+
+The `source_account` field is included in the alert payload whenever a source account is present.
+
+### `All`
+Fires when **all** nested rules match (logical AND). Nesting is supported up to depth 5.
+
+```toml
+[[contracts.rules]]
+type = "All"
+[[contracts.rules.rules]]
+type          = "FunctionCalled"
+function_name = "withdraw"
+[[contracts.rules.rules]]
+type          = "LargeTransfer"
+threshold_xlm = 10000
+```
+
+The `rule_triggered` payload field shows a readable label:
+`All(FunctionCalled(withdraw), LargeTransfer(>=10000XLM))`.
+
+### `Any`
+Fires when **any** nested rule matches (logical OR).
+
+```toml
+[[contracts.rules]]
+type = "Any"
+[[contracts.rules.rules]]
+type = "TransactionFailed"
+[[contracts.rules.rules]]
+type          = "HighFee"
+threshold_xlm = 1
+```
+
+### `Not`
+Fires when the nested rule does **not** match (logical NOT).
+
+```toml
+[[contracts.rules]]
+type = "Not"
+[contracts.rules.rule]
+type = "TransactionFailed"
 ### `EventEmitted`
 Fires when the transaction emitted a Soroban contract event whose first topic is exactly the symbol `topic`
 (a valid Soroban symbol, e.g. `transfer`, `mint`, `admin_changed`). `topics` optionally constrains the following
@@ -335,6 +436,8 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
 
 ```json
 {
+  "schema_version":      1,
+  "alert_id":            "a3f1bc20e94d77c1a3f1bc20e94d77c1",
   "alert_id":            "3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e",
   "label":               "My Escrow Contract",
   "contract_id":         "CAAA...",
@@ -348,10 +451,13 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
   "amount_stroops":      150000000000000,
   "amount_xlm_decimal":  "15000.0000000",
   "fee_charged_stroops": 50000,
+  "source_account":      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+  "severity":            "critical",
   "timestamp":           1705316096,
   "timestamp_iso":       "2024-01-15T12:00:00Z",
   "horizon_link":        "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":       "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "resolved":            false
   "matched_events":      [],
   "suppressed_count":    0
 }
@@ -360,6 +466,16 @@ topics = ["*", "GDESTINATION..."]   # optional: topic 1 = any, topic 2 = this ad
 This example and the one in the README are checked against `AlertPayload` by
 `crates/rules/tests/docs_payload.rs`, so they cannot drift from the code.
 
+**Schema compatibility policy:** `schema_version` is `1`. Additive changes (new optional
+fields added) keep the same version. Breaking changes (field removals, renames, or type
+changes) bump the version. Receivers should check `schema_version` to detect incompatible
+changes before parsing other fields.
+
+- `schema_version` — integer version of this payload shape. Use this to detect breaking changes.
+- `alert_id` — stable, deterministic identifier (32 hex chars) derived from
+  `(network, contract_id, tx_hash, rule_type, rule_triggered)` via SHA-256. Identical for every
+  retry of the same alert. Receivers should deduplicate on this value. Also sent as the
+  `X-TxWatch-Alert-Id` request header for deduplication without parsing the body.
 - `alert_id` — stable 32-character hex ID derived from the contract, transaction and rule; the same
   alert always has the same ID, so receivers can de-duplicate redeliveries. PagerDuty uses it as the
   `dedup_key`.
@@ -369,6 +485,8 @@ This example and the one in the README are checked against `AlertPayload` by
 - `amount_stroops` — raw transfer amount in stroops (1 XLM = 10,000,000 stroops), or `null` when the transaction has none.
 - `amount_xlm_decimal` — transfer amount as a decimal string with 7 fractional digits (e.g. `"9999.9900000"`), or `null` when the transaction has none. Use this instead of `amount_xlm` when precision matters.
 - `fee_charged_stroops` — fee charged for the transaction in stroops, or `null` if unknown.
+- `source_account` — transaction source account (G-address); omitted from the payload when not present on the Horizon record.
+- `severity` — the severity level from the rule definition (`info`, `warning`, `critical`); omitted when the rule has no `severity` set.
 - `timestamp` / `timestamp_iso` — ledger close time as Unix seconds and as an ISO 8601 string.
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
