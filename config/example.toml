@@ -1,4 +1,7 @@
 poll_interval_seconds = 10
+# Optional: how often the poller logs a periodic summary line, in seconds.
+# Set to 0 to disable the periodic summary entirely.
+# summary_interval_seconds = 60
 
 [[contracts]]
 label       = "My Escrow Contract"
