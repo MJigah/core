@@ -1,9 +1,12 @@
 poll_interval_seconds = 10
+# Optional: how often the poller logs a periodic summary line, in seconds.
+# Set to 0 to disable the periodic summary entirely.
+# summary_interval_seconds = 60
 
 [[contracts]]
 label       = "My Escrow Contract"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 # webhook_secret = "my-secret-token"   # optional: HMAC-SHA256 signature sent as X-TxWatch-Signature header
@@ -15,6 +18,8 @@ webhook_url = "https://hooks.example.com/my-webhook"
   [[contracts.rules]]
   type           = "AdminFunctionCalled"
   function_names = ["set_admin", "upgrade", "initialize"]
+  webhook_url    = "https://hooks.example.com/critical-webhook"  # per-rule override
+  severity       = "critical"
 
   [[contracts.rules]]
   type = "TransactionFailed"
@@ -22,7 +27,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 [[contracts]]
 label       = "Mainnet Vault"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+contract_id = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/vault-webhook"
 
@@ -33,17 +38,20 @@ webhook_url = "https://hooks.example.com/vault-webhook"
   type          = "FunctionCalled"
   function_name = "withdraw"
 
+  # Disabled rule: config is preserved but not evaluated
+  [[contracts.rules]]
+  type    = "HighFee"
+  threshold_stroops = 100000
+  enabled = false
+
 # Each [[contracts]] block is independent: rules, webhook_url, and network settings
 # apply only to that contract. You can define different webhook receivers and alert
 # rules per contract, even if they share the same network.
-# Example: HighFee rule (threshold in stroops)
-#  [[contracts.rules]]
-#  type               = "HighFee"
-#  threshold_stroops  = 100000
+
 [[contracts]]
 label       = "Mainnet Bridge Gateway"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+contract_id = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"
 # network must be one of: mainnet / testnet / futurenet
 network     = "mainnet"
 # webhook_url can differ per contract — this allows routing alerts to different endpoints
@@ -56,3 +64,19 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
 
   [[contracts.rules]]
   type = "TransactionFailed"
+
+  # SourceAccount rule: alert when called by anyone except the known admin
+  [[contracts.rules]]
+  type  = "SourceAccount"
+  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+  severity = "warning"
+
+  # Composite rule: alert only when withdraw is called AND amount is large
+  [[contracts.rules]]
+  type = "All"
+  [[contracts.rules.rules]]
+  type          = "FunctionCalled"
+  function_name = "withdraw"
+  [[contracts.rules.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 50000
