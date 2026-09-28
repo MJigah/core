@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
+use txwatch_rules::{evaluate, EvalContext, EnrichedTransaction, HorizonTransaction, NoActivityState, WarningSuppressor, check_no_activity};
 use txwatch_rules::{
     evaluate, ContractEvent, CooldownTracker, EnrichedTransaction, HorizonTransaction,
 };
@@ -166,11 +167,24 @@ pub async fn run_with_shutdown(
 /// keep their cursors; new contracts start from the start-cursor rules
 /// (`cursor_file` entry, else `now`). HTTP client settings are not reloaded.
 pub async fn run_with_reload(
-    mut cfg: AppConfig,
+    cfg: AppConfig,
     dry_run: bool,
     mut shutdown: watch::Receiver<bool>,
-    mut reload: mpsc::Receiver<AppConfig>,
+    _reload: mpsc::Receiver<AppConfig>,
 ) -> Result<()> {
+    // 0 disables keepalive, as documented on `AppConfig::http_tcp_keepalive_secs`.
+    let keepalive =
+        (cfg.http_tcp_keepalive_secs > 0).then(|| Duration::from_secs(cfg.http_tcp_keepalive_secs));
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(cfg.http_pool_max_idle_per_host)
+        .tcp_keepalive(keepalive)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let mut cursors = start_cursors(&cfg);
+    let cursors = load_cursors(&cfg);
     let client = build_poll_client(&cfg)?;
     let mut cursors = load_cursors(&cfg);
 
@@ -223,7 +237,7 @@ pub async fn run_with_reload(
     let fast_contracts = cfg
         .contracts
         .iter()
-        .filter(|c| c.effective_poll_interval(cfg.poll_interval_seconds) < 10)
+        .filter(|c| c.enabled && c.effective_poll_interval(cfg.poll_interval_seconds) < 10)
         .count();
     if fast_contracts > 5 {
         warn!(
@@ -263,6 +277,10 @@ pub async fn run_with_reload(
     // short per-contract interval never affects the schedule of the others.
     let mut tasks = JoinSet::new();
     for contract in cfg.contracts {
+        if !contract.enabled {
+            info!(contract = %contract.label, "contract is disabled — skipping");
+            continue;
+        }
         let interval =
             Duration::from_secs(contract.effective_poll_interval(cfg.poll_interval_seconds));
         let mut contract_cursors: HashMap<String, String> = cursors
@@ -277,7 +295,9 @@ pub async fn run_with_reload(
         let mut cooldowns = CooldownTracker::new();
 
         tasks.spawn(async move {
+            let mut poll_state = ContractPollState::default();
             loop {
+                match poll_contract(&client, &contract, &mut contract_cursors, &mut poll_state, dry_run).await {
                 match poll_contract(
                     &client,
                     &contract,
@@ -299,9 +319,47 @@ pub async fn run_with_reload(
                         // Issue #25: increment Prometheus counters when metrics feature is enabled.
                         #[cfg(feature = "metrics")]
                         {
-                            metrics::inc_transactions(txs);
-                            metrics::inc_alerts(alerts);
+                            let network = contract.network.as_str();
+                            metrics::inc_transactions(&contract.label, network, txs);
+                            metrics::inc_alerts(&contract.label, network, alerts);
+                            metrics::record_poll_success(&contract.label, network);
+                            metrics::mark_poll_success();
                         }
+                    }
+                    Err(e) => {
+                        error!(contract = %contract.label, error = %e, "contract polling task failed");
+                        #[cfg(feature = "metrics")]
+                        metrics::record_poll_failure(&contract.label, contract.network.as_str());
+                    }
+                }
+
+                if *shutdown.borrow() {
+                    }
+                    Err(e) => {
+                        error!(contract = %contract.label, error = %e, "contract polling task failed");
+                        #[cfg(feature = "metrics")]
+                        metrics::record_poll_failure(&contract.label, contract.network.as_str());
+                    }
+                }
+
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(interval) => {}
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(e) = result {
+            error!(error = ?e, "contract polling task panicked");
     loop {
         // Each contract runs on its own task and interval, so a slow contract or
         // a short per-contract interval never affects the schedule of the others.
@@ -454,6 +512,129 @@ async fn poll_contract_forever(
                     break;
                 }
             }
+        });
+    }
+
+    // Wait for a reload signal or shutdown; on reload, restart all tasks.
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+            Some(new_cfg) = reload.recv() => {
+                let start = start_cursors(&new_cfg);
+                // Merge existing cursors with new ones.
+                cursors = new_cfg
+                    .contracts
+                    .iter()
+                    .map(|c| {
+                        let id = c.contract_id.clone();
+                        let cursor = cursors
+                            .get(&id)
+                            .or_else(|| start.get(&id))
+                            .cloned()
+                            .unwrap_or_else(|| "now".to_string());
+                        (id, cursor)
+                    })
+                    .collect();
+                counters
+                    .contracts
+                    .store(new_cfg.contracts.len() as u64, Ordering::Relaxed);
+                info!(
+                    contracts = new_cfg.contracts.len(),
+                    interval_secs = new_cfg.poll_interval_seconds,
+                    "configuration reloaded"
+                );
+                cfg = new_cfg;
+                // Abort all existing tasks and restart with new config.
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+
+                for contract in &cfg.contracts {
+                    if !contract.enabled {
+                        info!(contract = %contract.label, "contract is disabled — skipping");
+                        continue;
+                    }
+                    let interval = Duration::from_secs(
+                        contract.effective_poll_interval(cfg.poll_interval_seconds),
+                    );
+                    let mut contract_cursors: HashMap<String, String> = cursors
+                        .get_key_value(&contract.contract_id)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .into_iter()
+                        .collect();
+                    let client = client.clone();
+                    let counters = Arc::clone(&counters);
+                    let contract = contract.clone();
+                    let mut shutdown = shutdown.clone();
+
+                    tasks.spawn(async move {
+                        loop {
+                            match poll_contract(&client, &contract, &mut contract_cursors, dry_run)
+                                .await
+                            {
+                                Ok((txs, alerts, _)) => {
+                                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
+                                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
+                                    counters
+                                        .interval_transactions
+                                        .fetch_add(txs, Ordering::Relaxed);
+                                    counters
+                                        .interval_alerts
+                                        .fetch_add(alerts, Ordering::Relaxed);
+                                    #[cfg(feature = "metrics")]
+                                    {
+                                        let network = contract.network.as_str();
+                                        metrics::inc_transactions(&contract.label, network, txs);
+                                        metrics::inc_alerts(&contract.label, network, alerts);
+                                        metrics::record_poll_success(&contract.label, network);
+                                        metrics::mark_poll_success();
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(
+                                        contract = %contract.label, error = %e,
+                                        "contract polling task failed"
+                                    );
+                                    #[cfg(feature = "metrics")]
+                                    metrics::record_poll_failure(
+                                        &contract.label,
+                                        contract.network.as_str(),
+                                    );
+                                }
+                            }
+
+                            if *shutdown.borrow() {
+                                break;
+                            }
+
+                            tokio::select! {
+                                () = tokio::time::sleep(interval) => {}
+                                _ = shutdown.changed() => {
+                                    if *shutdown.borrow() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    // Signal all tasks to stop, then wait for them.
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
+}
+
+/// Initial cursor per contract: the `cursor_file` entry when present, else `now`.
+fn start_cursors(cfg: &AppConfig) -> HashMap<String, String> {
         }
     }
 
@@ -486,6 +667,12 @@ fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
             .or_insert_with(|| "now".to_string());
     }
     cursors
+}
+
+/// Load the cursor map from `cfg.cursor_file`, defaulting every configured
+/// contract without a saved cursor to Horizon's `now`.
+fn load_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+    start_cursors(cfg)
 }
 
 /// Write the cursor map to `cfg.cursor_file`, if one is configured. Writes to a
@@ -542,6 +729,13 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
     let mut cooldowns = CooldownTracker::new();
 
     for contract in &cfg.contracts {
+        if !contract.enabled {
+            info!(contract = %contract.label, "contract is disabled — skipping");
+            continue;
+        }
+        match poll_contract(&client, contract, &mut cursors, dry_run).await {
+        let mut state = ContractPollState::default();
+        match poll_contract(&client, contract, &mut cursors, &mut state, dry_run).await {
         match poll_contract(&client, contract, &mut cursors, &mut cooldowns, dry_run).await {
             Ok((txs, alerts, webhook_failures)) => {
                 report.transactions += txs;
@@ -561,12 +755,26 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<CycleReport> {
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
+/// Per-contract mutable state carried across poll cycles.
+#[derive(Default)]
+pub struct ContractPollState {
+    /// Last transaction timestamp seen for this contract. `None` until the
+    /// first transaction is observed.
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    /// One `NoActivityState` entry per rule index.  Entries are created on
+    /// demand so the vector may be shorter than `contract.rules`.
+    pub no_activity_states: Vec<NoActivityState>,
+    /// Suppresses repeated evaluation warnings for broken rules.
+    pub suppressor: WarningSuppressor,
+}
+
 /// Returns `(transactions_processed, alerts_fired, webhook_failures)`.
 ///
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
+#[tracing::instrument(skip(client, contract, cursors, state), fields(
 #[tracing::instrument(skip(client, contract, cursors, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
@@ -576,6 +784,7 @@ async fn poll_contract(
     client: &Client,
     contract: &WatchedContract,
     cursors: &mut HashMap<String, String>,
+    state: &mut ContractPollState,
     cooldowns: &mut CooldownTracker,
     dry_run: bool,
 ) -> Result<(u64, u64, u64)> {
@@ -673,6 +882,16 @@ async fn poll_contract(
     // With `batch_alerts`, alerts are collected here and sent after the loop.
     let mut batch: Vec<txwatch_rules::AlertPayload> = Vec::new();
 
+    // Build a reusable EvalContext for per-transaction rule evaluation.
+    // We use the canonical (production) Horizon base for links in payloads.
+    let eval_ctx = EvalContext {
+        label: &contract.label,
+        contract_id: &contract.contract_id,
+        network: contract.network.as_str(),
+        horizon_base: canonical_base,
+        explorer_base: contract.network.explorer_base_url(),
+    };
+
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
         let tx_hash = record.tx.hash.clone();
@@ -714,6 +933,22 @@ async fn poll_contract(
             }
         };
 
+        // Track the most recent transaction timestamp for NoActivity evaluation.
+        state.last_seen = Some(
+            state
+                .last_seen
+                .map(|prev| prev.max(enriched.timestamp))
+                .unwrap_or(enriched.timestamp),
+        );
+
+        tx_count += 1;
+
+        let payloads = evaluate(
+            &eval_ctx,
+            &contract.rules,
+            &enriched,
+            Some(&state.suppressor),
+        );
         let enriched = if contract.needs_events() {
             let events = transaction_events(
                 client,
@@ -733,18 +968,52 @@ async fn poll_contract(
         let payloads = evaluate_contract(contract, canonical_base, &enriched);
 
         if payloads.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash, rules = ?contract.rules,
+            debug!(contract = %contract.label, tx = %tx_hash,
                 "transaction evaluated but no rules matched");
         }
         let payloads = cooldowns.apply(&contract.rules, payloads, chrono::Utc::now());
 
         for payload in payloads {
             alert_count += 1;
-            info!(contract = %contract.label, rule = %payload.rule_triggered,
-                tx = %payload.transaction_hash, "rule matched");
+            deliver_payload(
+                client, contract, &payload, dry_run, &mut webhook_failures,
+            )
+            .await;
+        }
+    }
 
-            if dry_run {
+    // ── NoActivity poll-cycle check ───────────────────────────────────────────
+    let now = chrono::Utc::now();
+    // Ensure we have enough slots for all rules.
+    if state.no_activity_states.len() < contract.rules.len() {
+        state
+            .no_activity_states
+            .resize_with(contract.rules.len(), Default::default);
+    }
+    for (idx, rule) in contract.rules.iter().enumerate() {
+        if !matches!(rule, txwatch_config::AlertRule::NoActivity { .. }) {
+            continue;
+        }
+        if let Some(payload) = check_no_activity(
+            rule,
+            state.last_seen,
+            now,
+            &mut state.no_activity_states[idx],
+            &eval_ctx,
+        ) {
+            let resolved = payload.resolved;
+            if resolved {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
+                    "NoActivity resolved — activity resumed");
+            } else {
+                info!(contract = %contract.label, rule = %payload.rule_triggered,
+                    "NoActivity threshold exceeded — firing alert");
+            }
+            alert_count += 1;
+            deliver_payload(
+                client, contract, &payload, dry_run, &mut webhook_failures,
+            )
+            .await;
                     tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
             } else if contract.batch_alerts {
                 batch.push(payload);
@@ -754,6 +1023,32 @@ async fn poll_contract(
                     "rule fired — sending webhook");
                 webhook_failures += deliver_to_all(client, contract, &destinations, &payload).await;
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                #[cfg(feature = "metrics")]
+                let started = std::time::Instant::now();
+                // Use per-rule webhook URL/secret override when present.
+                let webhook_url = payload
+                    .effective_webhook_url
+                    .as_deref()
+                    .unwrap_or(&contract.webhook_url);
+                let webhook_secret = payload
+                    .effective_webhook_secret
+                    .as_deref()
+                    .or(contract.webhook_secret.as_deref());
+                let delivery = send_webhook(
+                    client,
+                    webhook_url,
+                    &payload,
+                    webhook_secret,
+                    shutdown_rx,
+                )
+                .await;
+                #[cfg(feature = "metrics")]
+                metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+                if let Err(e) = delivery {
+                    error!(contract = %contract.label, rule = %payload.rule_triggered,
+                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
+                    webhook_failures += 1;
                 let client = client.clone();
                 let webhook_url = contract.webhook_url.clone();
                 let webhook_secret = contract.webhook_secret.clone();
@@ -835,6 +1130,41 @@ async fn poll_contract(
     Ok((tx_count, alert_count, webhook_failures))
 }
 
+/// Deliver a single `AlertPayload` to the contract's webhook, counting any
+/// failures into `webhook_failures`.
+async fn deliver_payload(
+    client: &Client,
+    contract: &WatchedContract,
+    payload: &txwatch_rules::AlertPayload,
+    dry_run: bool,
+    webhook_failures: &mut u64,
+) {
+    info!(contract = %contract.label, rule = %payload.rule_triggered,
+        tx = %payload.transaction_hash, "rule matched");
+
+    if dry_run {
+        info!(contract = %contract.label, rule = %payload.rule_triggered,
+            tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+    } else {
+        info!(contract = %contract.label, rule = %payload.rule_triggered,
+            tx = %payload.transaction_hash, "rule fired — sending webhook");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "metrics")]
+        let started = std::time::Instant::now();
+        let delivery = send_webhook(
+            client,
+            &contract.webhook_url,
+            payload,
+            contract.webhook_secret.as_deref(),
+            shutdown_rx,
+        )
+        .await;
+        #[cfg(feature = "metrics")]
+        metrics::observe_webhook_delivery(started.elapsed().as_secs_f64());
+        if let Err(e) = delivery {
+            error!(contract = %contract.label, rule = %payload.rule_triggered,
+                tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
+            *webhook_failures += 1;
 /// Delivers `payload` to every destination concurrently; each destination has
 /// its own retries, so a slow or failing receiver never blocks the others.
 /// Returns the number of destinations that could not be reached.
@@ -920,6 +1250,21 @@ pub async fn replay_transaction(
     ))
 }
 
+    let explorer_base = contract.network.explorer_base_url().unwrap_or_default();
+    Ok(evaluate(
+        &contract.label,
+        &contract.contract_id,
+        contract.network.as_str(),
+        contract.network.horizon_base_url(),
+        explorer_base,
+    let ctx = EvalContext {
+        label: &contract.label,
+        contract_id: &contract.contract_id,
+        network: contract.network.as_str(),
+        horizon_base: contract.network.horizon_base_url(),
+        explorer_base: contract.network.explorer_base_url(),
+    };
+    Ok(evaluate(&ctx, &contract.rules, &enriched, None))
 /// Runs the contract's rules against `tx`, linking to `horizon_base`.
 fn evaluate_contract(
     contract: &WatchedContract,
@@ -1163,7 +1508,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use txwatch_config::{AlertRule, Network};
+    use txwatch_config::{AlertRule, Network, RuleEntry};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1177,6 +1522,16 @@ mod tests {
 
     fn empty_page() -> serde_json::Value {
         serde_json::json!({ "_embedded": { "records": [] } })
+    }
+
+    fn rule(r: AlertRule) -> RuleEntry {
+        RuleEntry {
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
+            rule: r,
+        }
     }
 
     /// Issue #23: when Horizon returns inline operations via join=operations,
@@ -1229,8 +1584,11 @@ mod tests {
             label: "test".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
-            rules: vec![AlertRule::FunctionCalled {
+            rules: vec![rule(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+            })],
+                match_mode: Default::default(),
+            }],
             }]
             .into_iter()
             .map(Into::into)
@@ -1240,6 +1598,7 @@ mod tests {
             webhook_url: Some(format!("{}/hook", receiver.uri())),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
             webhook_format: Default::default(),
@@ -1251,6 +1610,9 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false)
+            .await
+            .unwrap();
         let (txs, alerts, _) = poll_contract(
             &client,
             &contract,
@@ -1369,6 +1731,7 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
             rules: vec![txwatch_config::AlertRule::AnyTransaction]
                 .into_iter()
                 .map(Into::into)
@@ -1378,6 +1741,7 @@ mod tests {
             webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
             webhook_format: Default::default(),
@@ -1388,6 +1752,7 @@ mod tests {
         };
 
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
+        let result = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false).await;
         let result = poll_contract(
             &client,
             &contract,
@@ -1418,6 +1783,7 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![rule(txwatch_config::AlertRule::AnyTransaction)],
             rules: vec![txwatch_config::AlertRule::AnyTransaction]
                 .into_iter()
                 .map(Into::into)
@@ -1427,6 +1793,7 @@ mod tests {
             webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
             webhook_format: Default::default(),
@@ -1436,6 +1803,9 @@ mod tests {
             batch_alerts: false,
         };
 
+        let err = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false)
+            .await
+            .unwrap_err();
         let err = poll_contract(
             &client,
             &contract,
@@ -1470,12 +1840,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![rule(AlertRule::AnyTransaction)],
             rules: vec![AlertRule::AnyTransaction].into_iter().map(Into::into).collect(),
             webhook_url: "https://hooks.example.com/test".into(),
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: Some("https://hooks.example.com/test".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
             webhook_format: Default::default(),
@@ -1485,6 +1857,7 @@ mod tests {
             batch_alerts: false,
         };
 
+        let result = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false).await;
         let result = poll_contract(
             &client,
             &contract,
@@ -1503,6 +1876,7 @@ mod tests {
 
     #[test]
     fn startup_log_includes_version_contracts_list_and_networks() {
+        let r = rule(txwatch_config::AlertRule::AnyTransaction);
         let cfg = AppConfig {
             poll_interval_seconds: 10,
             http_pool_max_idle_per_host: 10,
@@ -1515,6 +1889,7 @@ mod tests {
                     label: "Contract A".into(),
                     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
                     network: txwatch_config::Network::Testnet,
+                    rules: vec![r.clone()],
                     rules: vec![txwatch_config::AlertRule::AnyTransaction]
                         .into_iter()
                         .map(Into::into)
@@ -1524,6 +1899,7 @@ mod tests {
                     webhook_url: Some("https://hooks.example.com/a".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
+                    enabled: true,
                     soroban_rpc_url: None,
                     horizon_base_url_override: None,
                     webhook_format: Default::default(),
@@ -1536,6 +1912,7 @@ mod tests {
                     label: "Contract B".into(),
                     contract_id: "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526".into(),
                     network: txwatch_config::Network::Mainnet,
+                    rules: vec![r.clone()],
                     rules: vec![txwatch_config::AlertRule::AnyTransaction]
                         .into_iter()
                         .map(Into::into)
@@ -1545,6 +1922,7 @@ mod tests {
                     webhook_url: Some("https://hooks.example.com/b".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
+                    enabled: true,
                     soroban_rpc_url: None,
                     horizon_base_url_override: None,
                     webhook_format: Default::default(),
@@ -1557,6 +1935,7 @@ mod tests {
                     label: "Contract C".into(),
                     contract_id: "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ".into(),
                     network: txwatch_config::Network::Mainnet,
+                    rules: vec![r.clone()],
                     rules: vec![txwatch_config::AlertRule::AnyTransaction]
                         .into_iter()
                         .map(Into::into)
@@ -1566,6 +1945,7 @@ mod tests {
                     webhook_url: Some("https://hooks.example.com/c".into()),
                     webhook_secret: None,
                     poll_interval_seconds: None,
+                    enabled: true,
                     soroban_rpc_url: None,
                     horizon_base_url_override: None,
                     webhook_format: Default::default(),
@@ -1723,12 +2103,14 @@ mod tests {
             label: "Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
+            rules: vec![rule(AlertRule::AnyTransaction)],
             rules: vec![AlertRule::AnyTransaction].into_iter().map(Into::into).collect(),
             webhook_url: format!("{}/hooks", server.uri()),
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: Some(format!("{}/hooks", server.uri())),
             webhook_secret: None,
             poll_interval_seconds: None,
+            enabled: true,
             soroban_rpc_url: None,
             horizon_base_url_override: Some(server.uri()),
             webhook_format: Default::default(),
@@ -1740,6 +2122,7 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false)
         let (txs, alerts, _) = poll_contract(
             &client,
             &contract,

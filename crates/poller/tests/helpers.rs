@@ -1,18 +1,33 @@
 #![allow(dead_code)]
 use txwatch_config::{AlertRule, Network, WatchedContract};
 use txwatch_poller::ContractState;
+use txwatch_config::{AlertRule, Network, RuleEntry, WatchedContract};
 
+pub fn rule(r: AlertRule) -> RuleEntry {
+    RuleEntry {
+        enabled: true,
+        webhook_url: None,
+        webhook_secret: None,
+        severity: None,
+        rule: r,
+    }
+}
+
+/// Build a `WatchedContract` fixture with sensible test defaults.
+///
+/// Centralizes the literal so that new fields on `WatchedContract` only need
+/// to be updated here (and in `WatchedContract::test_default`).
 pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
     WatchedContract {
         label: "Integration Test Contract".into(),
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
         network: Network::Testnet,
+        rules: rules.into_iter().map(rule).collect(),
         rules: rules.into_iter().map(Into::into).collect(),
-        webhook_url: webhook_url.to_string(),
-        rules,
         webhook_url: Some(webhook_url.to_string()),
         webhook_secret: None,
         poll_interval_seconds: None,
+        enabled: true,
         soroban_rpc_url: None,
         horizon_base_url_override: None,
         webhook_format: Default::default(),

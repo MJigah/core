@@ -206,6 +206,7 @@ async fn deliver(
         req = req
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-TxWatch-Alert-Id", &payload.alert_id)
             .body(body.clone());
         if let Some(s) = secret {
             let mut mac =
@@ -337,7 +338,25 @@ pub fn test_payload_with_network(
 ) -> AlertPayload {
     let now = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    let rule_type = "TestWebhook";
+    let rule_triggered = "TestWebhook";
+    let alert_id = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(network.as_bytes());
+        h.update(b"\x00");
+        h.update("CTEST000000000000000000000000000000000000000000000000000".as_bytes());
+        h.update(b"\x00");
+        h.update(tx_hash.as_bytes());
+        h.update(b"\x00");
+        h.update(rule_type.as_bytes());
+        h.update(b"\x00");
+        h.update(rule_triggered.as_bytes());
+        hex::encode(&h.finalize()[..16])
+    };
     AlertPayload {
+        schema_version: 1,
+        alert_id,
         // Unique per send, so repeated tests are not de-duplicated by receivers.
         alert_id: txwatch_rules::alert_id(
             TEST_CONTRACT_ID,
@@ -347,8 +366,8 @@ pub fn test_payload_with_network(
         label: label.to_string(),
         contract_id: TEST_CONTRACT_ID.into(),
         network: network.to_string(),
-        rule_type: "TestWebhook".into(),
-        rule_triggered: "TestWebhook".into(),
+        rule_type: rule_type.into(),
+        rule_triggered: rule_triggered.into(),
         transaction_hash: tx_hash.into(),
         function_name: Some("test".into()),
         function_names: vec!["test".into()],
@@ -356,6 +375,8 @@ pub fn test_payload_with_network(
         amount_stroops: None,
         amount_xlm_decimal: None,
         fee_charged_stroops: None,
+        source_account: None,
+        severity: None,
         timestamp: now.timestamp(),
         timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link: format!("{}/transactions/{}", horizon_base_url, tx_hash),
@@ -364,6 +385,14 @@ pub fn test_payload_with_network(
             None => format!("{}/transactions/{}", horizon_base_url, tx_hash),
         },
         explorer_link: format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        effective_webhook_url: None,
+        effective_webhook_secret: None,
+        ledger: None,
+        source_account: None,
+        memo: None,
+        memo_type: None,
+        operation_count: None,
+        resolved: false,
         matched_events: vec![],
         suppressed_count: 0,
         test: true,
@@ -382,6 +411,8 @@ mod tests {
 
     fn sample_payload() -> AlertPayload {
         AlertPayload {
+            schema_version: 1,
+            alert_id: "deadbeefcafe0000deadbeefcafe0000".into(),
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "Test Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
@@ -395,10 +426,20 @@ mod tests {
             amount_stroops: None,
             amount_xlm_decimal: None,
             fee_charged_stroops: None,
+            source_account: None,
+            severity: None,
             timestamp: 1_700_000_000,
             timestamp_iso: "2023-11-15T03:13:20Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
+            source_account: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            resolved: false,
             matched_events: vec![],
             suppressed_count: 0,
             test: false,
