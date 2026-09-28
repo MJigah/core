@@ -403,3 +403,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 [Apache-2.0](LICENSE)
+
+## Handsoff notes
+
+<!-- handsoff-issue-33 -->
+- #33: http_connection_verbose is parsed but never used
