@@ -3,7 +3,7 @@
 //! on the position of the first mismatched byte.
 
 use anyhow::{anyhow, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Compares two byte slices in constant time.

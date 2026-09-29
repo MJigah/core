@@ -234,6 +234,21 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            schema_version: 1,
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            source_account: None,
+            severity: None,
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            matched_events: vec![],
+            suppressed_count: 0,
+            resolved: false,
+            test: false,
         }
     }
 

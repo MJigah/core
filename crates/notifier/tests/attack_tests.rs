@@ -1,7 +1,7 @@
 //! Attack tests for `txwatch-notifier` verifying HMAC signature defenses,
 //! retry exhaustion behavior, and denial of service resistance.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use tokio::sync::oneshot;
 use wiremock::matchers::{method, path};
@@ -11,7 +11,7 @@ use txwatch_notifier::{build_client, send_webhook, test_payload};
 
 #[tokio::test]
 async fn test_attack_hmac_tamper_detection() {
-    let payload = test_payload("AttackTest", "https://example.com/hook");
+    let payload = test_payload("AttackTest");
     let body = serde_json::to_string(&payload).unwrap();
     let secret = "correct-secret-key";
 
@@ -42,7 +42,7 @@ async fn test_attack_server_slowloris_or_500_flood_terminates() {
 
     let client = build_client().unwrap();
     let url = format!("{}/hook", server.uri());
-    let payload = test_payload("SlowlorisDefense", &url);
+    let payload = test_payload("SlowlorisDefense");
     let (_tx, rx) = oneshot::channel();
 
     let result = send_webhook(&client, &url, &payload, Some("secret"), rx).await;
