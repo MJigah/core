@@ -16,7 +16,7 @@ use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use txwatch_config::{AlertRule, AppConfig};
-use txwatch_rules::{evaluate, EvalContext, EnrichedTransaction};
+use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -270,9 +270,14 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), payload, None)
-                .await
-                .unwrap();
+            txwatch_notifier::send_webhook_simple(
+                &client,
+                contract.webhook_url.as_deref().unwrap(),
+                payload,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 }
@@ -327,10 +332,10 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 fee_charged: None,
                 source_account: None,
                 fee_account: None,
-                ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
                 ledger: None,
+                ..Default::default()
             },
             vec![],
             None,
@@ -346,10 +351,10 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 fee_charged: None,
                 source_account: None,
                 fee_account: None,
-                ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
                 ledger: None,
+                ..Default::default()
             },
             vec![],
             None,
@@ -368,9 +373,14 @@ async fn transaction_failed_rule_fires_only_on_failure() {
         };
         let payloads = evaluate(&ctx, &contract.rules, tx, None);
         for p in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), p, None)
-                .await
-                .unwrap();
+            txwatch_notifier::send_webhook_simple(
+                &client,
+                contract.webhook_url.as_deref().unwrap(),
+                p,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 }
@@ -404,10 +414,10 @@ async fn large_transfer_fires_above_threshold() {
             fee_charged: None,
             source_account: None,
             fee_account: None,
-            ..Default::default()
             envelope_xdr: None,
             result_xdr: None,
             ledger: None,
+            ..Default::default()
         },
         vec![],
         Some(100_000_000_000),
@@ -430,9 +440,14 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), &payloads[0], None)
-        .await
-        .unwrap();
+    txwatch_notifier::send_webhook_simple(
+        &client,
+        contract.webhook_url.as_deref().unwrap(),
+        &payloads[0],
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 /// FunctionCalled rule fires only when the function name matches.
@@ -465,10 +480,10 @@ async fn function_called_rule_fires_on_exact_match() {
                 fee_charged: None,
                 source_account: None,
                 fee_account: None,
-                ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
                 ledger: None,
+                ..Default::default()
             },
             vec!["deposit".into()],
             None,
@@ -484,10 +499,10 @@ async fn function_called_rule_fires_on_exact_match() {
                 fee_charged: None,
                 source_account: None,
                 fee_account: None,
-                ..Default::default()
                 envelope_xdr: None,
                 result_xdr: None,
                 ledger: None,
+                ..Default::default()
             },
             vec!["withdraw".into()],
             None,
@@ -510,9 +525,14 @@ async fn function_called_rule_fires_on_exact_match() {
             None,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), p, None)
-                .await
-                .unwrap();
+            txwatch_notifier::send_webhook_simple(
+                &client,
+                contract.webhook_url.as_deref().unwrap(),
+                p,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 }
@@ -591,10 +611,10 @@ async fn high_fee_rule_fires_on_fee_charged() {
             fee_charged: Some("50000".into()),
             source_account: None,
             fee_account: None,
-            ..Default::default()
             envelope_xdr: None,
             result_xdr: None,
             ledger: None,
+            ..Default::default()
         },
         vec![],
         None,
@@ -618,9 +638,14 @@ async fn high_fee_rule_fires_on_fee_charged() {
     assert!(payloads[0].rule_triggered.contains("HighFee"));
     assert_eq!(payloads[0].fee_charged_stroops, Some(50_000));
 
-    txwatch_notifier::send_webhook_simple(&client, contract.webhook_url.as_deref().unwrap(), &payloads[0], None)
-        .await
-        .unwrap();
+    txwatch_notifier::send_webhook_simple(
+        &client,
+        contract.webhook_url.as_deref().unwrap(),
+        &payloads[0],
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 /// When run in dry-run mode, matched rules are logged but webhooks are not sent.

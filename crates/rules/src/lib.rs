@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
@@ -110,7 +109,14 @@ impl ContractEvent {
     }
 }
 
-/// Compare one `ScVal` topic against a config pattern. Single-key scalar
+/// Compare a topic's compact JSON rendering against `pattern`. A topic is
+/// compared once per event, so the allocation is not worth avoiding.
+#[allow(clippy::cmp_owned)]
+fn cmp_rendered(value: &Value, pattern: &str) -> bool {
+    value.to_string() == pattern
+}
+
+// Compare one `ScVal` topic against a config pattern. Single-key scalar
 /// values (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`, `{"i128": "-1"}`)
 /// match the inner value's text; anything else matches its compact JSON.
 fn topic_value_matches(value: &Value, pattern: &str) -> bool {
@@ -126,7 +132,8 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     };
     match inner {
         Some(text) => text == pattern,
-        None => value.to_string() == pattern,
+        // A non-scalar topic matches its own compact JSON rendering.
+        None => cmp_rendered(value, pattern),
     }
 }
 
@@ -332,35 +339,6 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
-/// Evaluate all enabled rules for one contract against one transaction.
-/// Derive a deterministic alert identifier from the tuple
-/// (network, contract_id, transaction_hash, rule_type, rule_triggered).
-/// Returns the first 16 bytes (32 hex chars) of the SHA-256 digest,
-/// which is short enough to fit in headers while being collision-resistant
-/// for any realistic alert volume (issue #57).
-fn derive_alert_id(
-    network: &str,
-    contract_id: &str,
-    tx_hash: &str,
-    rule_type: &str,
-    rule_triggered: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    // Use null bytes as separators to prevent cross-field collisions.
-    hasher.update(network.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(contract_id.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(tx_hash.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(rule_type.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(rule_triggered.as_bytes());
-    let digest = hasher.finalize();
-    // Take the first 16 bytes → 32 hex characters.
-    hex::encode(&digest[..16])
-}
-
 /// Evaluate all rules for one contract against one transaction.
 /// Context passed to [`evaluate`] to identify the contract being evaluated
 /// and provide the link base URLs needed to build webhook payloads.
@@ -371,20 +349,29 @@ fn derive_alert_id(
 /// # Example
 /// ```
 /// use txwatch_rules::EvalContext;
-/// use txwatch_config::{Network, WatchedContract, AlertRule};
+/// use txwatch_config::{AlertRule, Network, RuleConfig, WatchedContract};
 ///
-/// let ctx = EvalContext::from_contract(
-///     &WatchedContract {
-///         label: "My Oracle".into(),
-///         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-///         network: Network::Testnet,
-///         rules: vec![AlertRule::AnyTransaction],
-///         webhook_url: "https://hooks.example.com/hook".into(),
-///         webhook_secret: None,
-///         poll_interval_seconds: None,
-///         horizon_base_url_override: None,
-///     },
-/// );
+/// let contract = WatchedContract {
+///     label: "My Oracle".into(),
+///     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+///     network: Network::Testnet,
+///     rules: vec![RuleConfig {
+///         rule: AlertRule::AnyTransaction,
+///         cooldown_seconds: None,
+///     }],
+///     webhook_url: Some("https://hooks.example.com/hook".into()),
+///     webhook_secret: None,
+///     webhook_format: Default::default(),
+///     webhook_headers: Default::default(),
+///     webhook_routing_key: None,
+///     webhooks: Vec::new(),
+///     poll_interval_seconds: None,
+///     enabled: true,
+///     soroban_rpc_url: None,
+///     batch_alerts: false,
+///     horizon_base_url_override: None,
+/// };
+/// let ctx = EvalContext::from_contract(&contract);
 /// assert_eq!(ctx.network, "testnet");
 /// ```
 #[derive(Debug, Clone)]
@@ -455,7 +442,7 @@ impl WarningSuppressor {
 /// Pass `suppressor` as `None` to use a one-shot suppressor (appropriate for
 /// replay and tests). The poller keeps a per-contract suppressor to
 /// deduplicate repeated warnings across poll cycles.
-pub fn evaluate<R: AsRef<AlertRule>>(
+pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
     ctx: &EvalContext<'_>,
     rules: &[R],
     tx: &EnrichedTransaction,
@@ -494,59 +481,117 @@ pub fn evaluate<R: AsRef<AlertRule>>(
 
     rules
         .iter()
-        .map(AsRef::as_ref)
-        .filter_map(|rule| match eval_rule(rule, tx) {
-            Ok(true) => Some(AlertPayload {
-                schema_version: 1,
-                alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
-                label: label.to_string(),
-                contract_id: contract_id.to_string(),
-                network: network.to_string(),
-                // #44: Use the single canonical implementations from txwatch-config.
-                rule_type: rule.rule_type().to_string(),
-                rule_triggered: rule.label(),
-                transaction_hash: tx.hash.clone(),
-                function_name: tx.function_names.first().cloned(),
-                function_names: tx.function_names.clone(),
-                amount_xlm,
-                amount_stroops: tx.amount_stroops,
-                amount_xlm_decimal: amount_xlm_decimal.clone(),
-                fee_charged_stroops: tx.fee_charged_stroops,
-                source_account: tx.source_account.clone(),
-                // Per-rule delivery overrides are only set for composite rules,
-                // where the nested `RuleEntry` can override them.
-                severity: None,
-                effective_webhook_url: None,
-                effective_webhook_secret: None,
-                timestamp,
-                timestamp_iso: timestamp_iso.clone(),
-                horizon_link: horizon_link.clone(),
-                explorer_link: explorer_link.clone(),
-                ledger: tx.ledger,
-                memo: tx.memo.clone(),
-                memo_type: tx.memo_type.clone(),
-                operation_count: tx.operation_count,
-                resolved: false,
-                matched_events: matched_events(rule, tx),
-                suppressed_count: 0,
-                test: false,
-            }),
-            Ok(false) => None,
-            Err(e) => {
-                // A broken rule would otherwise warn on every poll cycle.
-                let key = format!("{}:{}", ctx.contract_id, rule.label());
-                if suppressor.should_warn(&key) {
-                    tracing::warn!(
-                        tx = %tx.hash,
-                        rule = %rule.label(),
-                        error = %e,
-                        "rule evaluation error — skipping"
-                    );
+        .filter(|entry| entry.enabled())
+        .filter_map(|entry| {
+            let rule: &AlertRule = entry.as_ref();
+            match eval_rule(rule, tx) {
+                Ok(true) => Some(AlertPayload {
+                    schema_version: 1,
+                    alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
+                    label: label.to_string(),
+                    contract_id: contract_id.to_string(),
+                    network: network.to_string(),
+                    // #44: Use the single canonical implementations from txwatch-config.
+                    rule_type: rule.rule_type().to_string(),
+                    rule_triggered: rule.label(),
+                    transaction_hash: tx.hash.clone(),
+                    function_name: tx.function_names.first().cloned(),
+                    function_names: tx.function_names.clone(),
+                    amount_xlm,
+                    amount_stroops: tx.amount_stroops,
+                    amount_xlm_decimal: amount_xlm_decimal.clone(),
+                    fee_charged_stroops: tx.fee_charged_stroops,
+                    source_account: tx.source_account.clone(),
+                    // Per-rule delivery overrides, absent unless the rule sets them.
+                    severity: entry.severity().map(|s| s.to_string()),
+                    effective_webhook_url: entry.webhook_url().map(str::to_owned),
+                    effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
+                    timestamp,
+                    timestamp_iso: timestamp_iso.clone(),
+                    horizon_link: horizon_link.clone(),
+                    explorer_link: explorer_link.clone(),
+                    ledger: tx.ledger,
+                    memo: tx.memo.clone(),
+                    memo_type: tx.memo_type.clone(),
+                    operation_count: tx.operation_count,
+                    resolved: false,
+                    matched_events: matched_events(rule, tx),
+                    suppressed_count: 0,
+                    test: false,
+                }),
+                Ok(false) => None,
+                Err(e) => {
+                    // A broken rule would otherwise warn on every poll cycle.
+                    let key = format!("{}:{}", ctx.contract_id, rule.label());
+                    if suppressor.should_warn(&key) {
+                        tracing::warn!(
+                            tx = %tx.hash,
+                            rule = %rule.label(),
+                            error = %e,
+                            "rule evaluation error — skipping"
+                        );
+                    }
+                    None
                 }
-                None
             }
         })
         .collect()
+}
+
+/// Per-rule delivery settings that ride alongside the rule itself. A bare
+/// [`AlertRule`] and a `RuleConfig` have none; a `RuleEntry` (used for the
+/// nested rules of a composite) carries the enable flag, the webhook overrides
+/// and the severity.
+pub trait RuleOverrides {
+    /// `false` skips the rule entirely.
+    fn enabled(&self) -> bool {
+        true
+    }
+    /// Webhook URL this rule overrides the contract's with.
+    fn webhook_url(&self) -> Option<&str> {
+        None
+    }
+    /// Webhook secret this rule overrides the contract's with.
+    fn webhook_secret(&self) -> Option<&str> {
+        None
+    }
+    /// Severity carried on the alert payload.
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        None
+    }
+}
+
+impl<T: RuleOverrides + ?Sized> RuleOverrides for &T {
+    fn enabled(&self) -> bool {
+        (**self).enabled()
+    }
+    fn webhook_url(&self) -> Option<&str> {
+        (**self).webhook_url()
+    }
+    fn webhook_secret(&self) -> Option<&str> {
+        (**self).webhook_secret()
+    }
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        (**self).severity()
+    }
+}
+
+impl RuleOverrides for AlertRule {}
+impl RuleOverrides for txwatch_config::RuleConfig {}
+
+impl RuleOverrides for txwatch_config::RuleEntry {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn webhook_url(&self) -> Option<&str> {
+        self.webhook_url.as_deref()
+    }
+    fn webhook_secret(&self) -> Option<&str> {
+        self.webhook_secret.as_deref()
+    }
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        self.severity.as_ref()
+    }
 }
 
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` in this
@@ -592,11 +637,18 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             match tx.source_account.as_deref() {
                 None => false,
                 Some(src) => {
-                    // If allow-list is non-empty, source must be in it.
-                    let in_allow = allow.is_empty() || allow.iter().any(|a| a == src);
-                    // If deny-list is non-empty, source must NOT be in it.
-                    let not_denied = deny.is_empty() || !deny.iter().any(|d| d == src);
-                    in_allow && not_denied
+                    let in_allow = allow.iter().any(|a| a == src);
+                    let in_deny = deny.iter().any(|d| d == src);
+                    if !allow.is_empty() {
+                        // `allow` gates the rule; an address on the `deny`
+                        // fire-list still fires, so it can carve out exceptions.
+                        in_allow || in_deny
+                    } else if !deny.is_empty() {
+                        // With no gate, `deny` alone decides.
+                        in_deny
+                    } else {
+                        true
+                    }
                 }
             }
         }
@@ -705,23 +757,6 @@ fn rule_label(rule: &AlertRule) -> String {
     }
 }
 
-fn rule_type(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
-        AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
-        AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
-        AlertRule::HighFee { .. } => "HighFee".into(),
-        AlertRule::SourceAccount { .. } => "SourceAccount".into(),
-        AlertRule::All { .. } => "All".into(),
-        AlertRule::Any { .. } => "Any".into(),
-        AlertRule::Not { .. } => "Not".into(),
-        AlertRule::NoActivity { .. } => "NoActivity".into(),
-        AlertRule::EventEmitted { .. } => "EventEmitted".into(),
-    }
-}
-
 // ── NoActivity poll-cycle evaluation ─────────────────────────────────────────
 
 /// State machine for a single `NoActivity` rule instance on one contract.
@@ -729,26 +764,21 @@ fn rule_type(rule: &AlertRule) -> String {
 /// The poller keeps one `NoActivityState` per `(contract_id, rule_index)` pair
 /// and calls [`check_no_activity`] once per poll cycle — even when there are no
 /// new transactions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NoActivityState {
     /// The contract is active (or we haven't yet exceeded the threshold).
+    #[default]
     Active,
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
     Alerting,
 }
 
-impl Default for NoActivityState {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
 /// Check the `NoActivity` rule for a single contract after one poll cycle.
 ///
 /// * `rule`              — must be `AlertRule::NoActivity { minutes }`.
 /// * `last_seen`         — the timestamp of the most recent transaction seen,
-///                         or `None` if we have never seen any transaction.
+///   or `None` if we have never seen any transaction.
 /// * `now`               — current time (injectable for testing).
 /// * `state`             — mutable state carried across poll cycles.
 /// * `ctx`               — context used to build the `AlertPayload`.
@@ -788,10 +818,7 @@ pub fn check_no_activity(
     // Synthetic payloads have no transaction — use empty hash and link to Horizon
     // account page rather than a specific transaction.
     let synthetic_hash = String::new();
-    let synthetic_horizon_link = format!(
-        "{}/accounts/{}",
-        horizon_base, ctx.contract_id
-    );
+    let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
     let synthetic_explorer_link = match explorer_base {
         Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
         None => synthetic_horizon_link.clone(),
@@ -929,12 +956,7 @@ impl CooldownTracker {
                     .find(|r| rule_label(&r.rule) == payload.rule_triggered)
                     .and_then(|r| r.cooldown_seconds)
                     .unwrap_or(0);
-                match self.check(
-                    &payload.contract_id,
-                    &payload.rule_triggered,
-                    cooldown,
-                    now,
-                ) {
+                match self.check(&payload.contract_id, &payload.rule_triggered, cooldown, now) {
                     Some(suppressed) => {
                         payload.suppressed_count = suppressed;
                         Some(payload)
@@ -1020,7 +1042,9 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
         (None, Some(_)) => false,
         // `*` → try consuming zero characters (advance pattern only) or one
         // character from text (advance text only).
-        (Some('*'), _) => glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..])),
+        (Some('*'), _) => {
+            glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..]))
+        }
         // Text consumed but pattern has non-`*` characters remaining → no match.
         (Some(_), None) => false,
         // `?` → match any single character.
@@ -1084,7 +1108,10 @@ mod tests {
         }
     }
 
-    fn run<R: AsRef<AlertRule>>(rules: &[R], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
+    fn run<R: AsRef<AlertRule> + RuleOverrides>(
+        rules: &[R],
+        tx: &EnrichedTransaction,
+    ) -> Vec<AlertPayload> {
         let ctx = EvalContext {
             label: "Label",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
@@ -1132,8 +1159,8 @@ mod tests {
             }),
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                }
+                match_mode: FunctionMatchMode::default(),
+            }
             .label(),
             "FunctionCalled(withdraw)"
         );
@@ -1158,7 +1185,10 @@ mod tests {
     #[test]
     fn rule_type_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.rule_type(), "AnyTransaction");
-        assert_eq!(AlertRule::TransactionFailed.rule_type(), "TransactionFailed");
+        assert_eq!(
+            AlertRule::TransactionFailed.rule_type(),
+            "TransactionFailed"
+        );
         assert_eq!(
             AlertRule::LargeTransfer {
                 threshold_xlm: 1,
@@ -1170,8 +1200,8 @@ mod tests {
         assert_eq!(
             AlertRule::FunctionCalled {
                 function_name: "f".into(),
-                    match_mode: FunctionMatchMode::default(),
-                }
+                match_mode: FunctionMatchMode::default(),
+            }
             .rule_type(),
             "FunctionCalled"
         );
@@ -1308,18 +1338,25 @@ mod tests {
     #[test]
     fn large_transfer_no_amount_does_not_fire() {
         let tx = make_tx(true, &[], None);
-        let payloads = run(&[entry(AlertRule::LargeTransfer { threshold_xlm: 1, threshold_stroops: 0 })], &tx);
+        let payloads = run(
+            &[entry(AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+                threshold_stroops: 0,
+            })],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
-
 
     #[test]
     fn large_transfer_overflow_is_handled_gracefully() {
         let tx = make_tx(true, &[], Some(1_000_000_000_000_000));
+        // A validated rule never carries this pair, but if one did the
+        // comparison must not multiply and overflow.
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: u64::MAX,
-                threshold_stroops: 0,
+                threshold_stroops: u64::MAX,
             })],
             &tx,
         );
@@ -1359,8 +1396,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                })],
+                match_mode: FunctionMatchMode::default(),
+            })],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1373,8 +1410,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                })],
+                match_mode: FunctionMatchMode::default(),
+            })],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1399,8 +1436,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                })],
+                match_mode: FunctionMatchMode::default(),
+            })],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1598,8 +1635,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                })],
+                match_mode: FunctionMatchMode::default(),
+            })],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1612,8 +1649,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
-                    match_mode: FunctionMatchMode::default(),
-                })],
+                match_mode: FunctionMatchMode::default(),
+            })],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1682,10 +1719,7 @@ mod tests {
         let tx = make_tx(true, &[], Some(5_000_000)); // 0.5 XLM
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads[0].amount_xlm, Some(0));
-        assert_eq!(
-            payloads[0].amount_xlm_decimal.as_deref(),
-            Some("0.5000000")
-        );
+        assert_eq!(payloads[0].amount_xlm_decimal.as_deref(), Some("0.5000000"));
     }
 
     #[test]
@@ -1855,8 +1889,8 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
-                            match_mode: FunctionMatchMode::default(),
-                        },
+                        match_mode: FunctionMatchMode::default(),
+                    },
                 },
                 RuleEntry {
                     enabled: true,
@@ -1865,7 +1899,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
-                        threshold_stroops: 0,
+                        threshold_stroops: 100000000000,
                     },
                 },
             ],
@@ -1891,8 +1925,8 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
-                            match_mode: FunctionMatchMode::default(),
-                        },
+                        match_mode: FunctionMatchMode::default(),
+                    },
                 },
                 RuleEntry {
                     enabled: true,
@@ -1901,13 +1935,16 @@ mod tests {
                     severity: None,
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
-                        threshold_stroops: 0,
+                        threshold_stroops: 100000000000,
                     },
                 },
             ],
         };
         let payloads = run(&[entry(all_rule)], &tx);
-        assert!(payloads.is_empty(), "All rule must not fire unless all sub-rules match");
+        assert!(
+            payloads.is_empty(),
+            "All rule must not fire unless all sub-rules match"
+        );
     }
 
     #[test]
@@ -1922,8 +1959,8 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
-                            match_mode: FunctionMatchMode::default(),
-                        },
+                        match_mode: FunctionMatchMode::default(),
+                    },
                 },
                 RuleEntry {
                     enabled: true,
@@ -1932,8 +1969,8 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "upgrade".into(),
-                            match_mode: FunctionMatchMode::default(),
-                        },
+                        match_mode: FunctionMatchMode::default(),
+                    },
                 },
             ],
         };
@@ -1979,8 +2016,8 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
-                            match_mode: FunctionMatchMode::default(),
-                        },
+                        match_mode: FunctionMatchMode::default(),
+                    },
                 },
                 RuleEntry {
                     enabled: false, // disabled — skip this sub-rule
@@ -2068,7 +2105,10 @@ mod tests {
             })],
             &tx,
         );
-        assert!(payloads.is_empty(), "SourceAccount must not fire when source_account is None");
+        assert!(
+            payloads.is_empty(),
+            "SourceAccount must not fire when source_account is None"
+        );
     }
 
     #[test]
@@ -2254,7 +2294,9 @@ mod no_activity_tests {
     }
 
     fn ts(h: i32, m: i32) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc.with_ymd_and_hms(2024, 1, 15, h as u32, m as u32, 0).unwrap()
+        chrono::Utc
+            .with_ymd_and_hms(2024, 1, 15, h as u32, m as u32, 0)
+            .unwrap()
     }
 
     #[test]
@@ -2273,7 +2315,10 @@ mod no_activity_tests {
         let p = payload.unwrap();
         assert_eq!(p.rule_type, "NoActivity");
         assert!(!p.resolved, "incident payload must have resolved=false");
-        assert!(p.transaction_hash.is_empty(), "synthetic payload has empty hash");
+        assert!(
+            p.transaction_hash.is_empty(),
+            "synthetic payload has empty hash"
+        );
         assert_eq!(state, NoActivityState::Alerting);
     }
 
@@ -2320,7 +2365,10 @@ mod no_activity_tests {
         let now = ts(12, 20);
         let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
 
-        assert!(payload.is_none(), "should not re-fire while already alerting");
+        assert!(
+            payload.is_none(),
+            "should not re-fire while already alerting"
+        );
         assert_eq!(state, NoActivityState::Alerting);
     }
 
@@ -2336,7 +2384,10 @@ mod no_activity_tests {
         let now = ts(12, 11);
         let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
 
-        assert!(payload.is_some(), "should fire recovery when activity resumes");
+        assert!(
+            payload.is_some(),
+            "should fire recovery when activity resumes"
+        );
         let p = payload.unwrap();
         assert!(p.resolved, "recovery payload must have resolved=true");
         assert_eq!(p.rule_type, "NoActivity");
@@ -2354,7 +2405,10 @@ mod no_activity_tests {
         let now = ts(12, 0);
         let payload = check_no_activity(&rule, None, now, &mut state, &eval_ctx);
 
-        assert!(payload.is_some(), "should fire when no transactions ever seen");
+        assert!(
+            payload.is_some(),
+            "should fire when no transactions ever seen"
+        );
         assert!(!payload.unwrap().resolved);
     }
 }
@@ -2406,7 +2460,6 @@ mod suppressor_tests {
         assert_eq!(s.suppressed_count("x"), 3);
     }
 
-
     #[test]
     fn alert_id_is_deterministic_and_distinguishes_inputs() {
         let id = alert_id("CA", "tx1", "AnyTransaction");
@@ -2450,7 +2503,10 @@ mod suppressor_tests {
             None,
         );
         assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0].alert_id, alert_id("CAAA", "deadbeef", "AnyTransaction"));
+        assert_eq!(
+            payloads[0].alert_id,
+            alert_id("CAAA", "deadbeef", "AnyTransaction")
+        );
         assert_ne!(payloads[0].alert_id, payloads[1].alert_id);
     }
 
@@ -2508,7 +2564,11 @@ mod suppressor_tests {
 
     // ── Issue #50: EventEmitted ───────────────────────────────────────────────
 
-    fn make_tx(successful: bool, function_names: &[&str], amount: Option<u64>) -> EnrichedTransaction {
+    fn make_tx(
+        successful: bool,
+        function_names: &[&str],
+        amount: Option<u64>,
+    ) -> EnrichedTransaction {
         let function_names: Vec<String> = function_names.iter().map(|s| s.to_string()).collect();
         EnrichedTransaction {
             hash: "abc123".into(),
@@ -2556,8 +2616,8 @@ mod suppressor_tests {
 
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
         let ctx = EvalContext {
-            label: "Label".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
             network: "testnet",
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: Some("https://stellar.expert/explorer/testnet"),
@@ -2589,10 +2649,7 @@ mod suppressor_tests {
 
     #[test]
     fn event_emitted_first_topic_must_be_a_symbol() {
-        let ev = event(
-            vec![serde_json::json!({"string": "transfer"})],
-            Value::Null,
-        );
+        let ev = event(vec![serde_json::json!({"string": "transfer"})], Value::Null);
         let tx = make_tx(true, &[], None).with_events(vec![ev]);
         assert!(run(&[event_rule("transfer", &[])], &tx).is_empty());
     }
@@ -2609,7 +2666,10 @@ mod suppressor_tests {
     #[test]
     fn event_emitted_wildcard_matches_missing_topic() {
         let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
-        assert_eq!(run(&[event_rule("transfer", &["*", "*", "*"])], &tx).len(), 1);
+        assert_eq!(
+            run(&[event_rule("transfer", &["*", "*", "*"])], &tx).len(),
+            1
+        );
     }
 
     #[test]
@@ -2633,7 +2693,10 @@ mod suppressor_tests {
     #[test]
     fn topic_value_matches_scalars_and_json() {
         assert!(topic_value_matches(&serde_json::json!({"u32": 5}), "5"));
-        assert!(topic_value_matches(&serde_json::json!({"bool": true}), "true"));
+        assert!(topic_value_matches(
+            &serde_json::json!({"bool": true}),
+            "true"
+        ));
         assert!(topic_value_matches(&serde_json::json!("plain"), "plain"));
         let vec_val = serde_json::json!({"vec": [{"u32": 1}]});
         assert!(topic_value_matches(&vec_val, &vec_val.to_string()));

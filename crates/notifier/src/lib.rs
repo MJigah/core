@@ -80,8 +80,6 @@ pub async fn send_webhook(
         &WebhookHeaders::default(),
         payload,
         shutdown,
-        &payload.rule_triggered,
-        &payload.transaction_hash,
     )
     .await
 }
@@ -118,8 +116,6 @@ pub async fn send_to_destination(
         &destination.headers,
         payload,
         shutdown,
-        &payload.rule_triggered,
-        &payload.transaction_hash,
     )
     .await
 }
@@ -170,12 +166,6 @@ pub async fn send_webhook_batch(
     let _enter = span.enter();
 
     let body = serde_json::to_string(&AlertBatch { alerts: payloads })?;
-    let rule = format!("batch of {}", payloads.len());
-    let txs = payloads
-        .iter()
-        .map(|p| p.transaction_hash.as_str())
-        .collect::<Vec<_>>()
-        .join(",");
     deliver(
         client,
         url,
@@ -184,14 +174,12 @@ pub async fn send_webhook_batch(
         &WebhookHeaders::default(),
         &payloads[0],
         shutdown,
-        &rule,
-        &txs,
     )
     .await
 }
 
-/// POSTs `body` with retries and exponential backoff; `rule` and `tx` only
-/// label the log lines.
+/// POSTs `body` with retries and exponential backoff. `payload` supplies the
+/// rule and transaction identifiers that label the log lines.
 async fn deliver(
     client: &Client,
     url: &str,
@@ -200,8 +188,6 @@ async fn deliver(
     headers: &WebhookHeaders,
     payload: &AlertPayload,
     mut shutdown: oneshot::Receiver<()>,
-    rule: &str,
-    tx: &str,
 ) -> Result<DeliveryResult> {
     let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
@@ -250,8 +236,8 @@ async fn deliver(
                 info!(
                     timestamp = %ts,
                     url       = %url,
-                    rule      = %rule,
-                    tx        = %tx,
+                    rule      = %payload.rule_triggered,
+                    tx        = %payload.transaction_hash,
                     attempts  = attempt,
                     "webhook delivered"
                 );
@@ -304,8 +290,8 @@ async fn deliver(
     let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
     error!(
         url  = %url,
-        rule = %rule,
-        tx   = %tx,
+        rule = %payload.rule_triggered,
+        tx   = %payload.transaction_hash,
         "webhook delivery failed permanently: {}",
         err
     );
@@ -352,7 +338,10 @@ pub fn test_payload_with_network(
         alert_id: txwatch_rules::alert_id(
             TEST_CONTRACT_ID,
             tx_hash,
-            &format!("TestWebhook@{}", now.timestamp_nanos_opt().unwrap_or_default()),
+            &format!(
+                "TestWebhook@{}",
+                now.timestamp_nanos_opt().unwrap_or_default()
+            ),
         ),
         label: label.to_string(),
         contract_id: TEST_CONTRACT_ID.into(),
@@ -679,7 +668,6 @@ mod tests {
             network.horizon_base_url(),
             network.explorer_base_url(),
         );
-        let p = test_payload_with_network("Label", "mainnet", "https://horizon.stellar.org", None);
         assert!(p
             .horizon_link
             .starts_with("https://horizon.stellar.org/transactions/"));
@@ -849,7 +837,9 @@ mod tests {
             format!("{}/hook", server.uri()),
             txwatch_config::WebhookFormat::Txwatch,
         );
-        dest.headers.0.insert("Authorization".into(), "Bearer t0ken".into());
+        dest.headers
+            .0
+            .insert("Authorization".into(), "Bearer t0ken".into());
         dest.headers.0.insert("X-Api-Key".into(), "k".into());
         send_to_destination_simple(&build_client().unwrap(), &dest, &sample_payload())
             .await
@@ -876,6 +866,17 @@ mod tests {
         assert_eq!(body["routing_key"], "R0UT1NG");
         assert_eq!(body["event_action"], "trigger");
         assert_eq!(body["dedup_key"], sample_payload().alert_id);
+    }
+
+    #[tokio::test]
+    async fn batch_signs_the_whole_alerts_array() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
         let payloads = vec![payload_for("tx1"), payload_for("tx2")];
         let client = build_client().unwrap();
         let url = format!("{}/hook", server.uri());
@@ -895,20 +896,31 @@ mod tests {
         let mut mac = Hmac::<Sha256>::new_from_slice(b"s3").unwrap();
         mac.update(&requests[0].body);
         let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        assert_eq!(requests[0].headers.get("x-txwatch-signature").unwrap(), &expected);
+        assert_eq!(
+            requests[0].headers.get("x-txwatch-signature").unwrap(),
+            &expected
+        );
     }
 
     #[tokio::test]
     async fn batch_rejects_empty_and_oversized_batches() {
         let client = build_client().unwrap();
         let url = "http://127.0.0.1:9/hook";
-        assert!(send_webhook_batch(&client, url, &[], None, dummy_shutdown())
-            .await
-            .is_err());
-        let too_many: Vec<_> = (0..=MAX_BATCH_SIZE).map(|i| payload_for(&i.to_string())).collect();
+        assert!(
+            send_webhook_batch(&client, url, &[], None, dummy_shutdown())
+                .await
+                .is_err()
+        );
+        let too_many: Vec<_> = (0..=MAX_BATCH_SIZE)
+            .map(|i| payload_for(&i.to_string()))
+            .collect();
         let err = send_webhook_batch(&client, url, &too_many, None, dummy_shutdown())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("exceeds the maximum of 50"), "got: {}", err);
+        assert!(
+            err.to_string().contains("exceeds the maximum of 50"),
+            "got: {}",
+            err
+        );
     }
 }

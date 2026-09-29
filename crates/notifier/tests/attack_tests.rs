@@ -46,5 +46,8 @@ async fn test_attack_server_slowloris_or_500_flood_terminates() {
     let (_tx, rx) = oneshot::channel();
 
     let result = send_webhook(&client, &url, &payload, Some("secret"), rx).await;
-    assert!(result.is_err(), "Exhausted retries on 500 flood must terminate with error");
+    assert!(
+        result.is_err(),
+        "Exhausted retries on 500 flood must terminate with error"
+    );
 }

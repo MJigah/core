@@ -24,9 +24,16 @@ fn dummy_tx(hash: &str, successful: bool, fee_charged: Option<&str>) -> HorizonT
 
 #[test]
 fn test_attack_overflow_amount_handled_safely() {
-    // Attack with maximum u64 value for amount_stroops to verify no panic occurs
+    // An amount above the total XLM supply is not representable, so
+    // `from_horizon` discards it rather than letting it drive an alert.
     let raw = dummy_tx("overflow_tx", true, None);
-    let enriched = EnrichedTransaction::from_horizon(raw, vec!["transfer".into()], Some(u64::MAX), None).unwrap();
+    let enriched =
+        EnrichedTransaction::from_horizon(raw, vec!["transfer".into()], Some(u64::MAX), None)
+            .unwrap();
+    assert_eq!(
+        enriched.amount_stroops, None,
+        "an impossible amount must be discarded"
+    );
 
     let rules = vec![RuleConfig {
         rule: AlertRule::LargeTransfer {
@@ -44,14 +51,18 @@ fn test_attack_overflow_amount_handled_safely() {
     };
     let payloads = evaluate(&ctx, &rules, &enriched, None);
 
-    assert_eq!(payloads.len(), 1, "LargeTransfer must safely detect overflow-scale amount without panicking");
+    assert!(
+        payloads.is_empty(),
+        "LargeTransfer must not fire on a discarded amount"
+    );
 }
 
 #[test]
 fn test_attack_case_spoofing_admin_function() {
     // Attack trying to bypass AdminFunctionCalled rule using mixed-case invocation
     let raw = dummy_tx("admin_tx", true, None);
-    let enriched = EnrichedTransaction::from_horizon(raw, vec!["Set_Admin".into()], None, None).unwrap();
+    let enriched =
+        EnrichedTransaction::from_horizon(raw, vec!["Set_Admin".into()], None, None).unwrap();
 
     let rules = vec![RuleConfig {
         rule: AlertRule::AdminFunctionCalled {
@@ -68,7 +79,11 @@ fn test_attack_case_spoofing_admin_function() {
     };
     let payloads = evaluate(&ctx, &rules, &enriched, None);
 
-    assert_eq!(payloads.len(), 1, "AdminFunctionCalled must catch case variations of sensitive functions");
+    assert_eq!(
+        payloads.len(),
+        1,
+        "AdminFunctionCalled must catch case variations of sensitive functions"
+    );
 }
 
 #[test]
@@ -90,5 +105,8 @@ fn test_attack_status_spoofing_transaction_failed() {
     };
     let payloads = evaluate(&ctx, &rules, &enriched, None);
 
-    assert!(payloads.is_empty(), "TransactionFailed must never trigger on successful transactions");
+    assert!(
+        payloads.is_empty(),
+        "TransactionFailed must never trigger on successful transactions"
+    );
 }

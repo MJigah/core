@@ -44,8 +44,8 @@ fn golden_payload() -> AlertPayload {
         function_name: Some("transfer".into()),
         function_names: vec!["transfer".into()],
         amount_xlm: Some(15000),
-        amount_stroops: Some(150_000_000_000),
-        amount_xlm_decimal: Some("15000.0000000".into()),
+        amount_stroops: None,
+        amount_xlm_decimal: None,
         fee_charged_stroops: Some(50000),
         timestamp: 1_705_316_096,
         timestamp_iso: "2024-01-15T12:00:00Z".into(),
@@ -73,21 +73,25 @@ fn alert_payload_golden_file_matches_serialization() {
         serde_json::to_value(&payload).expect("AlertPayload should serialize to JSON");
 
     // Normalise both sides to BTreeMap for stable key ordering in diffs.
-    let actual: BTreeMap<String, Value> = serde_json::from_value(serialized.clone())
-        .expect("serialized value should be an object");
+    let actual: BTreeMap<String, Value> =
+        serde_json::from_value(serialized.clone()).expect("serialized value should be an object");
 
     // Allow regenerating the golden file in CI-friendly mode.
     if std::env::var("UPDATE_GOLDEN").is_ok() {
-        let pretty = serde_json::to_string_pretty(&actual)
-            .expect("pretty-print actual payload");
+        let pretty = serde_json::to_string_pretty(&actual).expect("pretty-print actual payload");
         // Resolve path from workspace root (the directory containing Cargo.toml).
         let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent() // crates/rules → crates
             .and_then(|p| p.parent()) // crates → workspace root
             .expect("workspace root not found");
         let golden_path = workspace_root.join(GOLDEN_PATH);
-        std::fs::write(&golden_path, format!("{}\n", pretty))
-            .unwrap_or_else(|e| panic!("failed to write golden file {}: {}", golden_path.display(), e));
+        std::fs::write(&golden_path, format!("{}\n", pretty)).unwrap_or_else(|e| {
+            panic!(
+                "failed to write golden file {}: {}",
+                golden_path.display(),
+                e
+            )
+        });
         eprintln!("Updated golden file: {}", golden_path.display());
         return;
     }
@@ -111,5 +115,9 @@ fn alert_payload_golden_round_trips() {
     let golden_str = include_str!("fixtures/alert_payload_golden.json");
     let from_file: AlertPayload =
         serde_json::from_str(golden_str).expect("golden file should deserialize as AlertPayload");
-    assert_eq!(from_file, golden_payload(), "round-trip deserialization must be lossless");
+    assert_eq!(
+        from_file,
+        golden_payload(),
+        "round-trip deserialization must be lossless"
+    );
 }

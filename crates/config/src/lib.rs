@@ -2,9 +2,9 @@
 #![deny(clippy::unwrap_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use schemars::JsonSchema;
 use std::{collections::BTreeMap, env, fmt, fs, path::Path};
 use url::Url;
 
@@ -254,7 +254,10 @@ impl fmt::Display for Severity {
 
 /// A validated Stellar G-address (56 chars, starts with 'G').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
-    if addr.len() != 56 || !addr.starts_with('G') || !addr.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if addr.len() != 56
+        || !addr.starts_with('G')
+        || !addr.chars().all(|c| c.is_ascii_alphanumeric())
+    {
         bail!(
             "contract '{}': {} '{}' is not a valid Stellar account address \
              (must start with 'G' and be 56 alphanumeric characters)",
@@ -271,7 +274,7 @@ fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Re
 /// - `Exact`  — the invoked name must equal `function_name` exactly (default, pre-existing behaviour).
 /// - `Prefix` — the invoked name must start with `function_name`.
 /// - `Glob`   — the invoked name must match the glob pattern in `function_name`
-///              (`*` matches any sequence of characters, `?` matches exactly one character).
+///   (`*` matches any sequence of characters, `?` matches exactly one character).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionMatchMode {
@@ -908,7 +911,10 @@ impl WebhookHeaders {
 
     /// `Name: <redacted>` pairs, safe to print.
     pub fn redacted(&self) -> Vec<String> {
-        self.0.keys().map(|k| format!("{}: {}", k, REDACTED)).collect()
+        self.0
+            .keys()
+            .map(|k| format!("{}: {}", k, REDACTED))
+            .collect()
     }
 }
 
@@ -1029,7 +1035,6 @@ impl WebhookDestination {
         }
         problems
     }
-
 }
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
@@ -1160,11 +1165,9 @@ pub enum ContractIdError {
 impl fmt::Display for ContractIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContractIdError::Length(len) => write!(
-                f,
-                "must be {} characters, got {}",
-                CONTRACT_STRKEY_LEN, len
-            ),
+            ContractIdError::Length(len) => {
+                write!(f, "must be {} characters, got {}", CONTRACT_STRKEY_LEN, len)
+            }
             ContractIdError::Alphabet { position, found } => write!(
                 f,
                 "invalid character {:?} at position {} (only A-Z and 2-7 are allowed)",
@@ -1295,19 +1298,13 @@ impl WatchedContract {
         if self.label.is_empty() {
             errors.push("a contract has an empty label".to_owned());
         } else if self.label.chars().any(char::is_control) {
-            // Cannot check further label constraints without a non-empty label.
-            return errors;
-        }
-        // Labels end up in log lines and CLI output; `{:?}` escapes the
-        // offending characters so the error itself cannot inject them.
-        if self.label.chars().any(char::is_control) {
+            // Labels end up in log lines and CLI output; `{:?}` escapes the
+            // offending characters so the error itself cannot inject them.
             errors.push(format!(
                 "contract label {:?} must not contain control characters",
                 self.label
             ));
         } else if self.label.chars().count() > MAX_LABEL_LEN {
-        }
-        if self.label.chars().count() > MAX_LABEL_LEN {
             errors.push(format!(
                 "contract label '{}…' is longer than {} characters",
                 self.label.chars().take(32).collect::<String>(),
@@ -1334,7 +1331,10 @@ impl WatchedContract {
         if self.webhook_url.is_none() {
             let stray: Vec<&str> = [
                 ("webhook_secret", self.webhook_secret.is_some()),
-                ("webhook_format", self.webhook_format != WebhookFormat::default()),
+                (
+                    "webhook_format",
+                    self.webhook_format != WebhookFormat::default(),
+                ),
                 ("webhook_headers", !self.webhook_headers.is_empty()),
                 ("webhook_routing_key", self.webhook_routing_key.is_some()),
             ]
@@ -1605,7 +1605,6 @@ fn resolve_destination(
     Ok(())
 }
 
-
 impl AppConfig {
     /// Expands `${VAR}` references in every string field that may carry a
     /// secret or a deployment-specific value.
@@ -1618,8 +1617,21 @@ impl AppConfig {
             if let Some(url) = &mut contract.webhook_url {
                 resolve_field(url, &field("webhook_url"))?;
             }
-            if let Some(secret) = &mut contract.webhook_secret {
-                resolve_field(secret, &field("webhook_secret"))?;
+            // The shorthand destination's secret, header values and routing key.
+            resolve_destination(
+                &mut contract.webhook_secret,
+                &mut contract.webhook_headers,
+                &mut contract.webhook_routing_key,
+                &|name| field(&format!("webhook_{name}")),
+            )?;
+            // Each entry of the `webhooks` array is a destination in its own right.
+            for (j, destination) in contract.webhooks.iter_mut().enumerate() {
+                resolve_destination(
+                    &mut destination.secret,
+                    &mut destination.headers,
+                    &mut destination.routing_key,
+                    &|name| format!("contracts[{}].webhooks[{}].{}", i, j, name),
+                )?;
             }
             if let Network::Custom(custom) = &mut contract.network {
                 resolve_field(&mut custom.horizon_url, &field("network.horizon_url"))?;
@@ -1659,7 +1671,8 @@ impl AppConfig {
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
+        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
+        {
             errors.push(e.to_string());
         }
 
@@ -1836,7 +1849,10 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 , threshold_stroops: 0 })];
+        c.rules = vec![rule(AlertRule::LargeTransfer {
+            threshold_xlm: 0,
+            threshold_stroops: 0,
+        })];
         assert!(c.validate().is_err());
     }
 
@@ -2057,7 +2073,10 @@ mod tests {
         bad_id.webhook_url = Some("ftp://bad".into());
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
-        bad_rule.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 , threshold_stroops: 0 })];
+        bad_rule.rules = vec![rule(AlertRule::LargeTransfer {
+            threshold_xlm: 0,
+            threshold_stroops: 0,
+        })];
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
@@ -2181,7 +2200,11 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::NoActivity { minutes: 0 })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("NoActivity minutes must be > 0"), "got: {}", err);
+        assert!(
+            err.contains("NoActivity minutes must be > 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2524,7 +2547,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "Off"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             enabled     = false
@@ -2542,19 +2565,24 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
             type    = "AnyTransaction"
             enabled = false
         "#;
         let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
-        assert!(matches!(
-            cfg.contracts[0].rules[0].rule,
-            AlertRule::AnyTransaction
-        ));
+        let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule else {
+            panic!("expected All");
+        };
+        assert!(
+            !rules[0].enabled,
+            "nested rule defaults to enabled=false when set"
+        );
     }
 
     #[test]
@@ -2573,7 +2601,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2601,10 +2629,12 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
             type        = "AnyTransaction"
             webhook_url = "ftp://bad"
         "#;
@@ -2621,7 +2651,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2695,7 +2725,10 @@ mod tests {
         c.rules = vec![event_rule("transfer", &[])];
         c.soroban_rpc_url = Some("https://rpc.example.com/".into());
         c.validate().unwrap();
-        assert_eq!(c.effective_soroban_rpc_url(), Some("https://rpc.example.com"));
+        assert_eq!(
+            c.effective_soroban_rpc_url(),
+            Some("https://rpc.example.com")
+        );
     }
 
     #[test]
@@ -2704,7 +2737,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2729,7 +2762,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2766,7 +2799,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             {}
             [[contracts.rules]]
@@ -2815,8 +2848,14 @@ mod tests {
             summary,
             [
                 ("https://internal.example.com/hook", WebhookFormat::Txwatch),
-                ("https://hooks.slack.com/services/T/B/X", WebhookFormat::Slack),
-                ("https://events.pagerduty.com/v2/enqueue", WebhookFormat::Pagerduty),
+                (
+                    "https://hooks.slack.com/services/T/B/X",
+                    WebhookFormat::Slack
+                ),
+                (
+                    "https://events.pagerduty.com/v2/enqueue",
+                    WebhookFormat::Pagerduty
+                ),
             ]
         );
     }
@@ -2850,7 +2889,11 @@ mod tests {
             url = "https://example.com/hook"
             "#,
         );
-        assert!(err.contains("webhook_format set without webhook_url"), "got: {}", err);
+        assert!(
+            err.contains("webhook_format set without webhook_url"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2882,7 +2925,9 @@ mod tests {
             "#,
         );
         assert!(
-            err.contains("contract 'x': webhooks[1].url 'ftp://example.com/bad' must use http or https"),
+            err.contains(
+                "contract 'x': webhooks[1].url 'ftp://example.com/bad' must use http or https"
+            ),
             "got: {}",
             err
         );
@@ -2952,7 +2997,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2973,7 +3018,11 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::All { rules: vec![] })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("All: rules list must not be empty"), "got: {}", err);
+        assert!(
+            err.contains("All: rules list must not be empty"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3014,7 +3063,7 @@ mod tests {
     fn source_account_allow_validates() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
-            allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
             deny: vec![],
         })];
         assert!(c.validate().is_ok());
@@ -3025,7 +3074,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             allow: vec![],
-            deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
         })];
         assert!(c.validate().is_ok());
     }
@@ -3038,7 +3087,11 @@ mod tests {
             deny: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("at least one of 'allow' or 'deny'"), "got: {}", err);
+        assert!(
+            err.contains("at least one of 'allow' or 'deny'"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3049,7 +3102,11 @@ mod tests {
             deny: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("not a valid Stellar account address"), "got: {}", err);
+        assert!(
+            err.contains("not a valid Stellar account address"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3060,12 +3117,15 @@ mod tests {
         assert_eq!(cfg.effective_max_contracts(), 500);
         let default: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(default.effective_max_contracts(), MAX_CONTRACTS);
-
     }
     // ── Unknown fields in rules ──────────────────────────────────────────────
 
     fn parse_rule(rule_toml: &str) -> Result<AppConfig> {
-        let raw = format!("{}\n{}", MINIMAL_TOML.replace("type = \"AnyTransaction\"", ""), rule_toml);
+        let raw = format!(
+            "{}\n{}",
+            MINIMAL_TOML.replace("type = \"AnyTransaction\"", ""),
+            rule_toml
+        );
         AppConfig::parse(&raw, Path::new("rules.toml"))
     }
 
@@ -3118,12 +3178,20 @@ mod tests {
         )
         .unwrap();
         let headers: Vec<(&str, &str)> = cfg.contracts[0].webhook_headers.iter().collect();
-        assert_eq!(headers, [("Authorization", "Bearer abc"), ("X-Api-Key", "k")]);
+        assert_eq!(
+            headers,
+            [("Authorization", "Bearer abc"), ("X-Api-Key", "k")]
+        );
     }
 
     #[test]
     fn reserved_headers_are_rejected() {
-        for name in ["Content-Type", "content-length", "X-TxWatch-Secret", "x-txwatch-anything"] {
+        for name in [
+            "Content-Type",
+            "content-length",
+            "X-TxWatch-Secret",
+            "x-txwatch-anything",
+        ] {
             let err = parse_err(&format!(
                 r#"webhook_url = "https://example.com/hook"
                 webhook_headers = {{ "{}" = "v" }}"#,
@@ -3134,12 +3202,25 @@ mod tests {
         }
     }
 
+    #[test]
     fn rejects_misspelled_field_on_every_rule_type() {
         let cases = [
-            ("type = \"AnyTransaction\"\nfunction_name = \"x\"", "function_name"),
-            ("type = \"TransactionFailed\"\nthreshold_xlm = 5", "threshold_xlm"),
-            ("type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshhold = 1", "threshhold"),
-            ("type = \"FunctionCalled\"\nfunction_name = \"x\"\nextra = true", "extra"),
+            (
+                "type = \"AnyTransaction\"\nfunction_name = \"x\"",
+                "function_name",
+            ),
+            (
+                "type = \"TransactionFailed\"\nthreshold_xlm = 5",
+                "threshold_xlm",
+            ),
+            (
+                "type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshhold = 1",
+                "threshhold",
+            ),
+            (
+                "type = \"FunctionCalled\"\nfunction_name = \"x\"\nextra = true",
+                "extra",
+            ),
             (
                 "type = \"AdminFunctionCalled\"\nfunction_names = [\"x\"]\nfunction_name = \"y\"",
                 "function_name",
@@ -3153,8 +3234,15 @@ mod tests {
 
     #[test]
     fn high_fee_typo_is_not_reported_as_missing_threshold() {
-        let err = format!("{:#}", parse_rule("type = \"HighFee\"\nthreshold_xml = 5").unwrap_err());
-        assert!(!err.contains("threshold_stroops must be > 0"), "got: {}", err);
+        let err = format!(
+            "{:#}",
+            parse_rule("type = \"HighFee\"\nthreshold_xml = 5").unwrap_err()
+        );
+        assert!(
+            !err.contains("threshold_stroops must be > 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3210,7 +3298,11 @@ mod tests {
             "got: {}",
             err
         );
-        assert!(!err.contains("secret-value"), "header value leaked: {}", err);
+        assert!(
+            !err.contains("secret-value"),
+            "header value leaked: {}",
+            err
+        );
     }
 
     #[test]
@@ -3245,7 +3337,10 @@ mod tests {
         );
         assert_eq!(
             validate_contract_id("CTEST000000000000000000000000000000000000000000000000000"),
-            Err(ContractIdError::Alphabet { position: 5, found: '0' })
+            Err(ContractIdError::Alphabet {
+                position: 5,
+                found: '0'
+            })
         );
         assert_eq!(
             validate_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
@@ -3276,7 +3371,10 @@ mod tests {
             let id = format!("C{}{}", bad, &VALID_ID[2..]);
             assert_eq!(
                 validate_contract_id(&id),
-                Err(ContractIdError::Alphabet { position: 1, found: bad }),
+                Err(ContractIdError::Alphabet {
+                    position: 1,
+                    found: bad
+                }),
                 "{}",
                 id
             );
@@ -3284,7 +3382,11 @@ mod tests {
         let mut c = valid_contract();
         c.contract_id = VALID_ID.to_lowercase();
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("invalid character 'c' at position 0"), "got: {}", err);
+        assert!(
+            err.contains("invalid character 'c' at position 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3321,7 +3423,6 @@ mod tests {
 
     fn lookup(name: &str) -> Option<String> {
         match name {
-            "TOKEN" => Some("t0ken".into()),
             "TOKEN" => Some("s3cr3t".into()),
             "HOST" => Some("hooks.example.com".into()),
             "EMPTY" => Some(String::new()),
@@ -3332,17 +3433,19 @@ mod tests {
     #[test]
     fn interpolation_supports_embedded_defaults_and_escapes() {
         let interp = |v: &str| interpolate(v, &lookup);
-        assert_eq!(interp("${TOKEN}").unwrap(), "t0ken");
-        assert_eq!(interp("Bearer ${TOKEN}").unwrap(), "Bearer t0ken");
+        assert_eq!(interp("${TOKEN}").unwrap(), "s3cr3t");
+        assert_eq!(interp("Bearer ${TOKEN}").unwrap(), "Bearer s3cr3t");
         assert_eq!(interp("${MISSING:-fallback}").unwrap(), "fallback");
         assert_eq!(interp("${EMPTY:-fallback}").unwrap(), "fallback");
         assert_eq!(interp("$${TOKEN}").unwrap(), "${TOKEN}");
         assert_eq!(interp("cost: $5").unwrap(), "cost: $5");
-        assert!(interp("${MISSING}").unwrap_err().to_string().contains("'MISSING'"));
+        assert!(interp("${MISSING}")
+            .unwrap_err()
+            .to_string()
+            .contains("'MISSING'"));
         assert!(interp("${}").is_err());
         assert!(interp("${TOKEN").is_err());
         assert!(interp("${1X}").is_err());
-
     }
     fn interp(value: &str) -> Result<String> {
         interpolate(value, &lookup)
@@ -3364,7 +3467,14 @@ mod tests {
 
     #[test]
     fn leaves_values_without_references_unchanged() {
-        for value in ["https://example.com/hook", "", "cost: $5", "$TOKEN", "a$$b", "{TOKEN}"] {
+        for value in [
+            "https://example.com/hook",
+            "",
+            "cost: $5",
+            "$TOKEN",
+            "a$$b",
+            "{TOKEN}",
+        ] {
             assert_eq!(interp(value).unwrap(), value);
         }
     }
@@ -3385,8 +3495,14 @@ mod tests {
 
     #[test]
     fn unterminated_and_invalid_references_are_errors() {
-        assert!(interp("${TOKEN").unwrap_err().to_string().contains("unterminated"));
-        assert!(interp("${1ABC}").unwrap_err().to_string().contains("invalid variable name"));
+        assert!(interp("${TOKEN")
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated"));
+        assert!(interp("${1ABC}")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid variable name"));
         assert!(interp("${A B}").is_err());
     }
 
@@ -3459,14 +3575,17 @@ mod tests {
             err
         );
         assert!(err.contains("TXWATCH_TEST_UNSET"), "got: {}", err);
-
     }
+    #[test]
     fn resolve_env_interpolation_reads_process_environment() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("TXWATCH_TEST_SET_VAR", "value");
         env::remove_var("TXWATCH_TEST_UNSET_VAR");
 
-        assert_eq!(resolve_env_interpolation("${TXWATCH_TEST_SET_VAR}").unwrap(), "value");
+        assert_eq!(
+            resolve_env_interpolation("${TXWATCH_TEST_SET_VAR}").unwrap(),
+            "value"
+        );
         assert!(resolve_env_interpolation("${TXWATCH_TEST_UNSET_VAR}").is_err());
         assert_eq!(resolve_env_interpolation("plain").unwrap(), "plain");
         assert!(resolve_env_interpolation("${}").is_err());
@@ -3517,7 +3636,10 @@ mod tests {
             "https://example.com/hook",
             "https://example.com/${TXWATCH_TEST_MISSING}",
         );
-        let err = format!("{:#}", AppConfig::parse(&raw, Path::new("env.toml")).unwrap_err());
+        let err = format!(
+            "{:#}",
+            AppConfig::parse(&raw, Path::new("env.toml")).unwrap_err()
+        );
         assert!(err.contains("contracts[0].webhook_url"), "got: {}", err);
         assert!(err.contains("TXWATCH_TEST_MISSING"), "got: {}", err);
     }

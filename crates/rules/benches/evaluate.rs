@@ -3,7 +3,7 @@
 //! rules crate.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use txwatch_config::{AlertRule, RuleConfig, RuleEntry};
+use txwatch_config::{AlertRule, RuleEntry};
 use txwatch_rules::{evaluate, EnrichedTransaction, EvalContext};
 
 fn tx() -> EnrichedTransaction {
@@ -22,7 +22,6 @@ fn tx() -> EnrichedTransaction {
             memo: None,
             memo_type: None,
             operation_count: Some(1),
-            ..Default::default()
         },
         vec!["transfer".into()],
         Some(1_000_000),

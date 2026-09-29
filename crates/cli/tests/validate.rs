@@ -145,12 +145,9 @@ webhook_url = "https://hooks.example.com/test"
         "  contracts             : 1\n",
         "\n",
         "  [Stellar Testnet] Test Contract\n",
-        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4\n",
         "    webhooks     : 1\n",
         "      - https://hooks.example.com/test (format: txwatch, secret: none)\n",
-        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4\n",
-        "    webhook_url  : https://hooks.example.com/test\n",
-        "    secret       : none\n",
         "    interval     : 10s\n",
         "    rules        : 2\n",
         "      - AnyTransaction\n",
@@ -311,6 +308,7 @@ webhook_secret = "super-secret-value"
   "contracts": [
     {
       "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      "enabled": true,
       "explorer_url": "https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
       "horizon_url": "https://horizon-testnet.stellar.org",
       "label": "Test Contract",
@@ -318,7 +316,6 @@ webhook_secret = "super-secret-value"
       "poll_interval_seconds": 10,
       "rules": [
         {
-          "enabled": true,
           "type": "AnyTransaction"
         }
       ],
@@ -378,7 +375,7 @@ fn validate_json_reports_errors() {
 const MULTI_DESTINATION_CONFIG: &str = r#"
 [[contracts]]
 label          = "Vault"
-contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 network        = "testnet"
 webhook_url    = "https://internal.example.com/hook"
 webhook_headers = { "Authorization" = "Bearer header-secret-value" }
@@ -405,7 +402,11 @@ fn validate_lists_every_destination_with_secrets_redacted() {
         .args(["--config", path.to_str().unwrap(), "validate"])
         .output()
         .expect("failed to run txwatch");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = concat!(
@@ -415,8 +416,14 @@ fn validate_lists_every_destination_with_secrets_redacted() {
         "      - https://events.pagerduty.com/v2/enqueue (format: pagerduty, secret: none, routing_key: <redacted>)\n",
     );
     assert!(stdout.contains(expected), "got:\n{}", stdout);
-    assert!(!stdout.contains("header-secret-value"), "header value leaked");
-    assert!(!stdout.contains("routing-key-secret-value"), "routing key leaked");
+    assert!(
+        !stdout.contains("header-secret-value"),
+        "header value leaked"
+    );
+    assert!(
+        !stdout.contains("routing-key-secret-value"),
+        "routing key leaked"
+    );
 }
 
 #[test]
@@ -425,14 +432,26 @@ fn validate_json_lists_every_destination_with_secrets_redacted() {
     fs::write(&path, MULTI_DESTINATION_CONFIG).unwrap();
 
     let output = txwatch_bin()
-        .args(["--config", path.to_str().unwrap(), "validate", "--format", "json"])
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+        ])
         .output()
         .expect("failed to run txwatch");
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("header-secret-value"), "header value leaked");
-    assert!(!stdout.contains("routing-key-secret-value"), "routing key leaked");
+    assert!(
+        !stdout.contains("header-secret-value"),
+        "header value leaked"
+    );
+    assert!(
+        !stdout.contains("routing-key-secret-value"),
+        "routing key leaked"
+    );
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let webhooks = json["contracts"][0]["webhooks"].as_array().unwrap();
