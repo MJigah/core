@@ -53,16 +53,22 @@ struct HorizonOperation {
     function: Option<String>,
     /// Present on `payment` operations (string, e.g. "1000.0000000").
     amount: Option<String>,
+    /// Present on `payment` operations: `native`, `credit_alphanum4` or
+    /// `credit_alphanum12`. Only `native` payments count as XLM.
+    asset_type: Option<String>,
+    /// Present on non-native `payment` operations.
+    #[allow(dead_code)]
+    asset_code: Option<String>,
+    /// Present on non-native `payment` operations.
+    #[allow(dead_code)]
+    asset_issuer: Option<String>,
 }
 
-/// A Horizon transaction record that may include inline operations via `join=operations`.
+/// A Horizon transaction record from the account transactions endpoint.
 #[derive(Deserialize)]
 struct HorizonTransactionWithOps {
     #[serde(flatten)]
     tx: HorizonTransaction,
-    /// Inline operations embedded when `join=operations` is used.
-    #[serde(default)]
-    operations: Vec<HorizonOperation>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +84,18 @@ struct Embedded {
 #[derive(Deserialize)]
 struct OperationsPage {
     _embedded: OpsEmbedded,
+    #[serde(default)]
+    _links: Option<PageLinks>,
+}
+
+#[derive(Deserialize)]
+struct PageLinks {
+    next: Option<PageLink>,
+}
+
+#[derive(Deserialize)]
+struct PageLink {
+    href: String,
 }
 
 #[derive(Deserialize)]
@@ -772,10 +790,8 @@ pub struct ContractPollState {
 
 /// Returns `(transactions_processed, alerts_fired, webhook_failures)`.
 ///
-/// Uses `join=operations` on the transactions endpoint so that Horizon returns
-/// operations inline, eliminating one HTTP request per transaction (#23).
-/// Falls back to a separate `/transactions/{hash}/operations` fetch only when
-/// the inline `operations` array is absent (older Horizon versions).
+/// Operations are fetched per transaction from `/transactions/{hash}/operations`;
+/// see the note on the transactions URL below for why they are not joined inline.
 #[tracing::instrument(skip(client, contract, cursors, state), fields(
 #[tracing::instrument(skip(client, contract, cursors, cooldowns), fields(
     contract    = %contract.label,
@@ -809,10 +825,13 @@ async fn poll_contract(
     let mut page_cursor = cursor.clone();
 
     loop {
-        // Issue #23: use join=operations to fetch operations inline, eliminating
-        // one HTTP request per transaction.
+        // Checked against horizon-testnet.stellar.org: `join=operations` on the
+        // transactions endpoint is NOT supported. Horizon answers 200 but ignores
+        // it and returns no `operations` array (only `join=transactions` exists,
+        // on operation/payment/effect collections). Operations are therefore
+        // fetched per transaction; see `fetch_soroban_details`.
         let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200",
             poll_base, contract.contract_id, page_cursor
         );
 
@@ -902,12 +921,7 @@ async fn poll_contract(
         // op enrichment fails.
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
-        // Issue #23: if Horizon returned inline operations, use them directly.
-        // Otherwise fall back to a separate /operations fetch.
-        let (function_names, amount_stroops) = if !record.operations.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
-            extract_soroban_details(record.operations)
-        } else {
+        let (function_names, amount_stroops) =
             match fetch_soroban_details(client, poll_base, &tx_hash).await {
                 Ok(details) => details,
                 Err(e) => {
@@ -917,8 +931,7 @@ async fn poll_contract(
                     );
                     (Vec::new(), None)
                 }
-            }
-        };
+            };
 
         let ledger = record.tx.ledger;
         let enriched = match EnrichedTransaction::from_horizon(
@@ -1294,9 +1307,62 @@ fn evaluate_contract(
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
+/// Number of fractional digits in a Horizon XLM amount (1 XLM = 10^7 stroops).
+const STROOP_DECIMALS: usize = 7;
+
+/// Largest operations page Horizon serves; a transaction has at most 100 operations.
+const OPERATIONS_PAGE_LIMIT: usize = 200;
+
+/// Safety cap on `_links.next` hops for a single transaction's operations.
+const MAX_OPERATION_PAGES: usize = 10;
+
+/// Number of separate `/transactions/{hash}/operations` requests made so far.
+/// Horizon ignores `join=operations`, so this is one per transaction; logged at
+/// debug level to make that N+1 behaviour visible.
+static OPERATION_FETCHES: AtomicU64 = AtomicU64::new(0);
+
+/// Parse a Horizon decimal amount string (e.g. `"1000.0000001"`) into stroops
+/// using integer arithmetic only. Accepts 1..=7 fractional digits (or none) and
+/// rejects signs, whitespace, empty parts and non-digits.
+fn parse_stroops(amount: &str) -> Result<u64> {
+    let (int_part, frac_part) = match amount.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (amount, ""),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("malformed amount {:?}: invalid integer part", amount);
+    }
+    if amount.contains('.') && frac_part.is_empty() {
+        anyhow::bail!("malformed amount {:?}: empty fractional part", amount);
+    }
+    if frac_part.len() > STROOP_DECIMALS || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!(
+            "malformed amount {:?}: fractional part must be at most {} digits",
+            amount,
+            STROOP_DECIMALS
+        );
+    }
+
+    let whole: u64 = int_part
+        .parse()
+        .with_context(|| format!("malformed amount {:?}: integer part out of range", amount))?;
+    let padded = format!("{:0<width$}", frac_part, width = STROOP_DECIMALS);
+    let frac: u64 = padded
+        .parse()
+        .with_context(|| format!("malformed amount {:?}: invalid fractional part", amount))?;
+
+    whole
+        .checked_mul(10u64.pow(STROOP_DECIMALS as u32))
+        .and_then(|w| w.checked_add(frac))
+        .with_context(|| format!("malformed amount {:?}: overflows u64 stroops", amount))
+}
+
 /// Extract Soroban details from a slice of already-fetched operations.
-/// Used for both inline (join=operations) and separately-fetched operations.
-fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
+///
+/// Only `payment` operations in the native asset (`asset_type == "native"`)
+/// count towards the returned stroop total; payments in issued assets are not XLM.
+/// A native payment with a malformed amount is an error.
+fn extract_soroban_details(ops: Vec<HorizonOperation>) -> Result<(Vec<String>, Option<u64>)> {
     let mut function_names: Vec<String> = Vec::new();
     let mut total_stroops: u64 = 0;
     let mut has_payment = false;
@@ -1307,50 +1373,70 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u
                 function_names.push(f);
             }
         }
-        if op.op_type == "payment" {
+        if op.op_type == "payment" && op.asset_type.as_deref() == Some("native") {
             if let Some(amt_str) = op.amount {
-                if let Ok(xlm) = amt_str.parse::<f64>() {
-                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
-                    has_payment = true;
-                }
+                let stroops = parse_stroops(&amt_str).map_err(|e| {
+                    error!(error = %e, "invalid payment amount in Horizon operation");
+                    e
+                })?;
+                total_stroops = total_stroops.saturating_add(stroops);
+                has_payment = true;
             }
         }
     }
 
-    (
+    Ok((
         function_names,
         if has_payment {
             Some(total_stroops)
         } else {
             None
         },
-    )
+    ))
 }
 
-/// Fetch operations for a single transaction from Horizon.
-/// Used as a fallback when `join=operations` is not supported or returned no ops.
+/// Fetch all operations for a single transaction from Horizon.
+/// Requests the maximum page size and follows `_links.next` while pages are full.
 #[tracing::instrument(skip(client), fields(tx = %tx_hash))]
 async fn fetch_soroban_details(
     client: &Client,
     base: &str,
     tx_hash: &str,
 ) -> Result<(Vec<String>, Option<u64>)> {
-    let url = format!("{}/transactions/{}/operations", base, tx_hash);
+    let fetches = OPERATION_FETCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    debug!(tx = %tx_hash, fallback_operation_fetches = fetches, "fetching operations for transaction");
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?;
-    let status = response.status();
-    let page: OperationsPage = response
-        .error_for_status()
-        .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
-        .json()
-        .await
-        .with_context(|| format!("failed to parse operations from {}", url))?;
+    let mut url = format!(
+        "{}/transactions/{}/operations?limit={}",
+        base, tx_hash, OPERATIONS_PAGE_LIMIT
+    );
+    let mut ops: Vec<HorizonOperation> = Vec::new();
 
-    Ok(extract_soroban_details(page._embedded.records))
+    for _ in 0..MAX_OPERATION_PAGES {
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?;
+        let status = response.status();
+        let page: OperationsPage = response
+            .error_for_status()
+            .with_context(|| format!("Horizon returned HTTP {} for {}", status, url))?
+            .json()
+            .await
+            .with_context(|| format!("failed to parse operations from {}", url))?;
+
+        let count = page._embedded.records.len();
+        ops.extend(page._embedded.records);
+
+        let next = page._links.and_then(|l| l.next).map(|n| n.href);
+        match next {
+            Some(next_url) if count >= OPERATIONS_PAGE_LIMIT => url = next_url,
+            _ => break,
+        }
+    }
+
+    extract_soroban_details(ops)
 }
 
 // ── Soroban contract events ───────────────────────────────────────────────────
@@ -1536,108 +1622,6 @@ mod tests {
         }
     }
 
-    /// Issue #23: when Horizon returns inline operations via join=operations,
-    /// the poller must parse them correctly without making a separate /operations request.
-    #[tokio::test]
-    async fn inline_operations_parsed_correctly() {
-        let server = MockServer::start().await;
-
-        // Transactions page with inline operations (join=operations response shape)
-        let tx_with_ops = serde_json::json!({
-            "_embedded": {
-                "records": [{
-                    "hash":         "inlinetx1",
-                    "created_at":   "2024-06-01T10:00:00Z",
-                    "successful":   true,
-                    "paging_token": "1",
-                    "fee_charged":  "100",
-                    "envelope_xdr": null,
-                    "result_xdr":   null,
-                    "operations": [
-                        { "type": "invoke_host_function", "function": "withdraw" }
-                    ]
-                }]
-            }
-        });
-
-        Mock::given(method("GET"))
-            .and(path_regex("/accounts/.*/transactions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(tx_with_ops))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        // Subsequent requests return empty page
-        Mock::given(method("GET"))
-            .and(path_regex("/accounts/.*/transactions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
-            .mount(&server)
-            .await;
-
-        // Webhook receiver
-        let receiver = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&receiver)
-            .await;
-
-        let client = Client::new();
-        let contract = WatchedContract {
-            label: "test".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
-            network: Network::Testnet,
-            rules: vec![rule(AlertRule::FunctionCalled {
-                function_name: "withdraw".into(),
-            })],
-                match_mode: Default::default(),
-            }],
-            }]
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-            webhook_url: format!("{}/hook", receiver.uri()),
-            }],
-            webhook_url: Some(format!("{}/hook", receiver.uri())),
-            webhook_secret: None,
-            poll_interval_seconds: None,
-            enabled: true,
-            soroban_rpc_url: None,
-            horizon_base_url_override: Some(server.uri()),
-            webhook_format: Default::default(),
-            webhook_headers: Default::default(),
-            webhook_routing_key: None,
-            webhooks: Vec::new(),
-            batch_alerts: false,
-        };
-        let mut cursors: HashMap<String, String> = HashMap::new();
-        cursors.insert(contract.contract_id.clone(), "now".to_string());
-
-        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, &mut ContractPollState::default(), false)
-            .await
-            .unwrap();
-        let (txs, alerts, _) = poll_contract(
-            &client,
-            &contract,
-            &mut cursors,
-            &mut CooldownTracker::new(),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(txs, 1);
-        assert_eq!(
-            alerts, 1,
-            "FunctionCalled(withdraw) should fire from inline operations"
-        );
-
-        // Verify no /operations request was made (inline ops used instead)
-        let reqs = server.received_requests().await.unwrap();
-        assert!(
-            reqs.iter().all(|r| !r.url.path().contains("/operations")),
-            "no separate /operations request should be made when inline ops are present"
-        );
-    }
-
     #[tokio::test]
     async fn poll_returns_ok_on_empty_page() {
         let server = MockServer::start().await;
@@ -1649,7 +1633,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!(
-            "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200&join=operations",
+            "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
             server.uri(),
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
         );
@@ -1679,7 +1663,9 @@ mod tests {
     async fn fetch_soroban_details_extracts_payment_amount() {
         let server = MockServer::start().await;
         let ops = serde_json::json!({
-            "_embedded": { "records": [{ "type": "payment", "amount": "1000.0000000" }] }
+            "_embedded": { "records": [{
+                "type": "payment", "asset_type": "native", "amount": "1000.0000000"
+            }] }
         });
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
@@ -1694,6 +1680,152 @@ mod tests {
 
         assert!(fn_names.is_empty());
         assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    fn payment_op(asset_type: &str, amount: &str) -> HorizonOperation {
+        HorizonOperation {
+            op_type: "payment".into(),
+            function: None,
+            amount: Some(amount.into()),
+            asset_type: Some(asset_type.into()),
+            asset_code: None,
+            asset_issuer: None,
+        }
+    }
+
+    #[test]
+    fn parse_stroops_accepts_valid_amounts() {
+        assert_eq!(parse_stroops("0.0000001").unwrap(), 1);
+        assert_eq!(parse_stroops("0.29").unwrap(), 2_900_000);
+        assert_eq!(parse_stroops("1000").unwrap(), 10_000_000_000);
+        assert_eq!(parse_stroops("1000.0000001").unwrap(), 10_000_000_001);
+        assert_eq!(
+            parse_stroops("922337203685.4775807").unwrap(),
+            9_223_372_036_854_775_807
+        );
+    }
+
+    #[test]
+    fn parse_stroops_rejects_malformed_amounts() {
+        for bad in [
+            "", ".", ".5", "1.", "abc", "1.2.3", "-1", "+1", " 1", "1 ", "1e3",
+            "0.00000001", "1,5", "18446744073709.5516160",
+        ] {
+            assert!(parse_stroops(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn extract_soroban_details_errors_on_malformed_native_amount() {
+        assert!(extract_soroban_details(vec![payment_op("native", "1.2.3")]).is_err());
+    }
+
+    #[test]
+    fn extract_soroban_details_ignores_non_native_payments() {
+        let ops = vec![
+            payment_op("credit_alphanum4", "50000.0000000"),
+            payment_op("native", "1.5"),
+        ];
+        let (_, amount) = extract_soroban_details(ops).unwrap();
+        assert_eq!(amount, Some(15_000_000));
+
+        let (_, amount) =
+            extract_soroban_details(vec![payment_op("credit_alphanum4", "50000.0000000")])
+                .unwrap();
+        assert!(amount.is_none());
+    }
+
+    /// A large non-native payment must not populate the amount, so
+    /// `LargeTransfer` cannot fire on it.
+    #[tokio::test]
+    async fn large_non_native_payment_does_not_fire_large_transfer() {
+        let server = MockServer::start().await;
+        let ops = serde_json::json!({
+            "_embedded": { "records": [{
+                "type": "payment", "asset_type": "credit_alphanum4",
+                "asset_code": "USDC",
+                "asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+                "amount": "50000.0000000"
+            }] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ops))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let (_, amount) = fetch_soroban_details(&client, &server.uri(), "abc123")
+            .await
+            .unwrap();
+        assert!(amount.is_none());
+    }
+
+    /// A 15-operation transaction whose matching function is the 12th op must
+    /// not lose it, and the request must ask for the maximum page size.
+    #[tokio::test]
+    async fn fetch_soroban_details_reads_all_operations_of_large_transaction() {
+        let server = MockServer::start().await;
+        let records: Vec<serde_json::Value> = (1..=15)
+            .map(|i| {
+                if i == 12 {
+                    serde_json::json!({ "type": "invoke_host_function", "function": "withdraw" })
+                } else {
+                    serde_json::json!({ "type": "bump_sequence" })
+                }
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "_embedded": { "records": records } })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let (fn_names, _) = fetch_soroban_details(&client, &server.uri(), "abc123")
+            .await
+            .unwrap();
+        assert_eq!(fn_names, vec!["withdraw"]);
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(reqs[0].url.query().unwrap_or("").contains("limit=200"));
+    }
+
+    /// Full pages are followed through `_links.next`.
+    #[tokio::test]
+    async fn fetch_soroban_details_follows_next_link() {
+        let server = MockServer::start().await;
+        let first: Vec<serde_json::Value> = (0..OPERATIONS_PAGE_LIMIT)
+            .map(|_| serde_json::json!({ "type": "bump_sequence" }))
+            .collect();
+        let next_href = format!("{}/transactions/abc123/operations?cursor=200", server.uri());
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .and(wiremock::matchers::query_param("cursor", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_embedded": { "records": [
+                    { "type": "invoke_host_function", "function": "withdraw" }
+                ] }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_embedded": { "records": first },
+                "_links": { "next": { "href": next_href } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let (fn_names, _) = fetch_soroban_details(&client, &server.uri(), "abc123")
+            .await
+            .unwrap();
+        assert_eq!(fn_names, vec!["withdraw"]);
     }
 
     #[tokio::test]

@@ -75,7 +75,8 @@ pub fn payment_ops_page(amount_str: &str) -> serde_json::Value {
     serde_json::json!({
         "_embedded": {
             "records": [{
-                "type":   "payment",
+                "type":       "payment",
+                "asset_type": "native",
                 "amount": amount_str
             }]
         }
