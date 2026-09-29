@@ -835,6 +835,12 @@ impl From<AlertRule> for RuleConfig {
     }
 }
 
+impl AsRef<AlertRule> for AlertRule {
+    fn as_ref(&self) -> &AlertRule {
+        self
+    }
+}
+
 impl AsRef<AlertRule> for RuleConfig {
     fn as_ref(&self) -> &AlertRule {
         &self.rule
