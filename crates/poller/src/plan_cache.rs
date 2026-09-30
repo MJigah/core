@@ -73,7 +73,11 @@ impl PlanCache {
 
     /// Optimized getter for `GET /api/analytics/plan-statistics`:
     /// Checks cache first; only invokes fallback calculation on cache miss.
-    pub async fn get_or_calculate<F, Fut>(&self, plan_id: &str, calculate_fallback: F) -> Result<PlanStatistics>
+    pub async fn get_or_calculate<F, Fut>(
+        &self,
+        plan_id: &str,
+        calculate_fallback: F,
+    ) -> Result<PlanStatistics>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<PlanStatistics>>,

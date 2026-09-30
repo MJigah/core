@@ -2,9 +2,9 @@
 #![deny(clippy::unwrap_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use schemars::JsonSchema;
 use std::{collections::BTreeMap, env, fmt, fs, path::Path};
 use url::Url;
 
@@ -254,7 +254,10 @@ impl fmt::Display for Severity {
 
 /// A validated Stellar G-address (56 chars, starts with 'G').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
-    if addr.len() != 56 || !addr.starts_with('G') || !addr.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if addr.len() != 56
+        || !addr.starts_with('G')
+        || !addr.chars().all(|c| c.is_ascii_alphanumeric())
+    {
         bail!(
             "contract '{}': {} '{}' is not a valid Stellar account address \
              (must start with 'G' and be 56 alphanumeric characters)",
@@ -264,12 +267,14 @@ fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Re
         );
     }
     Ok(())
+}
+
 /// Match mode for the `FunctionCalled` rule (issue #55).
 ///
 /// - `Exact`  — the invoked name must equal `function_name` exactly (default, pre-existing behaviour).
 /// - `Prefix` — the invoked name must start with `function_name`.
 /// - `Glob`   — the invoked name must match the glob pattern in `function_name`
-///              (`*` matches any sequence of characters, `?` matches exactly one character).
+///   (`*` matches any sequence of characters, `?` matches exactly one character).
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FunctionMatchMode {
@@ -279,8 +284,6 @@ pub enum FunctionMatchMode {
     Glob,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "type")]
 /// Unknown keys in a rule table are rejected (e.g. `threshold_xml` on a
 /// `HighFee` rule, or `function_name` on an `AnyTransaction` rule).
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -337,6 +340,21 @@ pub enum AlertRule {
     Not {
         rule: Box<RuleEntry>,
     },
+    /// Fires once when a contract has produced no transactions for longer than
+    /// `minutes` minutes, and again (with `resolved = true`) when activity
+    /// resumes.  Evaluated per poll cycle, not per transaction.
+    NoActivity {
+        minutes: u32,
+    },
+    /// Fires when the transaction emitted a Soroban contract event whose first
+    /// topic is the symbol `topic` (e.g. `transfer`, `mint`, `admin_changed`).
+    /// `topics` optionally constrains the following topics positionally
+    /// (`topics[0]` matches event topic 1, and so on); `"*"` matches anything.
+    EventEmitted {
+        topic: String,
+        #[serde(default)]
+        topics: Vec<String>,
+    },
 }
 
 /// A rule entry with optional per-rule overrides.
@@ -356,21 +374,6 @@ pub struct RuleEntry {
     pub severity: Option<Severity>,
     #[serde(flatten)]
     pub rule: AlertRule,
-    /// Fires once when a contract has produced no transactions for longer than
-    /// `minutes` minutes, and again (with `resolved = true`) when activity
-    /// resumes.  Evaluated per poll cycle, not per transaction.
-    NoActivity {
-        minutes: u32,
-    },
-    /// Fires when the transaction emitted a Soroban contract event whose first
-    /// topic is the symbol `topic` (e.g. `transfer`, `mint`, `admin_changed`).
-    /// `topics` optionally constrains the following topics positionally
-    /// (`topics[0]` matches event topic 1, and so on); `"*"` matches anything.
-    EventEmitted {
-        topic: String,
-        #[serde(default)]
-        topics: Vec<String>,
-    },
 }
 
 /// Deserialization mirror of [`AlertRule`]. serde ignores extra keys on unit
@@ -396,6 +399,29 @@ enum AlertRuleRepr {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    SourceAccount {
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        deny: Vec<String>,
+    },
+    All {
+        rules: Vec<RuleEntry>,
+    },
+    Any {
+        rules: Vec<RuleEntry>,
+    },
+    Not {
+        rule: Box<RuleEntry>,
+    },
+    NoActivity {
+        minutes: u32,
+    },
+    EventEmitted {
+        topic: String,
+        #[serde(default)]
+        topics: Vec<String>,
+    },
 }
 
 impl<'de> Deserialize<'de> for AlertRule {
@@ -403,12 +429,15 @@ impl<'de> Deserialize<'de> for AlertRule {
         Ok(match AlertRuleRepr::deserialize(deserializer)? {
             AlertRuleRepr::AnyTransaction {} => AlertRule::AnyTransaction,
             AlertRuleRepr::TransactionFailed {} => AlertRule::TransactionFailed,
-            AlertRuleRepr::LargeTransfer { threshold_xlm } => {
-                AlertRule::LargeTransfer { threshold_xlm }
-            }
-            AlertRuleRepr::FunctionCalled { function_name } => {
-                AlertRule::FunctionCalled { function_name }
-            }
+            AlertRuleRepr::LargeTransfer { threshold_xlm } => AlertRule::LargeTransfer {
+                threshold_xlm,
+                // Filled in by `validate`.
+                threshold_stroops: 0,
+            },
+            AlertRuleRepr::FunctionCalled { function_name } => AlertRule::FunctionCalled {
+                function_name,
+                match_mode: FunctionMatchMode::default(),
+            },
             AlertRuleRepr::AdminFunctionCalled { function_names } => {
                 AlertRule::AdminFunctionCalled { function_names }
             }
@@ -419,6 +448,16 @@ impl<'de> Deserialize<'de> for AlertRule {
                 threshold_stroops,
                 threshold_xlm,
             },
+            AlertRuleRepr::SourceAccount { allow, deny } => {
+                AlertRule::SourceAccount { allow, deny }
+            }
+            AlertRuleRepr::All { rules } => AlertRule::All { rules },
+            AlertRuleRepr::Any { rules } => AlertRule::Any { rules },
+            AlertRuleRepr::Not { rule } => AlertRule::Not { rule },
+            AlertRuleRepr::NoActivity { minutes } => AlertRule::NoActivity { minutes },
+            AlertRuleRepr::EventEmitted { topic, topics } => {
+                AlertRule::EventEmitted { topic, topics }
+            }
         })
     }
 }
@@ -592,6 +631,7 @@ impl AlertRule {
                         contract_label
                     );
                 }
+            }
             AlertRule::EventEmitted { topic, topics } => {
                 *topic = topic.trim().to_owned();
                 if topic.is_empty() {
@@ -683,6 +723,27 @@ impl AlertRule {
             AlertRule::Not { rule } => {
                 format!("Not({})", rule.rule.label())
             }
+            AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
+            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
+        }
+    }
+
+    /// Stable machine-readable rule variant name, e.g. `"LargeTransfer"`.
+    /// Used in the `rule_type` webhook field for programmatic routing.
+    pub fn rule_type(&self) -> &'static str {
+        match self {
+            AlertRule::AnyTransaction => "AnyTransaction",
+            AlertRule::TransactionFailed => "TransactionFailed",
+            AlertRule::LargeTransfer { .. } => "LargeTransfer",
+            AlertRule::FunctionCalled { .. } => "FunctionCalled",
+            AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled",
+            AlertRule::HighFee { .. } => "HighFee",
+            AlertRule::SourceAccount { .. } => "SourceAccount",
+            AlertRule::All { .. } => "All",
+            AlertRule::Any { .. } => "Any",
+            AlertRule::Not { .. } => "Not",
+            AlertRule::NoActivity { .. } => "NoActivity",
+            AlertRule::EventEmitted { .. } => "EventEmitted",
         }
     }
 }
@@ -705,9 +766,19 @@ impl RuleEntry {
                     problem
                 );
             }
-            AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
-            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
         }
+        if let Some(secret) = &self.webhook_secret {
+            if secret.is_empty() {
+                bail!(
+                    "contract '{}': rule webhook_secret must not be blank",
+                    contract_label
+                );
+            }
+        }
+        if self.enabled {
+            self.rule.validate_at_depth(contract_label, depth)?;
+        }
+        Ok(())
     }
 }
 
@@ -767,15 +838,24 @@ impl From<AlertRule> for RuleConfig {
     }
 }
 
+impl AsRef<AlertRule> for AlertRule {
+    fn as_ref(&self) -> &AlertRule {
+        self
+    }
+}
+
 impl AsRef<AlertRule> for RuleConfig {
     fn as_ref(&self) -> &AlertRule {
         &self.rule
     }
 }
 
-impl AsRef<AlertRule> for AlertRule {
+impl AsRef<AlertRule> for RuleEntry {
     fn as_ref(&self) -> &AlertRule {
-        self
+        &self.rule
+    }
+}
+
 // ── Webhook destinations ──────────────────────────────────────────────────────
 
 /// Printed in place of secret values (header values, secrets, routing keys).
@@ -831,7 +911,10 @@ impl WebhookHeaders {
 
     /// `Name: <redacted>` pairs, safe to print.
     pub fn redacted(&self) -> Vec<String> {
-        self.0.keys().map(|k| format!("{}: {}", k, REDACTED)).collect()
+        self.0
+            .keys()
+            .map(|k| format!("{}: {}", k, REDACTED))
+            .collect()
     }
 }
 
@@ -952,21 +1035,6 @@ impl WebhookDestination {
         }
         problems
     }
-
-    /// Stable machine-readable rule variant name, e.g. `"LargeTransfer"`.
-    /// Used in the `rule_type` webhook field for programmatic routing.
-    pub fn rule_type(&self) -> &'static str {
-        match self {
-            AlertRule::AnyTransaction => "AnyTransaction",
-            AlertRule::TransactionFailed => "TransactionFailed",
-            AlertRule::LargeTransfer { .. } => "LargeTransfer",
-            AlertRule::FunctionCalled { .. } => "FunctionCalled",
-            AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled",
-            AlertRule::HighFee { .. } => "HighFee",
-        }
-        self.rule.validate_at_depth(contract_label, depth)?;
-        Ok(())
-    }
 }
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
@@ -977,10 +1045,7 @@ pub struct WatchedContract {
     pub label: String,
     pub contract_id: String,
     pub network: Network,
-    pub rules: Vec<RuleEntry>,
     pub rules: Vec<RuleConfig>,
-    pub webhook_url: String,
-    pub rules: Vec<AlertRule>,
     /// Shorthand for a single destination; the `webhook_*` fields below
     /// describe it. Use `webhooks` for more than one destination. Optional when
     /// `webhooks` is non-empty.
@@ -1100,11 +1165,9 @@ pub enum ContractIdError {
 impl fmt::Display for ContractIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContractIdError::Length(len) => write!(
-                f,
-                "must be {} characters, got {}",
-                CONTRACT_STRKEY_LEN, len
-            ),
+            ContractIdError::Length(len) => {
+                write!(f, "must be {} characters, got {}", CONTRACT_STRKEY_LEN, len)
+            }
             ContractIdError::Alphabet { position, found } => write!(
                 f,
                 "invalid character {:?} at position {} (only A-Z and 2-7 are allowed)",
@@ -1235,19 +1298,13 @@ impl WatchedContract {
         if self.label.is_empty() {
             errors.push("a contract has an empty label".to_owned());
         } else if self.label.chars().any(char::is_control) {
-            // Cannot check further label constraints without a non-empty label.
-            return errors;
-        }
-        // Labels end up in log lines and CLI output; `{:?}` escapes the
-        // offending characters so the error itself cannot inject them.
-        if self.label.chars().any(char::is_control) {
+            // Labels end up in log lines and CLI output; `{:?}` escapes the
+            // offending characters so the error itself cannot inject them.
             errors.push(format!(
                 "contract label {:?} must not contain control characters",
                 self.label
             ));
         } else if self.label.chars().count() > MAX_LABEL_LEN {
-        }
-        if self.label.chars().count() > MAX_LABEL_LEN {
             errors.push(format!(
                 "contract label '{}…' is longer than {} characters",
                 self.label.chars().take(32).collect::<String>(),
@@ -1274,7 +1331,10 @@ impl WatchedContract {
         if self.webhook_url.is_none() {
             let stray: Vec<&str> = [
                 ("webhook_secret", self.webhook_secret.is_some()),
-                ("webhook_format", self.webhook_format != WebhookFormat::default()),
+                (
+                    "webhook_format",
+                    self.webhook_format != WebhookFormat::default(),
+                ),
                 ("webhook_headers", !self.webhook_headers.is_empty()),
                 ("webhook_routing_key", self.webhook_routing_key.is_some()),
             ]
@@ -1481,7 +1541,6 @@ fn interpolate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<S
             out.push_str("${");
             rest = tail;
         } else if let Some(tail) = after.strip_prefix("${") {
-            let end = tail.find('}').context("unterminated '${'")?;
             let end = tail
                 .find('}')
                 .with_context(|| format!("unterminated '${{' in {:?}", value))?;
@@ -1491,13 +1550,7 @@ fn interpolate(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<S
                 None => (expr, None),
             };
             if name.is_empty() {
-                bail!("empty variable name in '${{}}'");
                 bail!("empty variable name in '${{{}}}'", expr);
-            }
-            for entry in &mut contract.rules {
-                if let Some(secret) = &entry.webhook_secret {
-                    entry.webhook_secret = Some(resolve_env_interpolation(secret)?);
-                }
             }
             if !is_env_var_name(name) {
                 bail!(
@@ -1549,40 +1602,10 @@ fn resolve_destination(
     if let Some(key) = routing_key {
         resolve_field(key, &field("routing_key"))?;
     }
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// [`interpolate`] against the process environment.
-fn resolve_env_interpolation(value: &str) -> Result<String> {
-    interpolate(value, &|name| env::var(name).ok())
-}
-
-/// Interpolates `value` in place, naming `field` in any error.
-fn resolve_field(value: &mut String, field: &str) -> Result<()> {
-    *value = resolve_env_interpolation(value).with_context(|| field.to_owned())?;
     Ok(())
 }
 
 impl AppConfig {
-    /// Expands `${VAR}` references in webhook secrets, header values and
-    /// PagerDuty routing keys.
-    fn resolve_env_vars(&mut self) -> Result<()> {
-        for (i, contract) in self.contracts.iter_mut().enumerate() {
-            resolve_destination(
-                &mut contract.webhook_secret,
-                &mut contract.webhook_headers,
-                &mut contract.webhook_routing_key,
-                &|name| format!("contracts[{}].webhook_{}", i, name),
-            )?;
-            for (j, webhook) in contract.webhooks.iter_mut().enumerate() {
-                resolve_destination(
-                    &mut webhook.secret,
-                    &mut webhook.headers,
-                    &mut webhook.routing_key,
-                    &|name| format!("contracts[{}].webhooks[{}].{}", i, j, name),
-                )?;
     /// Expands `${VAR}` references in every string field that may carry a
     /// secret or a deployment-specific value.
     fn resolve_env_vars(&mut self) -> Result<()> {
@@ -1591,9 +1614,24 @@ impl AppConfig {
         }
         for (i, contract) in self.contracts.iter_mut().enumerate() {
             let field = |name: &str| format!("contracts[{}].{}", i, name);
-            resolve_field(&mut contract.webhook_url, &field("webhook_url"))?;
-            if let Some(secret) = &mut contract.webhook_secret {
-                resolve_field(secret, &field("webhook_secret"))?;
+            if let Some(url) = &mut contract.webhook_url {
+                resolve_field(url, &field("webhook_url"))?;
+            }
+            // The shorthand destination's secret, header values and routing key.
+            resolve_destination(
+                &mut contract.webhook_secret,
+                &mut contract.webhook_headers,
+                &mut contract.webhook_routing_key,
+                &|name| field(&format!("webhook_{name}")),
+            )?;
+            // Each entry of the `webhooks` array is a destination in its own right.
+            for (j, destination) in contract.webhooks.iter_mut().enumerate() {
+                resolve_destination(
+                    &mut destination.secret,
+                    &mut destination.headers,
+                    &mut destination.routing_key,
+                    &|name| format!("contracts[{}].webhooks[{}].{}", i, j, name),
+                )?;
             }
             if let Network::Custom(custom) = &mut contract.network {
                 resolve_field(&mut custom.horizon_url, &field("network.horizon_url"))?;
@@ -1633,15 +1671,11 @@ impl AppConfig {
     pub fn validate(&mut self) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
-            errors.push(e.to_string());
-        }
-
-        if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds") {
         if let Err(e) = validate_poll_interval(self.poll_interval_seconds, "poll_interval_seconds")
         {
             errors.push(e.to_string());
         }
+
         if self.http_pool_max_idle_per_host == 0
             || self.http_pool_max_idle_per_host > MAX_HTTP_POOL_MAX_IDLE_PER_HOST
         {
@@ -1666,7 +1700,6 @@ impl AppConfig {
             errors.extend(contract.collect_errors());
         }
 
-        // Labels are already trimmed by `collect_errors`; compare
         match self.max_contracts {
             Some(max) if max == 0 || max > MAX_CONTRACTS_CEILING => errors.push(format!(
                 "max_contracts must be between 1 and {}",
@@ -1687,18 +1720,14 @@ impl AppConfig {
                 }
             }
         }
-        for contract in &mut self.contracts {
-            errors.extend(contract.collect_errors());
-        }
         // Labels are already trimmed by `WatchedContract::collect_errors`; compare
-        // case-insensitively so "Vault" and "vault" count as duplicates.
+        // case-insensitively so "Vault" and "vault" count as duplicates. Report each
+        // offending label once even when it appears more than twice.
         let mut seen = std::collections::HashSet::new();
+        let mut reported = std::collections::HashSet::new();
         for contract in &self.contracts {
             let key = contract.label.to_lowercase();
             if !seen.insert(key) && reported.insert(contract.label.clone()) {
-            if !seen.insert(contract.label.to_lowercase()) {
-            let key = contract.label.to_lowercase();
-            if !seen.insert(key.clone()) && reported.insert(key) {
                 errors.push(format!("duplicate contract label '{}'", contract.label));
             }
         }
@@ -1714,13 +1743,10 @@ impl AppConfig {
 mod tests {
     use super::*;
 
-    fn rule(r: AlertRule) -> RuleEntry {
-        RuleEntry {
-            enabled: true,
-            webhook_url: None,
-            webhook_secret: None,
-            severity: None,
+    fn rule(r: AlertRule) -> RuleConfig {
+        RuleConfig {
             rule: r,
+            cooldown_seconds: None,
         }
     }
 
@@ -1730,9 +1756,6 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
             network: Network::Testnet,
             rules: vec![rule(AlertRule::AnyTransaction)],
-            rules: vec![AlertRule::AnyTransaction].into_iter().map(Into::into).collect(),
-            webhook_url: "https://example.com/hook".into(),
-            rules: vec![AlertRule::AnyTransaction],
             webhook_url: Some("https://example.com/hook".into()),
             webhook_secret: None,
             poll_interval_seconds: None,
@@ -1826,12 +1849,10 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 })];
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0, threshold_stroops: 0 }];
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }]
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        c.rules = vec![rule(AlertRule::LargeTransfer {
+            threshold_xlm: 0,
+            threshold_stroops: 0,
+        })];
         assert!(c.validate().is_err());
     }
 
@@ -1839,14 +1860,14 @@ mod tests {
     #[test]
     fn large_transfer_threshold_normalises_to_stroops() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer {
+        c.rules = vec![rule(AlertRule::LargeTransfer {
             threshold_xlm: 10_000,
             threshold_stroops: 0,
-        }];
+        })];
         c.validate().unwrap();
         if let AlertRule::LargeTransfer {
             threshold_stroops, ..
-        } = &c.rules[0]
+        } = &c.rules[0].rule
         {
             assert_eq!(
                 *threshold_stroops, 100_000_000_000,
@@ -1862,13 +1883,8 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::LargeTransfer {
             threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
-        })];
             threshold_stroops: 0,
-        }];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
+        })];
         let err = c.validate().unwrap_err();
         assert!(err
             .to_string()
@@ -1880,11 +1896,8 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "  ".into(),
+            match_mode: Default::default(),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1894,10 +1907,6 @@ mod tests {
         c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec![],
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -1908,10 +1917,6 @@ mod tests {
         c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " ".into()],
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         let err = c.validate().unwrap_err();
         assert!(
             err.to_string().contains("blank"),
@@ -1927,10 +1932,6 @@ mod tests {
         c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into()],
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_ok());
     }
 
@@ -1940,10 +1941,6 @@ mod tests {
         c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         c.validate().unwrap();
         if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0].rule {
             assert_eq!(function_names, &["set_admin", "upgrade"]);
@@ -2076,12 +2073,10 @@ mod tests {
         bad_id.webhook_url = Some("ftp://bad".into());
         let mut bad_rule = valid_contract();
         bad_rule.label = "B".into();
-        bad_rule.rules = vec![rule(AlertRule::LargeTransfer { threshold_xlm: 0 })];
-        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0, threshold_stroops: 0 }];
-        bad_rule.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }]
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        bad_rule.rules = vec![rule(AlertRule::LargeTransfer {
+            threshold_xlm: 0,
+            threshold_stroops: 0,
+        })];
         let mut cfg = AppConfig {
             poll_interval_seconds: 1,
             contracts: vec![bad_id, bad_rule, valid_contract(), valid_contract()],
@@ -2155,10 +2150,6 @@ mod tests {
             threshold_stroops: 0,
             threshold_xlm: Some(1),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         c.validate().unwrap();
         if let AlertRule::HighFee {
             threshold_stroops, ..
@@ -2180,10 +2171,6 @@ mod tests {
             threshold_stroops: 0,
             threshold_xlm: Some(0),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_err());
     }
 
@@ -2194,10 +2181,6 @@ mod tests {
             threshold_stroops: 100,
             threshold_xlm: Some(1),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("not both"));
     }
@@ -2209,25 +2192,25 @@ mod tests {
             threshold_stroops: 0,
             threshold_xlm: None,
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn no_activity_zero_minutes_is_rejected() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::NoActivity { minutes: 0 }];
+        c.rules = vec![rule(AlertRule::NoActivity { minutes: 0 })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("NoActivity minutes must be > 0"), "got: {}", err);
+        assert!(
+            err.contains("NoActivity minutes must be > 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
     fn no_activity_nonzero_minutes_is_valid() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::NoActivity { minutes: 30 }];
+        c.rules = vec![rule(AlertRule::NoActivity { minutes: 30 })];
         assert!(c.validate().is_ok());
     }
 
@@ -2455,11 +2438,8 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(33),
+            match_mode: Default::default(),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("contract 'Test'"), "got: {}", err);
         assert!(err.contains("FunctionCalled"), "got: {}", err);
@@ -2475,11 +2455,8 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "a".repeat(32),
+            match_mode: Default::default(),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         assert!(c.validate().is_ok());
     }
 
@@ -2489,11 +2466,8 @@ mod tests {
             let mut c = valid_contract();
             c.rules = vec![rule(AlertRule::FunctionCalled {
                 function_name: name.into(),
+                match_mode: Default::default(),
             })];
-            }]
-            .into_iter()
-            .map(Into::into)
-            .collect();
             let err = c.validate().unwrap_err().to_string();
             assert!(
                 err.contains("not a valid Soroban symbol"),
@@ -2509,11 +2483,8 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::FunctionCalled {
             function_name: "withdraw ".into(),
+            match_mode: Default::default(),
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("\"withdraw \""), "got: {}", err);
     }
@@ -2524,10 +2495,6 @@ mod tests {
         c.rules = vec![rule(AlertRule::AdminFunctionCalled {
             function_names: vec!["set_admin".into(), " upgrade".into()],
         })];
-        }]
-        .into_iter()
-        .map(Into::into)
-        .collect();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("AdminFunctionCalled"), "got: {}", err);
         assert!(err.contains("not a valid Soroban symbol"), "got: {}", err);
@@ -2580,7 +2547,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "Off"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             enabled     = false
@@ -2598,16 +2565,24 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
             type    = "AnyTransaction"
             enabled = false
         "#;
         let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
-        assert!(!cfg.contracts[0].rules[0].enabled);
+        let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule else {
+            panic!("expected All");
+        };
+        assert!(
+            !rules[0].enabled,
+            "nested rule defaults to enabled=false when set"
+        );
     }
 
     #[test]
@@ -2615,7 +2590,7 @@ mod tests {
         let mut c = valid_contract();
         c.validate().unwrap();
         assert!(c.enabled);
-        assert!(c.rules[0].enabled);
+        assert!(matches!(c.rules[0].rule, AlertRule::AnyTransaction));
     }
 
     // ── #53: per-rule webhook_url, webhook_secret, severity ─────────────────
@@ -2626,22 +2601,26 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
             type        = "AnyTransaction"
             webhook_url = "https://pagerduty.example.com/alert"
             severity    = "critical"
         "#;
         let mut cfg: AppConfig = toml::from_str(raw).unwrap();
         cfg.validate().unwrap();
-        let entry = &cfg.contracts[0].rules[0];
+        let AlertRule::All { rules } = &cfg.contracts[0].rules[0].rule else {
+            panic!("expected All");
+        };
         assert_eq!(
-            entry.webhook_url.as_deref(),
+            rules[0].webhook_url.as_deref(),
             Some("https://pagerduty.example.com/alert")
         );
-        assert_eq!(entry.severity, Some(Severity::Critical));
+        assert_eq!(rules[0].severity, Some(Severity::Critical));
     }
 
     #[test]
@@ -2650,10 +2629,12 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
+            type = "All"
+            [[contracts.rules.rules]]
             type        = "AnyTransaction"
             webhook_url = "ftp://bad"
         "#;
@@ -2670,7 +2651,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2687,14 +2668,19 @@ mod tests {
             assert_eq!(rules.len(), 2);
         } else {
             panic!("expected All rule");
+        }
+    }
+
     // ── Issue #50: EventEmitted ───────────────────────────────────────────────
 
     fn event_rule(topic: &str, topics: &[&str]) -> RuleConfig {
-        AlertRule::EventEmitted {
-            topic: topic.into(),
-            topics: topics.iter().map(|t| t.to_string()).collect(),
+        RuleConfig {
+            rule: AlertRule::EventEmitted {
+                topic: topic.into(),
+                topics: topics.iter().map(|t| t.to_string()).collect(),
+            },
+            cooldown_seconds: None,
         }
-        .into()
     }
 
     #[test]
@@ -2739,7 +2725,10 @@ mod tests {
         c.rules = vec![event_rule("transfer", &[])];
         c.soroban_rpc_url = Some("https://rpc.example.com/".into());
         c.validate().unwrap();
-        assert_eq!(c.effective_soroban_rpc_url(), Some("https://rpc.example.com"));
+        assert_eq!(
+            c.effective_soroban_rpc_url(),
+            Some("https://rpc.example.com")
+        );
     }
 
     #[test]
@@ -2748,7 +2737,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2773,7 +2762,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -2800,6 +2789,7 @@ mod tests {
         }];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("cooldown_seconds"), "got: {}", err);
+    }
     // ── Webhook destinations, formats and headers ────────────────────────────
 
     /// Parses and validates `contract_body` as the only `[[contracts]]` entry
@@ -2809,7 +2799,7 @@ mod tests {
             r#"
             [[contracts]]
             label = "x"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network = "testnet"
             {}
             [[contracts.rules]]
@@ -2858,8 +2848,14 @@ mod tests {
             summary,
             [
                 ("https://internal.example.com/hook", WebhookFormat::Txwatch),
-                ("https://hooks.slack.com/services/T/B/X", WebhookFormat::Slack),
-                ("https://events.pagerduty.com/v2/enqueue", WebhookFormat::Pagerduty),
+                (
+                    "https://hooks.slack.com/services/T/B/X",
+                    WebhookFormat::Slack
+                ),
+                (
+                    "https://events.pagerduty.com/v2/enqueue",
+                    WebhookFormat::Pagerduty
+                ),
             ]
         );
     }
@@ -2893,7 +2889,11 @@ mod tests {
             url = "https://example.com/hook"
             "#,
         );
-        assert!(err.contains("webhook_format set without webhook_url"), "got: {}", err);
+        assert!(
+            err.contains("webhook_format set without webhook_url"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2925,8 +2925,14 @@ mod tests {
             "#,
         );
         assert!(
-            err.contains("contract 'x': webhooks[1].url 'ftp://example.com/bad' must use http or https"),
+            err.contains(
+                "contract 'x': webhooks[1].url 'ftp://example.com/bad' must use http or https"
+            ),
             "got: {}",
+            err
+        );
+    }
+
     // ── Contract limit ───────────────────────────────────────────────────────
 
     /// `n` contracts with unique labels.
@@ -2991,7 +2997,7 @@ mod tests {
             poll_interval_seconds = 10
             [[contracts]]
             label       = "C"
-            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
             network     = "testnet"
             webhook_url = "https://example.com/hook"
             [[contracts.rules]]
@@ -3012,7 +3018,11 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::All { rules: vec![] })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("All: rules list must not be empty"), "got: {}", err);
+        assert!(
+            err.contains("All: rules list must not be empty"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3026,6 +3036,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
                 RuleEntry {
@@ -3035,6 +3046,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
+                        threshold_stroops: 0,
                     },
                 },
             ],
@@ -3051,7 +3063,7 @@ mod tests {
     fn source_account_allow_validates() {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
-            allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            allow: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
             deny: vec![],
         })];
         assert!(c.validate().is_ok());
@@ -3062,7 +3074,7 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![rule(AlertRule::SourceAccount {
             allow: vec![],
-            deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()],
+            deny: vec!["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA".into()],
         })];
         assert!(c.validate().is_ok());
     }
@@ -3075,7 +3087,11 @@ mod tests {
             deny: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("at least one of 'allow' or 'deny'"), "got: {}", err);
+        assert!(
+            err.contains("at least one of 'allow' or 'deny'"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3086,7 +3102,14 @@ mod tests {
             deny: vec![],
         })];
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("not a valid Stellar account address"), "got: {}", err);
+        assert!(
+            err.contains("not a valid Stellar account address"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn max_contracts_parses_from_toml() {
         let mut cfg: AppConfig =
             toml::from_str(&format!("max_contracts = 500\n{}", MINIMAL_TOML)).unwrap();
@@ -3094,10 +3117,15 @@ mod tests {
         assert_eq!(cfg.effective_max_contracts(), 500);
         let default: AppConfig = toml::from_str(MINIMAL_TOML).unwrap();
         assert_eq!(default.effective_max_contracts(), MAX_CONTRACTS);
+    }
     // ── Unknown fields in rules ──────────────────────────────────────────────
 
     fn parse_rule(rule_toml: &str) -> Result<AppConfig> {
-        let raw = format!("{}\n{}", MINIMAL_TOML.replace("type = \"AnyTransaction\"", ""), rule_toml);
+        let raw = format!(
+            "{}\n{}",
+            MINIMAL_TOML.replace("type = \"AnyTransaction\"", ""),
+            rule_toml
+        );
         AppConfig::parse(&raw, Path::new("rules.toml"))
     }
 
@@ -3150,12 +3178,20 @@ mod tests {
         )
         .unwrap();
         let headers: Vec<(&str, &str)> = cfg.contracts[0].webhook_headers.iter().collect();
-        assert_eq!(headers, [("Authorization", "Bearer abc"), ("X-Api-Key", "k")]);
+        assert_eq!(
+            headers,
+            [("Authorization", "Bearer abc"), ("X-Api-Key", "k")]
+        );
     }
 
     #[test]
     fn reserved_headers_are_rejected() {
-        for name in ["Content-Type", "content-length", "X-TxWatch-Secret", "x-txwatch-anything"] {
+        for name in [
+            "Content-Type",
+            "content-length",
+            "X-TxWatch-Secret",
+            "x-txwatch-anything",
+        ] {
             let err = parse_err(&format!(
                 r#"webhook_url = "https://example.com/hook"
                 webhook_headers = {{ "{}" = "v" }}"#,
@@ -3163,12 +3199,28 @@ mod tests {
             ));
             assert!(err.contains("is reserved"), "{}: {}", name, err);
             assert!(err.contains("webhook_headers"), "{}: {}", name, err);
+        }
+    }
+
+    #[test]
     fn rejects_misspelled_field_on_every_rule_type() {
         let cases = [
-            ("type = \"AnyTransaction\"\nfunction_name = \"x\"", "function_name"),
-            ("type = \"TransactionFailed\"\nthreshold_xlm = 5", "threshold_xlm"),
-            ("type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshhold = 1", "threshhold"),
-            ("type = \"FunctionCalled\"\nfunction_name = \"x\"\nextra = true", "extra"),
+            (
+                "type = \"AnyTransaction\"\nfunction_name = \"x\"",
+                "function_name",
+            ),
+            (
+                "type = \"TransactionFailed\"\nthreshold_xlm = 5",
+                "threshold_xlm",
+            ),
+            (
+                "type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshhold = 1",
+                "threshhold",
+            ),
+            (
+                "type = \"FunctionCalled\"\nfunction_name = \"x\"\nextra = true",
+                "extra",
+            ),
             (
                 "type = \"AdminFunctionCalled\"\nfunction_names = [\"x\"]\nfunction_name = \"y\"",
                 "function_name",
@@ -3182,8 +3234,15 @@ mod tests {
 
     #[test]
     fn high_fee_typo_is_not_reported_as_missing_threshold() {
-        let err = format!("{:#}", parse_rule("type = \"HighFee\"\nthreshold_xml = 5").unwrap_err());
-        assert!(!err.contains("threshold_stroops must be > 0"), "got: {}", err);
+        let err = format!(
+            "{:#}",
+            parse_rule("type = \"HighFee\"\nthreshold_xml = 5").unwrap_err()
+        );
+        assert!(
+            !err.contains("threshold_stroops must be > 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3202,9 +3261,12 @@ mod tests {
 
     // ── Contract StrKey ──────────────────────────────────────────────────────
 
+    const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
     #[test]
     fn validate_contract_id_accepts_real_contract_ids() {
-    const VALID_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+        assert!(validate_contract_id(VALID_ID).is_ok());
+    }
 
     #[test]
     fn accepts_real_contract_ids() {
@@ -3236,7 +3298,11 @@ mod tests {
             "got: {}",
             err
         );
-        assert!(!err.contains("secret-value"), "header value leaked: {}", err);
+        assert!(
+            !err.contains("secret-value"),
+            "header value leaked: {}",
+            err
+        );
     }
 
     #[test]
@@ -3259,6 +3325,10 @@ mod tests {
         assert_eq!(
             destination.headers.redacted(),
             ["Authorization: <redacted>"]
+        );
+    }
+
+    #[test]
     fn validate_contract_id_reports_each_failure_distinctly() {
         let valid = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
         assert_eq!(
@@ -3267,7 +3337,10 @@ mod tests {
         );
         assert_eq!(
             validate_contract_id("CTEST000000000000000000000000000000000000000000000000000"),
-            Err(ContractIdError::Alphabet { position: 5, found: '0' })
+            Err(ContractIdError::Alphabet {
+                position: 5,
+                found: '0'
+            })
         );
         assert_eq!(
             validate_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"),
@@ -3290,11 +3363,6 @@ mod tests {
         );
         let cfg: AppConfig = toml::from_str(&raw).unwrap();
         assert!(cfg.contracts[0].batch_alerts);
-            VALID_ID,
-        ] {
-            assert!(validate_contract_id(id).is_ok(), "{}", id);
-        }
-        assert_eq!(validate_contract_id(VALID_ID), Ok([0u8; 32]));
     }
 
     #[test]
@@ -3303,7 +3371,10 @@ mod tests {
             let id = format!("C{}{}", bad, &VALID_ID[2..]);
             assert_eq!(
                 validate_contract_id(&id),
-                Err(ContractIdError::Alphabet { position: 1, found: bad }),
+                Err(ContractIdError::Alphabet {
+                    position: 1,
+                    found: bad
+                }),
                 "{}",
                 id
             );
@@ -3311,7 +3382,11 @@ mod tests {
         let mut c = valid_contract();
         c.contract_id = VALID_ID.to_lowercase();
         let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("invalid character 'c' at position 0"), "got: {}", err);
+        assert!(
+            err.contains("invalid character 'c' at position 0"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3348,7 +3423,6 @@ mod tests {
 
     fn lookup(name: &str) -> Option<String> {
         match name {
-            "TOKEN" => Some("t0ken".into()),
             "TOKEN" => Some("s3cr3t".into()),
             "HOST" => Some("hooks.example.com".into()),
             "EMPTY" => Some(String::new()),
@@ -3359,16 +3433,20 @@ mod tests {
     #[test]
     fn interpolation_supports_embedded_defaults_and_escapes() {
         let interp = |v: &str| interpolate(v, &lookup);
-        assert_eq!(interp("${TOKEN}").unwrap(), "t0ken");
-        assert_eq!(interp("Bearer ${TOKEN}").unwrap(), "Bearer t0ken");
+        assert_eq!(interp("${TOKEN}").unwrap(), "s3cr3t");
+        assert_eq!(interp("Bearer ${TOKEN}").unwrap(), "Bearer s3cr3t");
         assert_eq!(interp("${MISSING:-fallback}").unwrap(), "fallback");
         assert_eq!(interp("${EMPTY:-fallback}").unwrap(), "fallback");
         assert_eq!(interp("$${TOKEN}").unwrap(), "${TOKEN}");
         assert_eq!(interp("cost: $5").unwrap(), "cost: $5");
-        assert!(interp("${MISSING}").unwrap_err().to_string().contains("'MISSING'"));
+        assert!(interp("${MISSING}")
+            .unwrap_err()
+            .to_string()
+            .contains("'MISSING'"));
         assert!(interp("${}").is_err());
         assert!(interp("${TOKEN").is_err());
         assert!(interp("${1X}").is_err());
+    }
     fn interp(value: &str) -> Result<String> {
         interpolate(value, &lookup)
     }
@@ -3389,7 +3467,14 @@ mod tests {
 
     #[test]
     fn leaves_values_without_references_unchanged() {
-        for value in ["https://example.com/hook", "", "cost: $5", "$TOKEN", "a$$b", "{TOKEN}"] {
+        for value in [
+            "https://example.com/hook",
+            "",
+            "cost: $5",
+            "$TOKEN",
+            "a$$b",
+            "{TOKEN}",
+        ] {
             assert_eq!(interp(value).unwrap(), value);
         }
     }
@@ -3410,8 +3495,14 @@ mod tests {
 
     #[test]
     fn unterminated_and_invalid_references_are_errors() {
-        assert!(interp("${TOKEN").unwrap_err().to_string().contains("unterminated"));
-        assert!(interp("${1ABC}").unwrap_err().to_string().contains("invalid variable name"));
+        assert!(interp("${TOKEN")
+            .unwrap_err()
+            .to_string()
+            .contains("unterminated"));
+        assert!(interp("${1ABC}")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid variable name"));
         assert!(interp("${A B}").is_err());
     }
 
@@ -3484,12 +3575,17 @@ mod tests {
             err
         );
         assert!(err.contains("TXWATCH_TEST_UNSET"), "got: {}", err);
+    }
+    #[test]
     fn resolve_env_interpolation_reads_process_environment() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("TXWATCH_TEST_SET_VAR", "value");
         env::remove_var("TXWATCH_TEST_UNSET_VAR");
 
-        assert_eq!(resolve_env_interpolation("${TXWATCH_TEST_SET_VAR}").unwrap(), "value");
+        assert_eq!(
+            resolve_env_interpolation("${TXWATCH_TEST_SET_VAR}").unwrap(),
+            "value"
+        );
         assert!(resolve_env_interpolation("${TXWATCH_TEST_UNSET_VAR}").is_err());
         assert_eq!(resolve_env_interpolation("plain").unwrap(), "plain");
         assert!(resolve_env_interpolation("${}").is_err());
@@ -3523,7 +3619,10 @@ mod tests {
         let cfg = cfg.unwrap();
 
         let contract = &cfg.contracts[0];
-        assert_eq!(contract.webhook_url, "https://hooks.example.com/tok123");
+        assert_eq!(
+            contract.webhook_url.as_deref(),
+            Some("https://hooks.example.com/tok123")
+        );
         assert_eq!(contract.webhook_secret.as_deref(), Some("Bearer shh"));
         assert_eq!(contract.network.horizon_base_url(), "http://localhost:8000");
         assert_eq!(cfg.cursor_file.as_deref(), Some("${literal}.json"));
@@ -3537,7 +3636,10 @@ mod tests {
             "https://example.com/hook",
             "https://example.com/${TXWATCH_TEST_MISSING}",
         );
-        let err = format!("{:#}", AppConfig::parse(&raw, Path::new("env.toml")).unwrap_err());
+        let err = format!(
+            "{:#}",
+            AppConfig::parse(&raw, Path::new("env.toml")).unwrap_err()
+        );
         assert!(err.contains("contracts[0].webhook_url"), "got: {}", err);
         assert!(err.contains("TXWATCH_TEST_MISSING"), "got: {}", err);
     }

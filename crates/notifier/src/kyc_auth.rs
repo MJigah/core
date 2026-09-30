@@ -3,7 +3,7 @@
 //! on the position of the first mismatched byte.
 
 use anyhow::{anyhow, Result};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 /// Compares two byte slices in constant time.
@@ -31,15 +31,18 @@ pub fn verify_kyc_webhook(
         .unwrap_or(received_signature_hex)
         .trim();
 
-    let expected_signature_bytes = hex::decode(clean_hex)
-        .map_err(|e| anyhow!("invalid hex signature: {}", e))?;
+    let expected_signature_bytes =
+        hex::decode(clean_hex).map_err(|e| anyhow!("invalid hex signature: {}", e))?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
         .map_err(|e| anyhow!("invalid HMAC key: {}", e))?;
     mac.update(payload_body);
     let computed_signature = mac.finalize().into_bytes();
 
-    Ok(constant_time_compare(&computed_signature, &expected_signature_bytes))
+    Ok(constant_time_compare(
+        &computed_signature,
+        &expected_signature_bytes,
+    ))
 }
 
 #[cfg(test)]

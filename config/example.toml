@@ -15,11 +15,18 @@ webhook_url = "https://hooks.example.com/my-webhook"
   type          = "LargeTransfer"
   threshold_xlm = 10000
 
+  # A composite rule; its nested entries are `RuleEntry`, which supports the
+  # per-rule `webhook_url` / `severity` / `enabled` overrides.
   [[contracts.rules]]
-  type           = "AdminFunctionCalled"
-  function_names = ["set_admin", "upgrade", "initialize"]
-  webhook_url    = "https://hooks.example.com/critical-webhook"  # per-rule override
-  severity       = "critical"
+  type = "All"
+    [[contracts.rules.rules]]
+    type           = "AdminFunctionCalled"
+    function_names = ["set_admin", "upgrade", "initialize"]
+    webhook_url    = "https://hooks.example.com/critical-webhook"  # per-rule override
+    severity       = "critical"
+
+    [[contracts.rules.rules]]
+    type = "TransactionFailed"
 
   [[contracts.rules]]
   type = "TransactionFailed"
@@ -38,11 +45,17 @@ webhook_url = "https://hooks.example.com/vault-webhook"
   type          = "FunctionCalled"
   function_name = "withdraw"
 
-  # Disabled rule: config is preserved but not evaluated
+  # A composite rule with a disabled nested entry: the config is preserved but
+  # the disabled rule is not evaluated.
   [[contracts.rules]]
-  type    = "HighFee"
-  threshold_stroops = 100000
-  enabled = false
+  type = "All"
+    [[contracts.rules.rules]]
+    type             = "HighFee"
+    threshold_stroops = 100000
+    enabled          = false
+
+    [[contracts.rules.rules]]
+    type = "AnyTransaction"
 
 # Each [[contracts]] block is independent: rules, webhook_url, and network settings
 # apply only to that contract. You can define different webhook receivers and alert
@@ -67,8 +80,10 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
 
   # SourceAccount rule: alert when called by anyone except the known admin
   [[contracts.rules]]
+  type = "All"
+  [[contracts.rules.rules]]
   type  = "SourceAccount"
-  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"]
+  deny  = ["GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA"]
   severity = "warning"
 
   # Composite rule: alert only when withdraw is called AND amount is large

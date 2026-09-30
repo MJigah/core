@@ -30,7 +30,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         OnceLock,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use http_body_util::Full;
@@ -239,12 +239,32 @@ fn is_ready() -> bool {
 
 /// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
 ///
-/// Returns an error if the listener cannot be bound.
-pub async fn serve_metrics(addr: SocketAddr, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+/// Binds the listener, starts serving on a background task and returns the
+/// address that was actually bound. Callers may pass port `0`, so the returned
+/// address is the one to scrape. Returns an error only if the listener cannot
+/// be bound.
+pub async fn serve_metrics(
+    addr: SocketAddr,
+    shutdown: watch::Receiver<bool>,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind metrics listener on {addr}"))?;
+    // The caller may pass port 0, so hand back what we actually bound.
+    let bound = listener
+        .local_addr()
+        .with_context(|| format!("read local address of metrics listener on {addr}"))?;
 
+    tokio::spawn(async move {
+        if let Err(e) = accept_loop(listener, shutdown).await {
+            tracing::error!(error = %e, "metrics endpoint stopped");
+        }
+    });
+
+    Ok(bound)
+}
+
+async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -273,7 +293,6 @@ pub async fn serve_metrics(addr: SocketAddr, mut shutdown: watch::Receiver<bool>
             }
         }
     }
-
     Ok(())
 }
 
@@ -281,7 +300,12 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let response = match (req.method().as_str(), req.uri().path()) {
-        ("GET", "/metrics") => text_response(StatusCode::OK, prometheus::TextEncoder::new().encode_to_string(&prometheus::gather()).unwrap_or_default()),
+        ("GET", "/metrics") => text_response(
+            StatusCode::OK,
+            prometheus::TextEncoder::new()
+                .encode_to_string(&prometheus::gather())
+                .unwrap_or_default(),
+        ),
         ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
         ("GET", "/readyz") => {
             if is_ready() {
@@ -291,7 +315,10 @@ async fn handle_request(
             }
         }
         ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
-        _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n".to_string()),
+        _ => text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed\n".to_string(),
+        ),
     };
     Ok(response)
 }
