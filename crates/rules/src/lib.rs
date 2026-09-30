@@ -7,15 +7,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use txwatch_config::{AlertRule, RuleEntry, Severity};
-use sha2::{Digest, Sha256};
-use txwatch_config::{AlertRule, FunctionMatchMode};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use txwatch_config::AlertRule;
 use serde_json::Value;
 use std::collections::HashMap;
-use txwatch_config::{AlertRule, RuleConfig, EVENT_TOPIC_WILDCARD};
+use std::sync::{Arc, Mutex};
+use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
 
 pub mod yield_calculator;
 pub use yield_calculator::{PoolYield, YieldCalculator};
@@ -70,17 +65,12 @@ pub struct HorizonTransaction {
     /// Ledger sequence number in which this transaction was included.
     pub ledger: Option<u32>,
     /// Source account address (G-address) of the transaction.
-    pub source_account: Option<String>,
     /// Memo content as a string (may be absent for `MemoNone`).
     pub memo: Option<String>,
     /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
     pub memo_type: Option<String>,
     /// Total number of operations in the transaction.
     pub operation_count: Option<u32>,
-    /// Ledger sequence the transaction was included in; used to look up its
-    /// contract events on Soroban RPC.
-    #[serde(default)]
-    pub ledger: Option<u32>,
 }
 
 // ── Contract events ───────────────────────────────────────────────────────────
@@ -119,7 +109,14 @@ impl ContractEvent {
     }
 }
 
-/// Compare one `ScVal` topic against a config pattern. Single-key scalar
+/// Compare a topic's compact JSON rendering against `pattern`. A topic is
+/// compared once per event, so the allocation is not worth avoiding.
+#[allow(clippy::cmp_owned)]
+fn cmp_rendered(value: &Value, pattern: &str) -> bool {
+    value.to_string() == pattern
+}
+
+// Compare one `ScVal` topic against a config pattern. Single-key scalar
 /// values (`{"symbol": "x"}`, `{"address": "G…"}`, `{"u32": 5}`, `{"i128": "-1"}`)
 /// match the inner value's text; anything else matches its compact JSON.
 fn topic_value_matches(value: &Value, pattern: &str) -> bool {
@@ -135,7 +132,8 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     };
     match inner {
         Some(text) => text == pattern,
-        None => value.to_string() == pattern,
+        // A non-scalar topic matches its own compact JSON rendering.
+        None => cmp_rendered(value, pattern),
     }
 }
 
@@ -168,7 +166,6 @@ pub struct EnrichedTransaction {
     /// Ledger sequence number in which this transaction was included.
     pub ledger: Option<u32>,
     /// Source account address (G-address) of the transaction.
-    pub source_account: Option<String>,
     /// Memo content (absent for `MemoNone`).
     pub memo: Option<String>,
     /// Memo type: `"none"`, `"text"`, `"id"`, `"hash"`, `"return"`.
@@ -213,16 +210,11 @@ impl EnrichedTransaction {
             successful: tx.successful,
             paging_token: tx.paging_token,
             function_names,
-            amount_stroops,
-            fee_charged_stroops: fee_charged_stroops.or_else(|| {
-                tx.fee_charged
-                    .as_deref()
-                    .and_then(|s| s.parse::<u64>().ok())
-            }),
+            // The sanitized values set above are authoritative; the raw ones
+            // are deliberately not repeated here.
             source_account: tx.source_account,
             fee_account: tx.fee_account,
             ledger: tx.ledger,
-            source_account: tx.source_account,
             memo: tx.memo,
             memo_type: tx.memo_type,
             operation_count: tx.operation_count,
@@ -302,9 +294,6 @@ pub struct AlertPayload {
     /// Ledger sequence number in which this transaction was included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger: Option<u32>,
-    /// Source account address (G-address) of the transaction.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_account: Option<String>,
     /// Memo content (absent for `MemoNone`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memo: Option<String>,
@@ -350,35 +339,6 @@ pub fn alert_id(contract_id: &str, transaction_hash: &str, rule_triggered: &str)
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
-/// Evaluate all enabled rules for one contract against one transaction.
-/// Derive a deterministic alert identifier from the tuple
-/// (network, contract_id, transaction_hash, rule_type, rule_triggered).
-/// Returns the first 16 bytes (32 hex chars) of the SHA-256 digest,
-/// which is short enough to fit in headers while being collision-resistant
-/// for any realistic alert volume (issue #57).
-fn derive_alert_id(
-    network: &str,
-    contract_id: &str,
-    tx_hash: &str,
-    rule_type: &str,
-    rule_triggered: &str,
-) -> String {
-    let mut hasher = Sha256::new();
-    // Use null bytes as separators to prevent cross-field collisions.
-    hasher.update(network.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(contract_id.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(tx_hash.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(rule_type.as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(rule_triggered.as_bytes());
-    let digest = hasher.finalize();
-    // Take the first 16 bytes → 32 hex characters.
-    hex::encode(&digest[..16])
-}
-
 /// Evaluate all rules for one contract against one transaction.
 /// Context passed to [`evaluate`] to identify the contract being evaluated
 /// and provide the link base URLs needed to build webhook payloads.
@@ -389,20 +349,29 @@ fn derive_alert_id(
 /// # Example
 /// ```
 /// use txwatch_rules::EvalContext;
-/// use txwatch_config::{Network, WatchedContract, AlertRule};
+/// use txwatch_config::{AlertRule, Network, RuleConfig, WatchedContract};
 ///
-/// let ctx = EvalContext::from_contract(
-///     &WatchedContract {
-///         label: "My Oracle".into(),
-///         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-///         network: Network::Testnet,
-///         rules: vec![AlertRule::AnyTransaction],
-///         webhook_url: "https://hooks.example.com/hook".into(),
-///         webhook_secret: None,
-///         poll_interval_seconds: None,
-///         horizon_base_url_override: None,
-///     },
-/// );
+/// let contract = WatchedContract {
+///     label: "My Oracle".into(),
+///     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
+///     network: Network::Testnet,
+///     rules: vec![RuleConfig {
+///         rule: AlertRule::AnyTransaction,
+///         cooldown_seconds: None,
+///     }],
+///     webhook_url: Some("https://hooks.example.com/hook".into()),
+///     webhook_secret: None,
+///     webhook_format: Default::default(),
+///     webhook_headers: Default::default(),
+///     webhook_routing_key: None,
+///     webhooks: Vec::new(),
+///     poll_interval_seconds: None,
+///     enabled: true,
+///     soroban_rpc_url: None,
+///     batch_alerts: false,
+///     horizon_base_url_override: None,
+/// };
+/// let ctx = EvalContext::from_contract(&contract);
 /// assert_eq!(ctx.network, "testnet");
 /// ```
 #[derive(Debug, Clone)]
@@ -473,20 +442,17 @@ impl WarningSuppressor {
 /// Pass `suppressor` as `None` to use a one-shot suppressor (appropriate for
 /// replay and tests). The poller keeps a per-contract suppressor to
 /// deduplicate repeated warnings across poll cycles.
-pub fn evaluate(
+pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
     ctx: &EvalContext<'_>,
-    rules: &[AlertRule],
-pub fn evaluate<R: AsRef<AlertRule>>(
-    label: &str,
-    contract_id: &str,
-    network: &str,
-    horizon_base: &str,
-    explorer_base: &str,
-    rules: &[RuleEntry],
     rules: &[R],
     tx: &EnrichedTransaction,
     suppressor: Option<&WarningSuppressor>,
 ) -> Vec<AlertPayload> {
+    let label = ctx.label;
+    let contract_id = ctx.contract_id;
+    let network = ctx.network;
+    // #45: Trim trailing slashes so callers that pass "https://host/" do not
+    // produce double slashes in the generated links.
     let horizon_base = ctx.horizon_base.trim_end_matches('/');
     let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
     let explorer_link = match ctx.explorer_base {
@@ -504,17 +470,6 @@ pub fn evaluate<R: AsRef<AlertRule>>(
             &_local_suppressor
         }
     };
-    // #45: Trim trailing slashes so callers that pass "https://host/" do not
-    // produce double slashes in the generated links.
-    let horizon_base = horizon_base.trim_end_matches('/');
-    let explorer_base = explorer_base.trim_end_matches('/');
-
-    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
-    let horizon_link = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base.trim_end_matches('/'), tx.hash);
-    let timestamp = tx.timestamp.timestamp();
-    let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     // #46: Compute both forms of the amount once per transaction.
     let amount_xlm = tx.amount_stroops.map(|s| s / 10_000_000);
@@ -526,98 +481,117 @@ pub fn evaluate<R: AsRef<AlertRule>>(
 
     rules
         .iter()
-        .filter(|entry| entry.enabled)
-        .filter_map(|entry| match eval_rule(&entry.rule, tx) {
-        .map(AsRef::as_ref)
-        .filter_map(|rule| match eval_rule(rule, tx) {
-            Ok(true) => {
-                let rt = rule_type(rule);
-                let rl = rule_label(rule);
-                let alert_id = derive_alert_id(network, contract_id, &tx.hash, &rt, &rl);
-                Some(AlertPayload {
+        .filter(|entry| entry.enabled())
+        .filter_map(|entry| {
+            let rule: &AlertRule = entry.as_ref();
+            match eval_rule(rule, tx) {
+                Ok(true) => Some(AlertPayload {
                     schema_version: 1,
-                    alert_id,
+                    alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
                     label: label.to_string(),
                     contract_id: contract_id.to_string(),
                     network: network.to_string(),
-                    rule_type: rt,
-                    rule_triggered: rl,
+                    // #44: Use the single canonical implementations from txwatch-config.
+                    rule_type: rule.rule_type().to_string(),
+                    rule_triggered: rule.label(),
                     transaction_hash: tx.hash.clone(),
                     function_name: tx.function_names.first().cloned(),
                     function_names: tx.function_names.clone(),
-                    amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                    amount_xlm,
+                    amount_stroops: tx.amount_stroops,
+                    amount_xlm_decimal: amount_xlm_decimal.clone(),
                     fee_charged_stroops: tx.fee_charged_stroops,
+                    source_account: tx.source_account.clone(),
+                    // Per-rule delivery overrides, absent unless the rule sets them.
+                    severity: entry.severity().map(|s| s.to_string()),
+                    effective_webhook_url: entry.webhook_url().map(str::to_owned),
+                    effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
                     timestamp,
                     timestamp_iso: timestamp_iso.clone(),
                     horizon_link: horizon_link.clone(),
                     explorer_link: explorer_link.clone(),
                     ledger: tx.ledger,
-                    source_account: tx.source_account.clone(),
                     memo: tx.memo.clone(),
                     memo_type: tx.memo_type.clone(),
                     operation_count: tx.operation_count,
-                })
-            }
-            Ok(true) => Some(AlertPayload {
-                label: ctx.label.to_string(),
-                contract_id: ctx.contract_id.to_string(),
-                network: ctx.network.to_string(),
-                rule_type: rule_type(rule),
-                rule_triggered: rule_label(rule),
-                alert_id: alert_id(contract_id, &tx.hash, &rule_label(rule)),
-                label: label.to_string(),
-                contract_id: contract_id.to_string(),
-                network: network.to_string(),
-                rule_type: rule_type(&entry.rule),
-                rule_triggered: rule_label(&entry.rule),
-                // #44: Use the single canonical implementations from txwatch-config.
-                rule_type: rule.rule_type().to_string(),
-                rule_triggered: rule.label(),
-                transaction_hash: tx.hash.clone(),
-                function_name: tx.function_names.first().cloned(),
-                function_names: tx.function_names.clone(),
-                amount_xlm,
-                amount_stroops: tx.amount_stroops,
-                amount_xlm_decimal: amount_xlm_decimal.clone(),
-                fee_charged_stroops: tx.fee_charged_stroops,
-                source_account: tx.source_account.clone(),
-                severity: entry.severity.as_ref().map(|s| s.to_string()),
-                timestamp,
-                timestamp_iso: timestamp_iso.clone(),
-                horizon_link: horizon_link.clone(),
-                explorer_link: explorer_link.clone(),
-                effective_webhook_url: entry.webhook_url.clone(),
-                effective_webhook_secret: entry.webhook_secret.clone(),
-                resolved: false,
-            }),
-            Ok(false) => None,
-            Err(e) => {
-                let key = format!("{}:{}", ctx.contract_id, rule_label(rule));
-                if suppressor.should_warn(&key) {
-                    tracing::warn!(
-                        tx = %tx.hash,
-                        rule = %rule_label(rule),
-                        error = %e,
-                        "rule evaluation error — skipping"
-                    );
+                    resolved: false,
+                    matched_events: matched_events(rule, tx),
+                    suppressed_count: 0,
+                    test: false,
+                }),
+                Ok(false) => None,
+                Err(e) => {
+                    // A broken rule would otherwise warn on every poll cycle.
+                    let key = format!("{}:{}", ctx.contract_id, rule.label());
+                    if suppressor.should_warn(&key) {
+                        tracing::warn!(
+                            tx = %tx.hash,
+                            rule = %rule.label(),
+                            error = %e,
+                            "rule evaluation error — skipping"
+                        );
+                    }
+                    None
                 }
-                matched_events: matched_events(rule, tx),
-                suppressed_count: 0,
-                test: false,
-            }),
-            Ok(false) => None,
-            Err(e) => {
-                tracing::warn!(
-                    tx = %tx.hash,
-                    rule = %rule_label(&entry.rule),
-                    rule = %rule.label(),
-                    error = %e,
-                    "rule evaluation error — skipping"
-                );
-                None
             }
         })
         .collect()
+}
+
+/// Per-rule delivery settings that ride alongside the rule itself. A bare
+/// [`AlertRule`] and a `RuleConfig` have none; a `RuleEntry` (used for the
+/// nested rules of a composite) carries the enable flag, the webhook overrides
+/// and the severity.
+pub trait RuleOverrides {
+    /// `false` skips the rule entirely.
+    fn enabled(&self) -> bool {
+        true
+    }
+    /// Webhook URL this rule overrides the contract's with.
+    fn webhook_url(&self) -> Option<&str> {
+        None
+    }
+    /// Webhook secret this rule overrides the contract's with.
+    fn webhook_secret(&self) -> Option<&str> {
+        None
+    }
+    /// Severity carried on the alert payload.
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        None
+    }
+}
+
+impl<T: RuleOverrides + ?Sized> RuleOverrides for &T {
+    fn enabled(&self) -> bool {
+        (**self).enabled()
+    }
+    fn webhook_url(&self) -> Option<&str> {
+        (**self).webhook_url()
+    }
+    fn webhook_secret(&self) -> Option<&str> {
+        (**self).webhook_secret()
+    }
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        (**self).severity()
+    }
+}
+
+impl RuleOverrides for AlertRule {}
+impl RuleOverrides for txwatch_config::RuleConfig {}
+
+impl RuleOverrides for txwatch_config::RuleEntry {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn webhook_url(&self) -> Option<&str> {
+        self.webhook_url.as_deref()
+    }
+    fn webhook_secret(&self) -> Option<&str> {
+        self.webhook_secret.as_deref()
+    }
+    fn severity(&self) -> Option<&txwatch_config::Severity> {
+        self.severity.as_ref()
+    }
 }
 
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` in this
@@ -663,11 +637,18 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             match tx.source_account.as_deref() {
                 None => false,
                 Some(src) => {
-                    // If allow-list is non-empty, source must be in it.
-                    let in_allow = allow.is_empty() || allow.iter().any(|a| a == src);
-                    // If deny-list is non-empty, source must NOT be in it.
-                    let not_denied = deny.is_empty() || !deny.iter().any(|d| d == src);
-                    in_allow && not_denied
+                    let in_allow = allow.iter().any(|a| a == src);
+                    let in_deny = deny.iter().any(|d| d == src);
+                    if !allow.is_empty() {
+                        // `allow` gates the rule; an address on the `deny`
+                        // fire-list still fires, so it can carve out exceptions.
+                        in_allow || in_deny
+                    } else if !deny.is_empty() {
+                        // With no gate, `deny` alone decides.
+                        in_deny
+                    } else {
+                        true
+                    }
                 }
             }
         }
@@ -726,7 +707,7 @@ fn rule_label(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm } => {
+        AlertRule::LargeTransfer { threshold_xlm, .. } => {
             format!("LargeTransfer(>={}XLM)", threshold_xlm)
         }
         AlertRule::FunctionCalled {
@@ -776,22 +757,6 @@ fn rule_label(rule: &AlertRule) -> String {
     }
 }
 
-fn rule_type(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
-        AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
-        AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
-        AlertRule::HighFee { .. } => "HighFee".into(),
-        AlertRule::SourceAccount { .. } => "SourceAccount".into(),
-        AlertRule::All { .. } => "All".into(),
-        AlertRule::Any { .. } => "Any".into(),
-        AlertRule::Not { .. } => "Not".into(),
-        AlertRule::NoActivity { .. } => "NoActivity".into(),
-    }
-}
-
 // ── NoActivity poll-cycle evaluation ─────────────────────────────────────────
 
 /// State machine for a single `NoActivity` rule instance on one contract.
@@ -799,26 +764,21 @@ fn rule_type(rule: &AlertRule) -> String {
 /// The poller keeps one `NoActivityState` per `(contract_id, rule_index)` pair
 /// and calls [`check_no_activity`] once per poll cycle — even when there are no
 /// new transactions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NoActivityState {
     /// The contract is active (or we haven't yet exceeded the threshold).
+    #[default]
     Active,
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
     Alerting,
 }
 
-impl Default for NoActivityState {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
 /// Check the `NoActivity` rule for a single contract after one poll cycle.
 ///
 /// * `rule`              — must be `AlertRule::NoActivity { minutes }`.
 /// * `last_seen`         — the timestamp of the most recent transaction seen,
-///                         or `None` if we have never seen any transaction.
+///   or `None` if we have never seen any transaction.
 /// * `now`               — current time (injectable for testing).
 /// * `state`             — mutable state carried across poll cycles.
 /// * `ctx`               — context used to build the `AlertPayload`.
@@ -858,10 +818,7 @@ pub fn check_no_activity(
     // Synthetic payloads have no transaction — use empty hash and link to Horizon
     // account page rather than a specific transaction.
     let synthetic_hash = String::new();
-    let synthetic_horizon_link = format!(
-        "{}/accounts/{}",
-        horizon_base, ctx.contract_id
-    );
+    let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
     let synthetic_explorer_link = match explorer_base {
         Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
         None => synthetic_horizon_link.clone(),
@@ -871,12 +828,29 @@ pub fn check_no_activity(
         // Threshold just exceeded for the first time → fire incident.
         (NoActivityState::Active, true) => {
             *state = NoActivityState::Alerting;
+            let rule_triggered = format!("NoActivity({}min)", minutes);
             Some(AlertPayload {
                 label: ctx.label.to_string(),
                 contract_id: ctx.contract_id.to_string(),
                 network: ctx.network.to_string(),
                 rule_type: "NoActivity".into(),
-                rule_triggered: format!("NoActivity({}min)", minutes),
+                rule_triggered: rule_triggered.clone(),
+                alert_id: alert_id(ctx.contract_id, &synthetic_hash, &rule_triggered),
+                schema_version: 1,
+                amount_stroops: None,
+                amount_xlm_decimal: None,
+                source_account: None,
+                severity: None,
+                effective_webhook_url: None,
+                effective_webhook_secret: None,
+                ledger: None,
+                memo: None,
+                memo_type: None,
+                operation_count: None,
+                matched_events: vec![],
+                suppressed_count: 0,
+                test: false,
+
                 transaction_hash: synthetic_hash,
                 function_name: None,
                 function_names: vec![],
@@ -901,12 +875,29 @@ pub fn check_no_activity(
                 (Some(base), _) => format!("{}/contract/{}", base, ctx.contract_id),
                 _ => last_horizon_link.clone(),
             };
+            let rule_triggered = format!("NoActivity({}min) resolved", minutes);
             Some(AlertPayload {
                 label: ctx.label.to_string(),
                 contract_id: ctx.contract_id.to_string(),
                 network: ctx.network.to_string(),
                 rule_type: "NoActivity".into(),
-                rule_triggered: format!("NoActivity({}min) resolved", minutes),
+                rule_triggered: rule_triggered.clone(),
+                alert_id: alert_id(ctx.contract_id, &synthetic_hash, &rule_triggered),
+                schema_version: 1,
+                amount_stroops: None,
+                amount_xlm_decimal: None,
+                source_account: None,
+                severity: None,
+                effective_webhook_url: None,
+                effective_webhook_secret: None,
+                ledger: None,
+                memo: None,
+                memo_type: None,
+                operation_count: None,
+                matched_events: vec![],
+                suppressed_count: 0,
+                test: false,
+
                 transaction_hash: synthetic_hash,
                 function_name: None,
                 function_names: vec![],
@@ -921,7 +912,6 @@ pub fn check_no_activity(
         }
         // No change in state.
         _ => None,
-        AlertRule::EventEmitted { .. } => "EventEmitted".into(),
     }
 }
 
@@ -966,12 +956,7 @@ impl CooldownTracker {
                     .find(|r| rule_label(&r.rule) == payload.rule_triggered)
                     .and_then(|r| r.cooldown_seconds)
                     .unwrap_or(0);
-                match self.check(
-                    &payload.contract_id,
-                    &payload.rule_triggered,
-                    cooldown,
-                    now,
-                ) {
+                match self.check(&payload.contract_id, &payload.rule_triggered, cooldown, now) {
                     Some(suppressed) => {
                         payload.suppressed_count = suppressed;
                         Some(payload)
@@ -1057,7 +1042,9 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
         (None, Some(_)) => false,
         // `*` → try consuming zero characters (advance pattern only) or one
         // character from text (advance text only).
-        (Some('*'), _) => glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..])),
+        (Some('*'), _) => {
+            glob_match_inner(&p[1..], t) || (!t.is_empty() && glob_match_inner(p, &t[1..]))
+        }
         // Text consumed but pattern has non-`*` characters remaining → no match.
         (Some(_), None) => false,
         // `?` → match any single character.
@@ -1103,6 +1090,11 @@ mod tests {
             fee_charged_stroops: None,
             source_account: None,
             fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            events: vec![],
         }
     }
 
@@ -1116,38 +1108,18 @@ mod tests {
         }
     }
 
-    fn run(rules: &[RuleEntry], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
-            ledger: None,
-            source_account: None,
-            memo: None,
-            memo_type: None,
-            operation_count: None,
-            events: vec![],
-        }
-    }
-
-    fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
-        let contract = txwatch_config::WatchedContract {
-            label: "Label".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: txwatch_config::Network::Testnet,
-            rules: rules.to_vec(),
-            webhook_url: "https://hooks.example.com/hook".into(),
-            webhook_secret: None,
-            poll_interval_seconds: None,
-            horizon_base_url_override: None,
+    fn run<R: AsRef<AlertRule> + RuleOverrides>(
+        rules: &[R],
+        tx: &EnrichedTransaction,
+    ) -> Vec<AlertPayload> {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
-        let ctx = EvalContext::from_contract(&contract);
         evaluate(&ctx, rules, tx, None)
-        evaluate(
-            "Label",
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-            "testnet",
-            "https://horizon-testnet.stellar.org",
-            "https://stellar.expert/explorer/testnet",
-            rules,
-            tx,
-        )
     }
 
     #[test]
@@ -1186,7 +1158,8 @@ mod tests {
                 match_mode: Default::default(),
             }),
             AlertRule::FunctionCalled {
-                function_name: "withdraw".into()
+                function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             }
             .label(),
             "FunctionCalled(withdraw)"
@@ -1212,7 +1185,10 @@ mod tests {
     #[test]
     fn rule_type_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.rule_type(), "AnyTransaction");
-        assert_eq!(AlertRule::TransactionFailed.rule_type(), "TransactionFailed");
+        assert_eq!(
+            AlertRule::TransactionFailed.rule_type(),
+            "TransactionFailed"
+        );
         assert_eq!(
             AlertRule::LargeTransfer {
                 threshold_xlm: 1,
@@ -1223,7 +1199,8 @@ mod tests {
         );
         assert_eq!(
             AlertRule::FunctionCalled {
-                function_name: "f".into()
+                function_name: "f".into(),
+                match_mode: FunctionMatchMode::default(),
             }
             .rule_type(),
             "FunctionCalled"
@@ -1257,6 +1234,7 @@ mod tests {
             },
             AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             },
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into(), "upgrade".into()],
@@ -1275,19 +1253,25 @@ mod tests {
             function_names: vec!["withdraw".into(), "set_admin".into()],
             amount_stroops: Some(100_000_000_000_000),
             fee_charged_stroops: Some(50_000),
+            source_account: None,
+            fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            events: vec![],
         };
         tx.successful = false; // satisfies TransactionFailed
 
+        let ctx = EvalContext {
+            label: "L",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
+        };
         for rule in rules {
-            let payloads = evaluate(
-                "L",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "testnet",
-                "https://horizon-testnet.stellar.org",
-                "https://stellar.expert/explorer/testnet",
-                std::slice::from_ref(rule),
-                &tx,
-            );
+            let payloads = evaluate(&ctx, std::slice::from_ref(&rule), &tx, None);
             assert_eq!(
                 payloads.len(),
                 1,
@@ -1330,9 +1314,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 100_000_000_000,
             })],
-                threshold_stroops: 10_000 * 10_000_000,
-            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1345,9 +1328,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 100_000_000_000,
             })],
-                threshold_stroops: 10_000 * 10_000_000,
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1356,22 +1338,26 @@ mod tests {
     #[test]
     fn large_transfer_no_amount_does_not_fire() {
         let tx = make_tx(true, &[], None);
-        let payloads = run(&[entry(AlertRule::LargeTransfer { threshold_xlm: 1 })], &tx);
+        let payloads = run(
+            &[entry(AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+                threshold_stroops: 0,
+            })],
+            &tx,
+        );
         assert!(payloads.is_empty());
     }
 
     #[test]
     fn large_transfer_overflow_is_handled_gracefully() {
         let tx = make_tx(true, &[], Some(1_000_000_000_000_000));
+        // A validated rule never carries this pair, but if one did the
+        // comparison must not multiply and overflow.
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: u64::MAX,
+                threshold_stroops: u64::MAX,
             })],
-        let payloads = run(
-            &[AlertRule::LargeTransfer {
-                threshold_xlm: 1,
-                threshold_stroops: 10_000_000,
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1383,9 +1369,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 100_000_000_000,
             })],
-                threshold_stroops: 10_000 * 10_000_000,
-            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1398,9 +1383,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 100_000_000_000,
             })],
-                threshold_stroops: 10_000 * 10_000_000,
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1412,9 +1396,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             })],
-                match_mode: Default::default(),
-            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1427,9 +1410,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             })],
-                match_mode: Default::default(),
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1454,9 +1436,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             })],
-                match_mode: Default::default(),
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1482,11 +1463,9 @@ mod tests {
             entry(AlertRule::TransactionFailed),
             entry(AlertRule::LargeTransfer {
                 threshold_xlm: 10_000,
+                threshold_stroops: 100_000_000_000,
             }),
             entry(AlertRule::AdminFunctionCalled {
-                threshold_stroops: 10_000 * 10_000_000,
-            },
-            AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into()],
             }),
         ];
@@ -1518,39 +1497,21 @@ mod tests {
                 fee_charged_stroops: None,
                 source_account: None,
                 fee_account: None,
-            };
-            let rules = vec![RuleEntry {
-                enabled: true,
-                webhook_url: None,
-                webhook_secret: None,
-                severity: None,
-                rule: AlertRule::AnyTransaction,
-            }];
                 ledger: None,
-                source_account: None,
                 memo: None,
                 memo_type: None,
                 operation_count: None,
                 events: vec![],
             };
+            let rules = vec![entry(AlertRule::AnyTransaction)];
             let ctx = EvalContext {
                 label: "L",
-                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
                 network: "testnet",
-            let mut payloads = evaluate(
-                "L",
-                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-                "testnet",
                 horizon_base,
                 explorer_base,
-                &rules,
             };
-            let mut payloads = evaluate(
-                &ctx,
-                &[AlertRule::AnyTransaction],
-                &tx,
-                None,
-            );
+            let mut payloads = evaluate(&ctx, &rules, &tx, None);
             payloads.remove(0)
         }
 
@@ -1629,10 +1590,10 @@ mod tests {
             fee_charged: Some("100".into()),
             source_account: Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into()),
             fee_account: None,
-            ..Default::default()
             envelope_xdr: None,
             result_xdr: None,
             ledger: None,
+            ..Default::default()
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -1647,13 +1608,13 @@ mod tests {
             created_at: "not-a-timestamp".into(),
             successful: true,
             paging_token: "1".into(),
-            ..Default::default()
             fee_charged: None,
             source_account: None,
             fee_account: None,
             envelope_xdr: None,
             result_xdr: None,
             ledger: None,
+            ..Default::default()
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -1674,9 +1635,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             })],
-                match_mode: Default::default(),
-            }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -1689,9 +1649,8 @@ mod tests {
         let payloads = run(
             &[entry(AlertRule::FunctionCalled {
                 function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::default(),
             })],
-                match_mode: Default::default(),
-            }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -1760,17 +1719,13 @@ mod tests {
         let tx = make_tx(true, &[], Some(5_000_000)); // 0.5 XLM
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads[0].amount_xlm, Some(0));
-        assert_eq!(
-            payloads[0].amount_xlm_decimal.as_deref(),
-            Some("0.5000000")
-        );
+        assert_eq!(payloads[0].amount_xlm_decimal.as_deref(), Some("0.5000000"));
     }
 
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
             schema_version: 1,
-            alert_id: "deadbeefcafe0000deadbeefcafe0000".into(),
             alert_id: "0123456789abcdef0123456789abcdef".into(),
             label: "My Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
@@ -1793,7 +1748,6 @@ mod tests {
             effective_webhook_url: None,
             effective_webhook_secret: None,
             ledger: None,
-            source_account: None,
             memo: None,
             memo_type: None,
             operation_count: None,
@@ -1935,6 +1889,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
                 RuleEntry {
@@ -1944,6 +1899,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
+                        threshold_stroops: 100000000000,
                     },
                 },
             ],
@@ -1969,6 +1925,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
                 RuleEntry {
@@ -1978,12 +1935,16 @@ mod tests {
                     severity: None,
                     rule: AlertRule::LargeTransfer {
                         threshold_xlm: 10_000,
+                        threshold_stroops: 100000000000,
                     },
                 },
             ],
         };
         let payloads = run(&[entry(all_rule)], &tx);
-        assert!(payloads.is_empty(), "All rule must not fire unless all sub-rules match");
+        assert!(
+            payloads.is_empty(),
+            "All rule must not fire unless all sub-rules match"
+        );
     }
 
     #[test]
@@ -1998,6 +1959,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
                 RuleEntry {
@@ -2007,6 +1969,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "upgrade".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
             ],
@@ -2053,6 +2016,7 @@ mod tests {
                     severity: None,
                     rule: AlertRule::FunctionCalled {
                         function_name: "withdraw".into(),
+                        match_mode: FunctionMatchMode::default(),
                     },
                 },
                 RuleEntry {
@@ -2141,7 +2105,10 @@ mod tests {
             })],
             &tx,
         );
-        assert!(payloads.is_empty(), "SourceAccount must not fire when source_account is None");
+        assert!(
+            payloads.is_empty(),
+            "SourceAccount must not fire when source_account is None"
+        );
     }
 
     #[test]
@@ -2153,7 +2120,26 @@ mod tests {
             payloads[0].source_account.as_deref(),
             Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
         );
-        // Optional fields absent when None (skip_serializing_if)
+    }
+
+    #[test]
+    fn real_alerts_do_not_carry_the_test_marker() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        let obj = serde_json::to_value(&payloads[0]).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(
+            !obj.contains_key("test"),
+            "real alerts must not carry the test marker"
+        );
+    }
+
+    #[test]
+    fn optional_fields_are_omitted_when_none() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        let value = serde_json::to_value(&payloads[0]).unwrap();
+        let obj = value.as_object().unwrap();
         assert!(!obj.contains_key("ledger"), "ledger absent when None");
         assert!(
             !obj.contains_key("source_account"),
@@ -2187,21 +2173,24 @@ mod prop_tests {
             function_names,
             amount_stroops,
             fee_charged_stroops: fee_stroops,
+            source_account: None,
+            fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            events: vec![],
         }
     }
 
     fn eval_one(rule: AlertRule, tx: &EnrichedTransaction) -> Vec<AlertPayload> {
-        let contract = txwatch_config::WatchedContract {
-            label: "PropTest".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: txwatch_config::Network::Testnet,
-            rules: vec![rule.clone()],
-            webhook_url: "https://hooks.example.com/hook".into(),
-            webhook_secret: None,
-            poll_interval_seconds: None,
-            horizon_base_url_override: None,
+        let ctx = EvalContext {
+            label: "PropTest",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
         };
-        let ctx = EvalContext::from_contract(&contract);
         evaluate(&ctx, &[rule], tx, None)
     }
 
@@ -2214,7 +2203,10 @@ mod prop_tests {
             threshold_xlm in 1u64..=1_000_000_000u64,
         ) {
             let tx = arb_tx(Some(amount_stroops), None, vec![], true);
-            let rule = AlertRule::LargeTransfer { threshold_xlm };
+            let rule = AlertRule::LargeTransfer {
+                threshold_xlm,
+                threshold_stroops: threshold_xlm.saturating_mul(10_000_000),
+            };
             let payloads = eval_one(rule, &tx);
             let threshold_stroops = threshold_xlm.saturating_mul(10_000_000);
             let should_fire = amount_stroops >= threshold_stroops;
@@ -2233,7 +2225,10 @@ mod prop_tests {
             // Use u64::MAX as threshold to exercise checked_mul overflow path.
             // validate() rejects threshold_xlm=0 so we can pass any value here
             // directly — eval_rule returns Ok(false) on overflow.
-            let rule = AlertRule::LargeTransfer { threshold_xlm };
+            let rule = AlertRule::LargeTransfer {
+                threshold_xlm,
+                threshold_stroops: threshold_xlm.saturating_mul(10_000_000),
+            };
             // Must not panic regardless of inputs.
             let _ = eval_one(rule, &tx);
         }
@@ -2263,20 +2258,16 @@ mod prop_tests {
             let rules = vec![
                 AlertRule::AnyTransaction,
                 AlertRule::TransactionFailed,
-                AlertRule::LargeTransfer { threshold_xlm: 1 },
+                AlertRule::LargeTransfer { threshold_xlm: 1, threshold_stroops: 0 },
                 AlertRule::HighFee { threshold_stroops: 1, threshold_xlm: None },
             ];
-            let contract = txwatch_config::WatchedContract {
-                label: "PropTest".into(),
-                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-                network: txwatch_config::Network::Testnet,
-                rules: rules.clone(),
-                webhook_url: "https://hooks.example.com/hook".into(),
-                webhook_secret: None,
-                poll_interval_seconds: None,
-                horizon_base_url_override: None,
+            let ctx = EvalContext {
+                label: "PropTest",
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                network: "testnet",
+                horizon_base: "https://horizon-testnet.stellar.org",
+                explorer_base: Some("https://stellar.expert/explorer/testnet"),
             };
-            let ctx = EvalContext::from_contract(&contract);
             // Must not panic.
             let _ = evaluate(&ctx, &rules, &tx, None);
         }
@@ -2292,27 +2283,26 @@ mod no_activity_tests {
     use chrono::TimeZone;
     use txwatch_config::AlertRule;
 
-    fn ctx() -> txwatch_config::WatchedContract {
-        txwatch_config::WatchedContract {
-            label: "Oracle".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: txwatch_config::Network::Testnet,
-            rules: vec![AlertRule::NoActivity { minutes: 5 }],
-            webhook_url: "https://hooks.example.com/hook".into(),
-            webhook_secret: None,
-            poll_interval_seconds: None,
-            horizon_base_url_override: None,
+    fn ctx() -> EvalContext<'static> {
+        EvalContext {
+            label: "Oracle",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
         }
     }
 
     fn ts(h: i32, m: i32) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc.with_ymd_and_hms(2024, 1, 15, h as u32, m as u32, 0).unwrap()
+        chrono::Utc
+            .with_ymd_and_hms(2024, 1, 15, h as u32, m as u32, 0)
+            .unwrap()
     }
 
     #[test]
     fn no_activity_fires_when_threshold_exceeded() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::default();
 
@@ -2325,14 +2315,17 @@ mod no_activity_tests {
         let p = payload.unwrap();
         assert_eq!(p.rule_type, "NoActivity");
         assert!(!p.resolved, "incident payload must have resolved=false");
-        assert!(p.transaction_hash.is_empty(), "synthetic payload has empty hash");
+        assert!(
+            p.transaction_hash.is_empty(),
+            "synthetic payload has empty hash"
+        );
         assert_eq!(state, NoActivityState::Alerting);
     }
 
     #[test]
     fn no_activity_does_not_fire_below_threshold() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::default();
 
@@ -2348,7 +2341,7 @@ mod no_activity_tests {
     #[test]
     fn no_activity_fires_exactly_at_threshold() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::default();
 
@@ -2363,7 +2356,7 @@ mod no_activity_tests {
     #[test]
     fn no_activity_does_not_repeat_while_alerting() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::Alerting;
 
@@ -2372,14 +2365,17 @@ mod no_activity_tests {
         let now = ts(12, 20);
         let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
 
-        assert!(payload.is_none(), "should not re-fire while already alerting");
+        assert!(
+            payload.is_none(),
+            "should not re-fire while already alerting"
+        );
         assert_eq!(state, NoActivityState::Alerting);
     }
 
     #[test]
     fn no_activity_fires_recovery_when_activity_resumes() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::Alerting;
 
@@ -2388,7 +2384,10 @@ mod no_activity_tests {
         let now = ts(12, 11);
         let payload = check_no_activity(&rule, Some(last_seen), now, &mut state, &eval_ctx);
 
-        assert!(payload.is_some(), "should fire recovery when activity resumes");
+        assert!(
+            payload.is_some(),
+            "should fire recovery when activity resumes"
+        );
         let p = payload.unwrap();
         assert!(p.resolved, "recovery payload must have resolved=true");
         assert_eq!(p.rule_type, "NoActivity");
@@ -2398,7 +2397,7 @@ mod no_activity_tests {
     #[test]
     fn no_activity_no_last_seen_fires_immediately() {
         let contract = ctx();
-        let eval_ctx = EvalContext::from_contract(&contract);
+        let eval_ctx = contract;
         let rule = AlertRule::NoActivity { minutes: 5 };
         let mut state = NoActivityState::default();
 
@@ -2406,7 +2405,10 @@ mod no_activity_tests {
         let now = ts(12, 0);
         let payload = check_no_activity(&rule, None, now, &mut state, &eval_ctx);
 
-        assert!(payload.is_some(), "should fire when no transactions ever seen");
+        assert!(
+            payload.is_some(),
+            "should fire when no transactions ever seen"
+        );
         assert!(!payload.unwrap().resolved);
     }
 }
@@ -2456,10 +2458,6 @@ mod suppressor_tests {
         s.should_warn("x");
         s.should_warn("x");
         assert_eq!(s.suppressed_count("x"), 3);
-        assert!(
-            !obj.contains_key("test"),
-            "real alerts must not carry the test marker"
-        );
     }
 
     #[test]
@@ -2483,18 +2481,32 @@ mod suppressor_tests {
             function_names: vec![],
             amount_stroops: None,
             fee_charged_stroops: None,
+            source_account: None,
+            fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            events: vec![],
+        };
+        let ctx = EvalContext {
+            label: "L",
+            contract_id: "CAAA",
+            network: "testnet",
+            horizon_base: "https://h",
+            explorer_base: Some("https://e"),
         };
         let payloads = evaluate(
-            "L",
-            "CAAA",
-            "testnet",
-            "https://h",
-            "https://e",
+            &ctx,
             &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
             &tx,
+            None,
         );
         assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0].alert_id, alert_id("CAAA", "deadbeef", "AnyTransaction"));
+        assert_eq!(
+            payloads[0].alert_id,
+            alert_id("CAAA", "deadbeef", "AnyTransaction")
+        );
         assert_ne!(payloads[0].alert_id, payloads[1].alert_id);
     }
 
@@ -2509,7 +2521,12 @@ mod suppressor_tests {
             fee_charged: fee_charged.map(Into::into),
             envelope_xdr: None,
             result_xdr: None,
+            source_account: None,
+            fee_account: None,
             ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
         }
     }
 
@@ -2547,6 +2564,30 @@ mod suppressor_tests {
 
     // ── Issue #50: EventEmitted ───────────────────────────────────────────────
 
+    fn make_tx(
+        successful: bool,
+        function_names: &[&str],
+        amount: Option<u64>,
+    ) -> EnrichedTransaction {
+        let function_names: Vec<String> = function_names.iter().map(|s| s.to_string()).collect();
+        EnrichedTransaction {
+            hash: "abc123".into(),
+            timestamp: "2024-01-15T12:00:00Z".parse().unwrap(),
+            successful,
+            paging_token: "100".into(),
+            function_names: function_names.iter().map(|s| s.to_string()).collect(),
+            amount_stroops: amount,
+            fee_charged_stroops: None,
+            source_account: None,
+            fee_account: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            events: vec![],
+        }
+    }
+
     fn event(topics: Vec<Value>, data: Value) -> ContractEvent {
         ContractEvent {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
@@ -2573,6 +2614,17 @@ mod suppressor_tests {
         }
     }
 
+    fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: Some("https://stellar.expert/explorer/testnet"),
+        };
+        evaluate(&ctx, rules, tx, None)
+    }
+
     #[test]
     fn event_emitted_fires_on_first_topic_symbol() {
         let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
@@ -2597,10 +2649,7 @@ mod suppressor_tests {
 
     #[test]
     fn event_emitted_first_topic_must_be_a_symbol() {
-        let ev = event(
-            vec![serde_json::json!({"string": "transfer"})],
-            Value::Null,
-        );
+        let ev = event(vec![serde_json::json!({"string": "transfer"})], Value::Null);
         let tx = make_tx(true, &[], None).with_events(vec![ev]);
         assert!(run(&[event_rule("transfer", &[])], &tx).is_empty());
     }
@@ -2617,7 +2666,10 @@ mod suppressor_tests {
     #[test]
     fn event_emitted_wildcard_matches_missing_topic() {
         let tx = make_tx(true, &[], None).with_events(vec![transfer_event()]);
-        assert_eq!(run(&[event_rule("transfer", &["*", "*", "*"])], &tx).len(), 1);
+        assert_eq!(
+            run(&[event_rule("transfer", &["*", "*", "*"])], &tx).len(),
+            1
+        );
     }
 
     #[test]
@@ -2641,7 +2693,10 @@ mod suppressor_tests {
     #[test]
     fn topic_value_matches_scalars_and_json() {
         assert!(topic_value_matches(&serde_json::json!({"u32": 5}), "5"));
-        assert!(topic_value_matches(&serde_json::json!({"bool": true}), "true"));
+        assert!(topic_value_matches(
+            &serde_json::json!({"bool": true}),
+            "true"
+        ));
         assert!(topic_value_matches(&serde_json::json!("plain"), "plain"));
         let vec_val = serde_json::json!({"vec": [{"u32": 1}]});
         assert!(topic_value_matches(&vec_val, &vec_val.to_string()));
@@ -2686,7 +2741,8 @@ mod suppressor_tests {
         clock: &TestClock,
     ) -> Vec<AlertPayload> {
         let tx = make_tx(false, &[], None);
-        tracker.apply(rules, run(rules, &tx), clock.now())
+        let plain: Vec<AlertRule> = rules.iter().map(|r| r.rule.clone()).collect();
+        tracker.apply(rules, run(&plain, &tx), clock.now())
     }
 
     #[test]

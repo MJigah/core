@@ -23,16 +23,19 @@ serde_json     = { workspace = true }
 anyhow         = { workspace = true }
 chrono         = { workspace = true }
 tracing        = { workspace = true }
-
-[dev-dependencies]
-proptest   = "1"
-serde_json = { workspace = true }
+# Used by production code for commitment hashing and alert-id derivation, not
+# only by tests.
 sha2           = { workspace = true }
 hex            = { workspace = true }
+# Backs the `soroban-xdr` feature. It has to be a real optional dependency
+# rather than a dev-dependency, because a dev-dependency cannot be optional and
+# the feature references it with `dep:`.
 stellar-xdr    = { version = "21", optional = true, default-features = false, features = ["std", "curr"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+proptest   = "1"
+tokio      = { workspace = true, features = ["macros", "rt"] }
+criterion  = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name    = "evaluate"

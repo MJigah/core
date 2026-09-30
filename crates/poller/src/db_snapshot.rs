@@ -1,10 +1,10 @@
 //! Automated PostgreSQL database snapshotting routine for continuous testnet monitoring.
 //! Manages scheduled database backups, retention policies, and snapshot rotation.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 /// Metadata recorded for each database snapshot execution.
@@ -44,14 +44,17 @@ impl PostgresSnapshotRoutine {
 
     /// Evaluates whether the current testnet polling cycle requires a snapshot.
     pub fn should_snapshot(&self, current_cycle: u64) -> bool {
-        current_cycle > 0 && (current_cycle % self.snapshot_interval_cycles == 0)
+        current_cycle > 0 && current_cycle.is_multiple_of(self.snapshot_interval_cycles)
     }
 
     /// Executes an automated snapshot for the specified testnet cycle.
     pub async fn execute_snapshot(&self, cycle: u64) -> Result<SnapshotMetadata> {
         let timestamp = Utc::now();
         let timestamp_str = timestamp.format("%Y%m%d_%H%M%S").to_string();
-        let filename = format!("txwatch_testnet_snapshot_cycle_{}_{}.sql", cycle, timestamp_str);
+        let filename = format!(
+            "txwatch_testnet_snapshot_cycle_{}_{}.sql",
+            cycle, timestamp_str
+        );
         let target_path = self.snapshot_directory.join(&filename);
 
         info!(

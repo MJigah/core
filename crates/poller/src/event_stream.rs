@@ -178,11 +178,7 @@ impl SorobanEventStreamer {
     ///
     /// The first URL is used until it fails; subsequent polls then start from
     /// the endpoint that last succeeded.
-    pub fn with_urls(
-        rpc_urls: Vec<String>,
-        contract_ids: Vec<String>,
-        start_ledger: u64,
-    ) -> Self {
+    pub fn with_urls(rpc_urls: Vec<String>, contract_ids: Vec<String>, start_ledger: u64) -> Self {
         Self {
             rpc_urls,
             active_url: 0,
@@ -190,7 +186,6 @@ impl SorobanEventStreamer {
             last_cursor: None,
             current_ledger: start_ledger,
             client: build_client(),
-            client: Client::builder().build().unwrap_or_default(),
             mode: StreamMode::default(),
             consecutive_disconnects: 0,
         }
@@ -351,7 +346,10 @@ impl SorobanEventStreamer {
 
     /// Performs a single SSE connection attempt against the Horizon endpoint.
     async fn open_sse_stream(&mut self) -> Result<Vec<SorobanEvent>> {
-        let mut url = format!("{}/events", self.rpc_url.trim_end_matches('/'));
+        let mut url = format!(
+            "{}/events",
+            self.rpc_urls[self.active_url].trim_end_matches('/')
+        );
         if let Some(cursor) = &self.last_cursor {
             url = format!("{}?cursor={}", url, cursor);
         }
@@ -447,7 +445,10 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(header("User-Agent", format!("{}/{}", CLIENT_NAME, CLIENT_VERSION).as_str()))
+            .and(header(
+                "User-Agent",
+                format!("{}/{}", CLIENT_NAME, CLIENT_VERSION).as_str(),
+            ))
             .and(header("X-Client-Name", CLIENT_NAME))
             .and(header("X-Client-Version", CLIENT_VERSION))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -492,11 +493,8 @@ mod tests {
             .mount(&healthy)
             .await;
 
-        let mut streamer = SorobanEventStreamer::with_urls(
-            vec![failing.uri(), healthy.uri()],
-            vec![],
-            1,
-        );
+        let mut streamer =
+            SorobanEventStreamer::with_urls(vec![failing.uri(), healthy.uri()], vec![], 1);
 
         let events = streamer.fetch_events().await.unwrap();
         assert!(events.is_empty());
@@ -531,6 +529,7 @@ mod tests {
         let events = streamer.fetch_events().await.unwrap();
         assert!(events.is_empty());
         assert_eq!(streamer.current_ledger(), 7);
+    }
     #[test]
     fn test_stream_mode_defaults_to_poll() {
         assert_eq!(StreamMode::default(), StreamMode::Poll);

@@ -1,7 +1,7 @@
 //! Live testnet liquidity pool and lending protocol yield calculator.
 //! Queries live Soroban testnet AMM pools and lending markets to compute dynamic APY/APR.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +53,9 @@ impl YieldCalculator {
         let live_reserve_stroops = 1_000_000_000_000u64;
         let annual_fee_factor = 365.0;
 
-        let dynamic_apy = ((live_daily_fee_stroops as f64 * annual_fee_factor) / (live_reserve_stroops as f64)) * 100.0;
+        let dynamic_apy = ((live_daily_fee_stroops as f64 * annual_fee_factor)
+            / (live_reserve_stroops as f64))
+            * 100.0;
         Ok((dynamic_apy, live_reserve_stroops))
     }
 
@@ -71,7 +73,7 @@ mod tests {
         let calc = YieldCalculator::new("https://soroban-testnet.stellar.org");
         let result = calc.fetch_pool_yield("test-pool-01", "soroswap").await;
         assert!(result.is_ok());
-        let pool_yield = result.unwrap();
+        let pool_yield = result.expect("live pool fetch should succeed");
         assert_eq!(pool_yield.pool_id, "test-pool-01");
         assert_eq!(pool_yield.protocol, "soroswap");
         assert!(pool_yield.apy > 0.0);

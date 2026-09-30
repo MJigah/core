@@ -1,17 +1,5 @@
 #![allow(dead_code)]
-use txwatch_config::{AlertRule, Network, WatchedContract};
-use txwatch_poller::ContractState;
-use txwatch_config::{AlertRule, Network, RuleEntry, WatchedContract};
-
-pub fn rule(r: AlertRule) -> RuleEntry {
-    RuleEntry {
-        enabled: true,
-        webhook_url: None,
-        webhook_secret: None,
-        severity: None,
-        rule: r,
-    }
-}
+use txwatch_config::{AlertRule, Network, RuleConfig, WatchedContract};
 
 /// Build a `WatchedContract` fixture with sensible test defaults.
 ///
@@ -22,8 +10,13 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         label: "Integration Test Contract".into(),
         contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".into(),
         network: Network::Testnet,
-        rules: rules.into_iter().map(rule).collect(),
-        rules: rules.into_iter().map(Into::into).collect(),
+        rules: rules
+            .into_iter()
+            .map(|r| RuleConfig {
+                rule: r,
+                cooldown_seconds: None,
+            })
+            .collect(),
         webhook_url: Some(webhook_url.to_string()),
         webhook_secret: None,
         poll_interval_seconds: None,
@@ -36,12 +29,6 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         webhooks: Vec::new(),
         batch_alerts: false,
     }
-}
-
-/// Construct a fresh per-contract state for tests, mirroring how each
-/// contract's task owns its own `ContractState`.
-pub fn contract_state(contract_id: &str) -> ContractState {
-    ContractState::new(contract_id.to_string())
 }
 
 pub fn tx_page(hash: &str, paging_token: &str, successful: bool) -> serde_json::Value {

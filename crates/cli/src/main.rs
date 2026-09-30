@@ -36,7 +36,13 @@ struct Cli {
     config: PathBuf,
 
     /// Log output format: human-readable text or one JSON object per line
-    #[arg(long, global = true, value_enum, env = "TXWATCH_LOG_FORMAT", default_value = "text")]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        env = "TXWATCH_LOG_FORMAT",
+        default_value = "text"
+    )]
     log_format: LogFormat,
 
     /// Override the Horizon base URL for every contract (e.g. a private Horizon instance)
@@ -197,18 +203,26 @@ async fn main() -> Result<()> {
     init_tracing(cli.log_format);
 
     match cli.command {
-        Command::Validate { format: OutputFormat::Json, .. } => {
-            match AppConfig::from_file(&required_config(&cli.config)?) {
-                Ok(cfg) => println!("{}", serde_json::to_string_pretty(&config_summary_json(&cfg))?),
-                Err(e) => {
-                    let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
-                    println!("{}", serde_json::to_string_pretty(&error)?);
-                    std::process::exit(1);
-                }
+        Command::Validate {
+            format: OutputFormat::Json,
+            ..
+        } => match AppConfig::from_file(&required_config(&cli.config)?) {
+            Ok(cfg) => println!(
+                "{}",
+                serde_json::to_string_pretty(&config_summary_json(&cfg))?
+            ),
+            Err(e) => {
+                let error = serde_json::json!({ "valid": false, "error": format!("{:#}", e) });
+                println!("{}", serde_json::to_string_pretty(&error)?);
+                std::process::exit(1);
             }
-        }
+        },
 
-        Command::Validate { check_webhooks, check_horizon, .. } => {
+        Command::Validate {
+            check_webhooks,
+            check_horizon,
+            ..
+        } => {
             let cfg = load_config(&cli)?;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
@@ -238,11 +252,7 @@ async fn main() -> Result<()> {
                 );
                 println!("    rules        : {}", c.rules.len());
                 for entry in &c.rules {
-                    if entry.enabled {
-                        println!("      - {}", entry.rule.label());
-                    } else {
-                        println!("      - {} (disabled)", entry.rule.label());
-                    }
+                    println!("      - {}", entry.rule.label());
                 }
                 println!("    horizon      : {}", c.network.horizon_base_url());
                 match c.network.explorer_base_url() {
@@ -261,7 +271,11 @@ async fn main() -> Result<()> {
                 let targets: Vec<(String, String)> = cfg
                     .contracts
                     .iter()
-                    .flat_map(|c| c.destinations().into_iter().map(move |d| (c.label.clone(), d.url)))
+                    .flat_map(|c| {
+                        c.destinations()
+                            .into_iter()
+                            .map(move |d| (c.label.clone(), d.url))
+                    })
                     .collect();
                 let checks = join_all(targets.into_iter().map(|(label, url)| {
                     let client = &client;
@@ -269,38 +283,81 @@ async fn main() -> Result<()> {
                         let result = check_webhook_reachable(client, &url).await;
                         (label, url, result)
                     }
-                })).await;
+                }))
+                .await;
                 let mut failed = false;
                 println!("Webhook checks:");
                 for (label, url, result) in checks {
                     match result {
                         Ok(status) => {
-                            if status == "method not allowed" { failed = true; }
+                            if status == "method not allowed" {
+                                failed = true;
+                            }
                             println!("  {:<18} {:<20} {}", label, status, url)
                         }
-                        Err(error) => { failed = true; println!("  {:<18} {:<20} {} ({})", label, "unreachable", url, error); }
+                        Err(error) => {
+                            failed = true;
+                            println!("  {:<18} {:<20} {} ({})", label, "unreachable", url, error);
+                        }
                     }
                 }
-                if failed { return Err(anyhow::anyhow!("one or more webhook checks failed")); }
+                if failed {
+                    return Err(anyhow::anyhow!("one or more webhook checks failed"));
+                }
             }
             if check_horizon {
-                let client = Client::builder().timeout(Duration::from_secs(5)).build().context("failed to build HTTP client")?;
-                let checks = join_all(cfg.contracts.iter().map(|c| check_horizon_contract(&client, c))).await;
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .context("failed to build HTTP client")?;
+                let checks = join_all(
+                    cfg.contracts
+                        .iter()
+                        .map(|c| check_horizon_contract(&client, c)),
+                )
+                .await;
                 let mut failed = false;
                 println!("Horizon checks:");
                 for check in checks {
-                    println!("  {:<10} {:<12} latest ledger: {} — {}", check.network, check.status, check.latest_ledger.map_or_else(|| "unknown".into(), |n| n.to_string()), check.message);
+                    println!(
+                        "  {:<10} {:<12} latest ledger: {} — {}",
+                        check.network,
+                        check.status,
+                        check
+                            .latest_ledger
+                            .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                        check.message
+                    );
                     failed |= !check.reachable || !check.found;
                 }
-                if failed { return Err(anyhow::anyhow!("one or more Horizon checks failed")); }
+                if failed {
+                    return Err(anyhow::anyhow!("one or more Horizon checks failed"));
+                }
             }
         }
 
-        Command::TestWebhook { url, label, network, contract, secret, format, routing_key, headers } => {
-            let configured = contract.as_ref().map(|wanted| {
-                let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
-                cfg.contracts.into_iter().find(|c| c.label == *wanted).ok_or_else(|| anyhow::anyhow!("configured contract '{}' not found", wanted))
-            }).transpose()?;
+        Command::TestWebhook {
+            url,
+            label,
+            network,
+            contract,
+            secret,
+            format,
+            routing_key,
+            headers,
+        } => {
+            let configured = contract
+                .as_ref()
+                .map(|wanted| {
+                    let cfg = AppConfig::from_file(&required_config(&cli.config)?)?;
+                    cfg.contracts
+                        .into_iter()
+                        .find(|c| c.label == *wanted)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("configured contract '{}' not found", wanted)
+                        })
+                })
+                .transpose()?;
             let (destinations, network) = if let Some(c) = configured {
                 let mut destinations = c.destinations();
                 if secret.is_some() {
@@ -310,9 +367,16 @@ async fn main() -> Result<()> {
                 }
                 (destinations, c.network)
             } else {
-                let selected = match network.as_str() { "mainnet" => txwatch_config::Network::Mainnet, "testnet" => txwatch_config::Network::Testnet, "futurenet" => txwatch_config::Network::Futurenet, other => return Err(anyhow::anyhow!("unknown network '{}'", other)) };
+                let selected = match network.as_str() {
+                    "mainnet" => txwatch_config::Network::Mainnet,
+                    "testnet" => txwatch_config::Network::Testnet,
+                    "futurenet" => txwatch_config::Network::Futurenet,
+                    other => return Err(anyhow::anyhow!("unknown network '{}'", other)),
+                };
                 let destination = WebhookDestination {
-                    url: url.ok_or_else(|| anyhow::anyhow!("--url is required unless --contract is provided"))?,
+                    url: url.ok_or_else(|| {
+                        anyhow::anyhow!("--url is required unless --contract is provided")
+                    })?,
                     secret,
                     format,
                     headers: parse_headers(&headers)?,
@@ -321,7 +385,6 @@ async fn main() -> Result<()> {
                 destination.validate()?;
                 (vec![destination], selected)
             };
-            let payload = test_payload_with_network(&label, &network_name, &horizon_base_url);
             let client = build_client().context("failed to build HTTP client")?;
 
             // Try every destination, then fail if any of them failed.
@@ -329,7 +392,6 @@ async fn main() -> Result<()> {
             for destination in &destinations {
                 let payload = test_payload_with_network(
                     &label,
-                    &destination.url,
                     network.as_str(),
                     network.horizon_base_url(),
                     network.explorer_base_url(),
@@ -355,7 +417,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Init { ref contract_id, ref network, ref webhook_url, ref output, force } => {
+        Command::Init {
+            ref contract_id,
+            ref network,
+            ref webhook_url,
+            ref output,
+            force,
+        } => {
             if output.exists() && !force {
                 return Err(anyhow::anyhow!(
                     "'{}' already exists; pass --force to overwrite it",
@@ -365,19 +433,31 @@ async fn main() -> Result<()> {
             let contract_id = value_or_prompt(contract_id, "Contract ID (C...)")?;
             let network = match network {
                 Some(n) => n.clone(),
-                None => prompt("Network [testnet]")?.filter(|n| !n.is_empty()).unwrap_or_else(|| "testnet".into()),
+                None => prompt("Network [testnet]")?
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| "testnet".into()),
             };
             let webhook_url = value_or_prompt(webhook_url, "Webhook URL")?;
 
             let raw = render_init_config(&contract_id, &network, &webhook_url)?;
             // Validate with the config crate before touching the filesystem.
             AppConfig::parse(&raw, output).context("the generated config is not valid")?;
-            fs::write(output, raw).with_context(|| format!("failed to write '{}'", output.display()))?;
-            println!("Wrote {}. Check it with: txwatch --config {} validate", output.display(), output.display());
+            fs::write(output, raw)
+                .with_context(|| format!("failed to write '{}'", output.display()))?;
+            println!(
+                "Wrote {}. Check it with: txwatch --config {} validate",
+                output.display(),
+                output.display()
+            );
         }
 
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "txwatch", &mut std::io::stdout());
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "txwatch",
+                &mut std::io::stdout(),
+            );
         }
 
         Command::Man => {
@@ -388,7 +468,11 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Replay { ref contract, ref tx, send } => {
+        Command::Replay {
+            ref contract,
+            ref tx,
+            send,
+        } => {
             let cfg = load_config(&cli)?;
             let contract = cfg
                 .contracts
@@ -398,7 +482,12 @@ async fn main() -> Result<()> {
             let client = build_client().context("failed to build HTTP client")?;
 
             let payloads = txwatch_poller::replay_transaction(&client, &contract, tx).await?;
-            println!("{} rule(s) matched transaction {} for '{}'", payloads.len(), tx, contract.label);
+            println!(
+                "{} rule(s) matched transaction {} for '{}'",
+                payloads.len(),
+                tx,
+                contract.label
+            );
             for payload in &payloads {
                 println!();
                 println!("  rule: {}", payload.rule_triggered);
@@ -431,7 +520,10 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Schema => println!("{}", serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?),
+        Command::Schema => println!(
+            "{}",
+            serde_json::to_string_pretty(&schemars::schema_for!(txwatch_config::AppConfig))?
+        ),
 
         Command::Watch {
             dry_run,
@@ -443,7 +535,12 @@ async fn main() -> Result<()> {
             let cfg = load_config(&cli)?;
 
             if once {
-                info!(version = VERSION, contracts = cfg.contracts.len(), dry_run, "running a single TxWatch poll cycle");
+                info!(
+                    version = VERSION,
+                    contracts = cfg.contracts.len(),
+                    dry_run,
+                    "running a single TxWatch poll cycle"
+                );
                 let report = txwatch_poller::run_once(cfg, dry_run).await?;
                 info!(
                     transactions = report.transactions,
@@ -474,6 +571,8 @@ async fn main() -> Result<()> {
 
             #[cfg(feature = "metrics")]
             if let Some(addr) = metrics_addr {
+                // Register before serving so the first scrape already has it.
+                txwatch_poller::metrics::register_build_info();
                 txwatch_poller::serve_metrics(addr, shutdown_rx.clone()).await?;
             }
             let (reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
@@ -498,7 +597,10 @@ fn prompt(label: &str) -> Result<Option<String>> {
     eprint!("{label}: ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
-    let read = std::io::stdin().lock().read_line(&mut line).context("failed to read from stdin")?;
+    let read = std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("failed to read from stdin")?;
     Ok((read > 0).then(|| line.trim().to_owned()))
 }
 
@@ -613,12 +715,8 @@ fn config_summary_json(cfg: &AppConfig) -> serde_json::Value {
                 let mut obj = serde_json::to_value(&entry.rule)
                     .unwrap_or_else(|_| serde_json::json!({}));
                 let map = obj.as_object_mut().unwrap();
-                map.insert("enabled".to_string(), serde_json::json!(entry.enabled));
-                if let Some(url) = &entry.webhook_url {
-                    map.insert("webhook_url".to_string(), serde_json::json!(url));
-                }
-                if let Some(sev) = &entry.severity {
-                    map.insert("severity".to_string(), serde_json::json!(sev.to_string()));
+                if let Some(cooldown) = entry.cooldown_seconds {
+                    map.insert("cooldown_seconds".to_string(), serde_json::json!(cooldown));
                 }
                 serde_json::Value::Object(map.clone())
             }).collect();
@@ -655,11 +753,18 @@ fn describe_destination(destination: &WebhookDestination) -> String {
         format!("format: {}", destination.format),
         format!(
             "secret: {}",
-            if destination.secret.is_some() { "set" } else { "none" }
+            if destination.secret.is_some() {
+                "set"
+            } else {
+                "none"
+            }
         ),
     ];
     if !destination.headers.is_empty() {
-        parts.push(format!("headers: {}", destination.headers.redacted().join(", ")));
+        parts.push(format!(
+            "headers: {}",
+            destination.headers.redacted().join(", ")
+        ));
     }
     if destination.routing_key.is_some() {
         parts.push(format!("routing_key: {}", REDACTED));
@@ -684,8 +789,12 @@ fn destination_summary_json(destination: &WebhookDestination) -> serde_json::Val
 }
 
 fn parse_webhook_format(value: &str) -> Result<WebhookFormat, String> {
-    serde_json::from_value(serde_json::Value::from(value))
-        .map_err(|_| format!("unknown format '{}': use txwatch, slack, discord or pagerduty", value))
+    serde_json::from_value(serde_json::Value::from(value)).map_err(|_| {
+        format!(
+            "unknown format '{}': use txwatch, slack, discord or pagerduty",
+            value
+        )
+    })
 }
 
 /// Parses repeated `--header "Name: value"` arguments.
@@ -695,7 +804,9 @@ fn parse_headers(raw: &[String]) -> Result<WebhookHeaders> {
         let (name, value) = header
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("--header must look like \"Name: value\""))?;
-        headers.0.insert(name.trim().to_owned(), value.trim().to_owned());
+        headers
+            .0
+            .insert(name.trim().to_owned(), value.trim().to_owned());
     }
     Ok(headers)
 }
@@ -709,7 +820,11 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<&'static 
                 || resp.status() == StatusCode::NOT_IMPLEMENTED =>
         {
             let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            if resp.status().is_success() { Ok("reachable (OPTIONS)") } else { Ok("method not allowed") }
+            if resp.status().is_success() {
+                Ok("reachable (OPTIONS)")
+            } else {
+                Ok("method not allowed")
+            }
         }
         Ok(_) => Ok("method not allowed"),
         Err(err) => {
@@ -730,24 +845,66 @@ struct HorizonCheck {
     message: String,
 }
 
-async fn check_horizon_contract(client: &Client, contract: &txwatch_config::WatchedContract) -> HorizonCheck {
-    let base = contract.horizon_base_url_override.as_deref().unwrap_or_else(|| contract.network.horizon_base_url());
+async fn check_horizon_contract(
+    client: &Client,
+    contract: &txwatch_config::WatchedContract,
+) -> HorizonCheck {
+    let base = contract
+        .horizon_base_url_override
+        .as_deref()
+        .unwrap_or_else(|| contract.network.horizon_base_url());
     let root = client.get(base).send().await;
     let (reachable, latest_ledger) = match root {
         Ok(response) if response.status().is_success() => {
-            let json = response.json::<serde_json::Value>().await.unwrap_or_default();
-            (true, json.get("core_latest_ledger").and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|text| text.parse().ok()))))
+            let json = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_default();
+            (
+                true,
+                json.get("core_latest_ledger").and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                }),
+            )
         }
         _ => (false, None),
     };
     if !reachable {
-        return HorizonCheck { network: contract.network.as_str().into(), status: "unreachable", latest_ledger, reachable: false, found: false, message: format!("Horizon {} is unreachable", base) };
+        return HorizonCheck {
+            network: contract.network.as_str().into(),
+            status: "unreachable",
+            latest_ledger,
+            reachable: false,
+            found: false,
+            message: format!("Horizon {} is unreachable", base),
+        };
     }
     // Horizon exposes Soroban contract activity through the same account-style
     // transactions collection used by the poller. A 404 means the contract is
     // not known on this network; a successful empty collection is still valid.
-    let found = client.get(format!("{}/accounts/{}/transactions?limit=1", base, contract.contract_id)).send().await.map(|response| response.status().is_success()).unwrap_or(false);
-    HorizonCheck { network: contract.network.as_str().into(), status: if found { "found" } else { "not found" }, latest_ledger, reachable, found, message: if found { format!("{} exists on {}", contract.label, contract.network) } else { format!("{} not found on {}", contract.contract_id, contract.network) } }
+    let found = client
+        .get(format!(
+            "{}/accounts/{}/transactions?limit=1",
+            base, contract.contract_id
+        ))
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false);
+    HorizonCheck {
+        network: contract.network.as_str().into(),
+        status: if found { "found" } else { "not found" },
+        latest_ledger,
+        reachable,
+        found,
+        message: if found {
+            format!("{} exists on {}", contract.label, contract.network)
+        } else {
+            format!("{} not found on {}", contract.contract_id, contract.network)
+        },
+    }
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 

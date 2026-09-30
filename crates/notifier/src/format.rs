@@ -208,7 +208,6 @@ pub fn pagerduty(p: &AlertPayload, routing_key: &str) -> Value {
     })
 }
 
-
 // ── Snapshot tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -234,6 +233,21 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            schema_version: 1,
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            source_account: None,
+            severity: None,
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            matched_events: vec![],
+            suppressed_count: 0,
+            resolved: false,
+            test: false,
         }
     }
 
@@ -300,7 +314,10 @@ mod tests {
             "footer": { "text": "TxWatch · alert 3f2b9c1d8e7a6b5c4d3e2f1a0b9c8d7e" }
           }]
         }"#;
-        assert_eq!(render(WebhookFormat::Discord, &fixture()), snapshot(expected));
+        assert_eq!(
+            render(WebhookFormat::Discord, &fixture()),
+            snapshot(expected)
+        );
     }
 
     #[test]
@@ -334,15 +351,24 @@ mod tests {
               "function_name": "transfer",
               "function_names": ["transfer"],
               "amount_xlm": 15000,
+              "amount_stroops": null,
+              "amount_xlm_decimal": null,
               "fee_charged_stroops": 50000,
               "timestamp": 1705320000,
               "timestamp_iso": "2024-01-15T12:00:00Z",
               "horizon_link": "https://horizon-testnet.stellar.org/transactions/abc123",
-              "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123"
+              "explorer_link": "https://stellar.expert/explorer/testnet/tx/abc123",
+              "schema_version": 1,
+              "resolved": false,
+              "matched_events": [],
+              "suppressed_count": 0
             }
           }
         }"#;
-        assert_eq!(render(WebhookFormat::Pagerduty, &fixture()), snapshot(expected));
+        assert_eq!(
+            render(WebhookFormat::Pagerduty, &fixture()),
+            snapshot(expected)
+        );
     }
 
     #[test]
@@ -386,7 +412,10 @@ mod tests {
                 render(WebhookFormat::Pagerduty, &p)["payload"]["severity"],
                 severity
             );
-            assert_eq!(render(WebhookFormat::Discord, &p)["embeds"][0]["color"], colour);
+            assert_eq!(
+                render(WebhookFormat::Discord, &p)["embeds"][0]["color"],
+                colour
+            );
         }
     }
 
