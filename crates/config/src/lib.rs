@@ -1591,6 +1591,46 @@ pub struct WebhookDestination {
     pub rule_types: Vec<String>,
 }
 
+/// Reads and parses a PEM file, returning a short description of the problem
+/// (never the file contents) when it cannot be read or parsed.
+fn check_pem_file(path: &str, kind: &str) -> Option<String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(format!("cannot be read: {}", e)),
+    };
+    if bytes.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return Some("is not valid UTF-8 PEM text".to_owned()),
+    };
+    let begin = format!("-----BEGIN {}-----", kind);
+    let end = format!("-----END {}-----", kind);
+    if !text.contains(&begin) || !text.contains(&end) {
+        return Some(format!("does not contain a {} PEM block", kind));
+    }
+    None
+}
+
+/// Warns (on Unix) when a private key file is readable by group or others.
+fn key_permission_warning(path: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "is accessible by group or others (mode {:04o}); consider chmod 600",
+                mode & 0o777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
+}
+
 impl fmt::Debug for WebhookDestination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebhookDestination")
@@ -1708,8 +1748,15 @@ impl WebhookDestination {
             )),
             (WebhookFormat::Template, Some(template)) => {
                 let mut env = minijinja::Environment::new();
-                if let Err(e) = env.add_template("body", template) {
-                    problems.push(format!("{} is invalid: {}", field("template"), e));
+                match env.add_template("body", template) {
+                    Err(e) => {
+                        problems.push(format!("{} is invalid: {}", field("template"), e));
+                    }
+                    Ok(_) => {
+                        if let Err(e) = check_template_renders(template) {
+                            problems.push(format!("{} {}", field("template"), e));
+                        }
+                    }
                 }
             }
             (_, Some(_)) => problems.push(format!(
@@ -1724,6 +1771,23 @@ impl WebhookDestination {
                 field("client_cert"),
                 field("client_key")
             ));
+        }
+        if let Some(cert) = &self.client_cert {
+            if let Some(problem) = check_pem_file(cert, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("client_cert"), problem));
+            }
+        }
+        if let Some(key) = &self.client_key {
+            if let Some(problem) = check_pem_file(key, "PRIVATE KEY") {
+                problems.push(format!("{} {}", field("client_key"), problem));
+            } else if let Some(warning) = key_permission_warning(key) {
+                problems.push(format!("{} {}", field("client_key"), warning));
+            }
+        }
+        if let Some(ca) = &self.ca_cert {
+            if let Some(problem) = check_pem_file(ca, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("ca_cert"), problem));
+            }
         }
         if self.has_tls_config() && !self.url.starts_with("https://") {
             problems.push(format!(
@@ -1827,6 +1891,72 @@ impl fmt::Display for ValidationErrors {
 }
 
 impl std::error::Error for ValidationErrors {}
+
+/// Renders `template` against a synthetic payload for every rule type, so a
+/// template that references an optional field (absent for e.g. `NoActivity`)
+/// fails at config load instead of at delivery time.
+fn check_template_renders(template: &str) -> std::result::Result<(), String> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template("body", template)
+        .map_err(|e| format!("is invalid: {}", e))?;
+    let tmpl = env
+        .get_template("body")
+        .map_err(|e| format!("is invalid: {}", e))?;
+    for rule_type in SYNTHETIC_RULE_TYPES {
+        let payload = synthetic_payload(rule_type);
+        tmpl.render(&payload)
+            .map_err(|e| format!("fails to render for {} alerts: {}", rule_type, e))?;
+    }
+    Ok(())
+}
+
+/// Rule types a synthetic payload is rendered for.
+const SYNTHETIC_RULE_TYPES: &[&str] = &[
+    "AnyTransaction",
+    "TransactionFailed",
+    "LargeTransfer",
+    "FunctionCalled",
+    "AdminFunctionCalled",
+    "HighFee",
+    "SourceAccount",
+    "All",
+    "Any",
+    "Not",
+    "NoActivity",
+    "EventEmitted",
+    "ContractUpgraded",
+    "Rate",
+    "Memo",
+];
+
+/// A payload with every optional field present (as `null` where the real
+/// payload would omit it), so templates referencing them still render.
+fn synthetic_payload(rule_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "rule_type": rule_type,
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "label": "synthetic",
+        "network": "testnet",
+        "tx_hash": "0".repeat(64),
+        "source_account": null,
+        "severity": null,
+        "memo": null,
+        "ledger": null,
+        "fee_account": null,
+        "old_wasm_hash": null,
+        "new_wasm_hash": null,
+        "function_name": null,
+        "amount": null,
+        "asset": null,
+        "topic": null,
+        "topics": [],
+        "data": null,
+        "suppressed_count": 0,
+        "timestamp": "1970-01-01T00:00:00Z",
+        "explorer_url": null,
+    })
+}
 
 /// Checks that `value` is an http(s) URL with a host; returns a description
 /// of the problem otherwise.
@@ -4876,6 +5006,44 @@ mod tests {
             validate_contract_id(&mistyped),
             Err(ContractIdError::Checksum { .. })
         ));
+    }
+
+    #[test]
+    fn template_referencing_optional_field_is_rejected_at_load() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ source_account }}".into()),
+            ..Default::default()
+        }];
+        // The synthetic payload provides `source_account` as null, so a plain
+        // reference renders; a missing field still fails.
+        assert!(c.validate().is_ok());
+
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ definitely_not_a_field }}".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].template"), "got: {}", err);
+    }
+
+    #[test]
+    fn missing_client_cert_file_is_reported_with_field_path() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            client_cert: Some("/nonexistent/txwatch-cert.pem".into()),
+            client_key: Some("/nonexistent/txwatch-key.pem".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].client_cert"), "got: {}", err);
+        assert!(err.contains("webhooks[0].client_key"), "got: {}", err);
     }
 
     #[test]

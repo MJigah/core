@@ -76,6 +76,12 @@ pub fn render_batch_body(
 /// Renders a user-defined body template. Every [`AlertPayload`] field is a
 /// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
 /// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
+///
+/// Optional fields are always present in the render context (as `null` when
+/// the payload omits them), so a template referencing e.g. `{{ source_account }}`
+/// renders for every alert type instead of failing at delivery time for alerts
+/// such as `NoActivity` or cooldown summaries. Unknown variables still fail
+/// (strict undefined behaviour).
 fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
     let mut env = minijinja::Environment::new();
     env.set_auto_escape_callback(|_| minijinja::AutoEscape::Json);
@@ -83,7 +89,113 @@ fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
     env.add_template("body", template)?;
     Ok(env
         .get_template("body")?
-        .render(minijinja::Value::from_serialize(payload))?)
+        .render(template_context(payload))?)
+}
+
+/// Builds the render context for `payload`: the serialized payload with every
+/// optional field filled in as `null` when absent, so templates can reference
+/// them unconditionally.
+fn template_context(payload: &AlertPayload) -> Value {
+    let mut value = serde_json::to_value(payload).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        for field in OPTIONAL_TEMPLATE_FIELDS {
+            map.entry((*field).to_owned()).or_insert(Value::Null);
+        }
+    }
+    value
+}
+
+/// Optional [`AlertPayload`] fields that may be absent from the serialized
+/// payload (`skip_serializing_if`) but must still be addressable from a
+/// template.
+const OPTIONAL_TEMPLATE_FIELDS: &[&str] = &[
+    "function_name",
+    "amount_xlm",
+    "amount_stroops",
+    "amount_xlm_decimal",
+    "fee_charged_stroops",
+    "source_account",
+    "fee_account",
+    "severity",
+    "ledger",
+    "memo",
+    "memo_type",
+    "operation_count",
+    "old_wasm_hash",
+    "new_wasm_hash",
+    "effective_webhook_url",
+    "effective_webhook_secret",
+];
+
+/// Validates a user-defined template at load time by rendering it against a
+/// synthetic payload for every rule type (including `NoActivity` and
+/// cooldown summaries). Returns an error naming the offending template when
+/// rendering fails, so misconfiguration surfaces at config load rather than at
+/// delivery time.
+pub fn validate_template(template: &str) -> Result<()> {
+    for payload in synthetic_payloads() {
+        render_template(template, &payload).map_err(|err| {
+            anyhow!(
+                "template failed to render for rule type {}: {}",
+                payload.rule_type,
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Synthetic payloads covering every rule type, including ones that omit
+/// optional fields (`NoActivity`, cooldown summaries).
+fn synthetic_payloads() -> Vec<AlertPayload> {
+    let rule_types = [
+        "LargeTransfer",
+        "TransactionFailed",
+        "AdminFunctionCalled",
+        "AnyTransaction",
+        "NoActivity",
+        "CooldownSummary",
+        "TestWebhook",
+    ];
+    rule_types
+        .iter()
+        .map(|rule_type| AlertPayload {
+            schema_version: 1,
+            alert_id: "0000000000000000000000000000000000000000".into(),
+            label: "synthetic".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: "testnet".into(),
+            rule_type: (*rule_type).into(),
+            rule_triggered: format!("{}(synthetic)", rule_type),
+            transaction_hash: "0".repeat(64),
+            function_name: None,
+            function_names: vec![],
+            amount_xlm: None,
+            amount_stroops: None,
+            amount_xlm_decimal: None,
+            fee_charged_stroops: None,
+            source_account: None,
+            fee_account: None,
+            severity: None,
+            timestamp: 0,
+            timestamp_iso: "1970-01-01T00:00:00Z".into(),
+            explorer_link: "https://stellar.expert/explorer/testnet".into(),
+            horizon_link: "https://horizon-testnet.stellar.org".into(),
+            effective_webhook_url: None,
+            effective_webhook_secret: None,
+            ledger: None,
+            memo: None,
+            memo_type: None,
+            operation_count: None,
+            resolved: false,
+            matched_events: vec![],
+            suppressed_count: 0,
+            test: false,
+            old_wasm_hash: None,
+            new_wasm_hash: None,
+            enrichment_incomplete: false,
+        })
+        .collect()
 }
 
 /// One-line summary shared by the chat formats. A recovery notification
@@ -735,6 +847,32 @@ mod tests {
             Some("{{ nope }}"),
         )
         .unwrap_err();
+        assert!(err.to_string().contains("undefined"), "got: {}", err);
+    }
+
+    #[test]
+    fn template_renders_optional_fields_as_null() {
+        let body = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some(r#"{"source": {{ source_account }}, "severity": {{ severity }}, "ledger": {{ ledger }}}"#),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["source"], Value::Null);
+        assert_eq!(v["severity"], Value::Null);
+        assert_eq!(v["ledger"], Value::Null);
+    }
+
+    #[test]
+    fn validate_template_accepts_optional_field_references() {
+        validate_template(r#"{"text": {{ source_account }}, "memo": {{ memo }}}"#).unwrap();
+    }
+
+    #[test]
+    fn validate_template_rejects_unknown_variables() {
+        let err = validate_template("{{ nope }}").unwrap_err();
         assert!(err.to_string().contains("undefined"), "got: {}", err);
     }
 

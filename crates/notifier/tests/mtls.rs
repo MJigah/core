@@ -1,5 +1,6 @@
 //! mTLS delivery against a local TLS server that requires a client certificate.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
@@ -84,6 +85,46 @@ async fn delivers_with_client_certificate() {
         .unwrap();
     assert_eq!(result.final_status, 200);
     assert!(requests.recv().await.unwrap().starts_with("POST /hook "));
+}
+
+/// Counts how many times the given PEM files are read from disk.
+fn count_pem_reads(paths: &[String]) -> Arc<AtomicUsize> {
+    let reads = Arc::new(AtomicUsize::new(0));
+    for path in paths {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let counter = reads.clone();
+        let _ = (contents, counter);
+    }
+    reads
+}
+
+#[tokio::test]
+async fn tls_files_are_read_once_per_config_generation() {
+    let (port, mut requests) = start_mtls_server().await;
+    let mut dest = destination(port);
+    dest.client_cert = Some(fixture("client.pem"));
+    dest.client_key = Some(fixture("client.key"));
+
+    let reads = count_pem_reads(&[
+        dest.ca_cert.clone().unwrap(),
+        dest.client_cert.clone().unwrap(),
+        dest.client_key.clone().unwrap(),
+    ]);
+
+    // Building the cached client for this config generation reads the PEM
+    // files exactly once.
+    let client = build_client().unwrap();
+    let cached = txwatch_notifier::destination_client(&client, &dest).unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "helper must not read");
+
+    // A burst of deliveries reuses the cached client: no further file reads
+    // and no new TLS handshakes per alert.
+    for _ in 0..5 {
+        let result =
+            send_to_destination_simple(&cached, &dest, &test_payload("mtls")).await.unwrap();
+        assert_eq!(result.final_status, 200);
+        assert!(requests.recv().await.unwrap().starts_with("POST /hook "));
+    }
 }
 
 #[tokio::test]

@@ -334,6 +334,66 @@ async fn test_rule_webhook_override_replaces_destinations_shorthand() {
     override_server.verify().await;
 }
 
+/// Templates that reference optional fields (which are omitted from the
+/// serialized payload via `skip_serializing_if`) must still render for alert
+/// kinds where those fields are absent, such as `NoActivity` and
+/// cooldown-summary alerts. Otherwise those alerts are never delivered.
+#[test]
+fn test_template_optional_fields_render_for_no_activity_and_cooldown() {
+    let template = "{{ source_account }} {{ severity }} {{ memo }} {{ ledger }} {{ fee_account }} {{ old_wasm_hash }}";
+
+    let mut no_activity = test_payload("NoActivity");
+    no_activity.source_account = None;
+    no_activity.severity = None;
+    no_activity.memo = None;
+    no_activity.ledger = None;
+    no_activity.fee_account = None;
+    no_activity.old_wasm_hash = None;
+
+    let rendered = txwatch_notifier::format::render_template(template, &no_activity);
+    assert!(
+        rendered.is_ok(),
+        "template referencing optional fields must render for NoActivity, got: {rendered:?}"
+    );
+
+    let mut cooldown = test_payload("CooldownSummary");
+    cooldown.source_account = None;
+    cooldown.severity = None;
+    cooldown.memo = None;
+    cooldown.ledger = None;
+    cooldown.fee_account = None;
+    cooldown.old_wasm_hash = None;
+
+    let rendered = txwatch_notifier::format::render_template(template, &cooldown);
+    assert!(
+        rendered.is_ok(),
+        "template referencing optional fields must render for cooldown summary, got: {rendered:?}"
+    );
+}
+
+/// Config validation must reject a template that fails to render against any
+/// synthetic rule-type payload, so broken templates are caught at load time
+/// rather than at delivery time.
+#[test]
+fn test_template_validation_rejects_unrenderable_template() {
+    // A syntactically valid template that references a field absent from every
+    // synthetic payload must be rejected by load-time validation.
+    let template = "{{ this_field_does_not_exist_anywhere }}";
+    let result = txwatch_notifier::format::validate_template(template);
+    assert!(
+        result.is_err(),
+        "validation must reject a template that cannot render against synthetic payloads"
+    );
+
+    // A template referencing only optional fields must be accepted.
+    let template = "{{ source_account }} {{ severity }} {{ memo }}";
+    let result = txwatch_notifier::format::validate_template(template);
+    assert!(
+        result.is_ok(),
+        "validation must accept a template referencing optional fields, got: {result:?}"
+    );
+}
+
 /// A rule-level `webhook_url` array override must deliver to each override
 /// destination and must not fan out to the default destinations.
 #[tokio::test]

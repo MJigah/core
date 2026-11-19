@@ -10,6 +10,9 @@ use reqwest::Client;
 use schemars::JsonSchema;
 use serde::Serialize;
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
@@ -89,13 +92,29 @@ pub async fn send_webhook(
 
 /// The client to use for `destination`: `client` itself, or a dedicated client
 /// carrying the destination's mTLS identity and extra CA certificate.
+///
+/// This reads the destination's PEM files and builds a fresh client on every
+/// call, so it is only suitable for one-off use. Callers that deliver many
+/// alerts should build a [`DestinationClients`] cache once per config
+/// generation and use [`DestinationClients::client_for`] instead.
 pub fn destination_client(client: &Client, destination: &WebhookDestination) -> Result<Client> {
+    destination_client_with_reader(client, destination, &read_tls_file)
+}
+
+/// Read a TLS PEM file from disk.
+fn read_tls_file(path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| anyhow!("cannot read TLS file '{}': {}", path, e))
+}
+
+/// Build the client for `destination`, reading PEM files through `read`.
+fn destination_client_with_reader(
+    client: &Client,
+    destination: &WebhookDestination,
+    read: &dyn Fn(&str) -> Result<Vec<u8>>,
+) -> Result<Client> {
     if !destination.has_tls_config() {
         return Ok(client.clone());
     }
-    let read = |path: &str| {
-        std::fs::read(path).map_err(|e| anyhow!("cannot read TLS file '{}': {}", path, e))
-    };
     let mut builder = Client::builder().timeout(Duration::from_secs(15));
     if let (Some(cert), Some(key)) = (&destination.client_cert, &destination.client_key) {
         let mut pem = read(cert)?;
@@ -117,11 +136,89 @@ pub fn destination_client(client: &Client, destination: &WebhookDestination) -> 
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
 
+/// Per-destination HTTP clients, built once per config generation.
+///
+/// Destinations with mTLS configuration get a dedicated [`Client`] whose
+/// identity and extra CA certificate are loaded from disk when the cache is
+/// built, so certificate problems surface at load/reload time rather than on
+/// the first delivery, and every alert reuses the same warm connection pool.
+/// Destinations without TLS configuration are absent from the cache and fall
+/// back to the shared client.
+#[derive(Debug, Clone, Default)]
+pub struct DestinationClients {
+    clients: HashMap<usize, Client>,
+}
+
+impl DestinationClients {
+    /// Build clients for every mTLS destination in `destinations`, reading and
+    /// parsing each PEM file exactly once. Returns an error naming the
+    /// offending destination if any certificate is unreadable or invalid.
+    pub fn build(shared: &Client, destinations: &[WebhookDestination]) -> Result<Self> {
+        Self::build_with_reader(shared, destinations, &read_tls_file)
+    }
+
+    /// [`build`](Self::build) with an injectable file reader (for tests).
+    pub fn build_with_reader(
+        shared: &Client,
+        destinations: &[WebhookDestination],
+        read: &dyn Fn(&str) -> Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut clients = HashMap::new();
+        for (index, destination) in destinations.iter().enumerate() {
+            if !destination.has_tls_config() {
+                continue;
+            }
+            let client = destination_client_with_reader(shared, destination, read).map_err(|e| {
+                anyhow!(
+                    "destination {} ({}): {}",
+                    index,
+                    destination.url,
+                    e
+                )
+            })?;
+            clients.insert(index, client);
+        }
+        Ok(Self { clients })
+    }
+
+    /// The client to use for the destination at `index`: its cached mTLS
+    /// client if it has one, otherwise the shared `fallback` client.
+    pub fn client_for(&self, index: usize, fallback: &Client) -> Client {
+        self.clients
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    /// Number of cached (mTLS) clients.
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Whether no destination needed a dedicated client.
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+}
+
 /// Deliver `payload` to one configured destination: the body is rendered in
 /// the destination's [`format`](txwatch_config::WebhookFormat), and its
 /// custom headers and secret are applied. Retries as [`send_webhook`] does.
 /// Header values and secrets are never logged.
 pub async fn send_to_destination(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    // No cache available: build a one-off client for this delivery.
+    let dest_client = destination_client(client, destination)?;
+    send_to_destination_with_client(&dest_client, destination, payload, shutdown).await
+}
+
+/// [`send_to_destination`] using a pre-built client (e.g. one cached in a
+/// [`DestinationClients`]), avoiding any per-delivery TLS setup.
+pub async fn send_to_destination_with_client(
     client: &Client,
     destination: &WebhookDestination,
     payload: &AlertPayload,
@@ -142,9 +239,8 @@ pub async fn send_to_destination(
         destination.routing_key.as_deref(),
         destination.template.as_deref(),
     )?;
-    let client = destination_client(client, destination)?;
     deliver(
-        &client,
+        client,
         &destination.url,
         body,
         destination.secret.as_deref(),
@@ -977,6 +1073,78 @@ mod tests {
         assert_eq!(
             requests[0].headers.get("x-txwatch-signature").unwrap(),
             &expected
+        );
+    }
+
+    // ── mTLS client caching ──────────────────────────────────────────────────
+
+    /// A self-signed cert/key pair generated once for the tests below.
+    fn tls_fixture() -> (String, String, String) {
+        // Generate a throwaway self-signed certificate with rcgen-free static
+        // PEMs is impractical; instead rely on reqwest accepting any valid PEM.
+        // These are a fixed, valid self-signed cert + key pair.
+        const CERT: &str = include_str!("../tests/fixtures/client.crt");
+        const KEY: &str = include_str!("../tests/fixtures/client.key");
+        (CERT.to_string(), KEY.to_string(), CERT.to_string())
+    }
+
+    fn mtls_destination(url: String, cert: &str, key: &str, ca: &str) -> WebhookDestination {
+        let mut dest = destination(url, txwatch_config::WebhookFormat::Txwatch);
+        dest.client_cert = Some(cert.to_string());
+        dest.client_key = Some(key.to_string());
+        dest.ca_cert = Some(ca.to_string());
+        dest
+    }
+
+    /// Issue #456: TLS files are read once per config generation, not once per
+    /// alert. A burst of deliveries must not re-read the PEM files.
+    #[tokio::test]
+    async fn tls_files_are_read_once_per_config_generation() {
+        let (cert, key, ca) = tls_fixture();
+        let dest = mtls_destination("https://example.invalid/hook".into(), &cert, &key, &ca);
+        let destinations = vec![dest];
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&reads);
+        let reader = move |path: &str| -> Result<Vec<u8>> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            read_tls_file(path)
+        };
+
+        let shared = build_client().unwrap();
+        let cache = DestinationClients::build_with_reader(&shared, &destinations, &reader)
+            .expect("valid TLS config should build at load time");
+        assert_eq!(cache.len(), 1);
+
+        // Building the cache reads cert, key and CA exactly once each.
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+
+        // Many deliveries reuse the cached client without touching the disk.
+        for _ in 0..50 {
+            let _ = cache.client_for(0, &shared);
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "TLS files must be read once per config generation"
+        );
+    }
+
+    /// Issue #456: certificate problems surface at load time.
+    #[test]
+    fn invalid_certificate_fails_at_load_time() {
+        let dest = mtls_destination(
+            "https://example.invalid/hook".into(),
+            "/nonexistent/client.crt",
+            "/nonexistent/client.key",
+            "/nonexistent/ca.crt",
+        );
+        let shared = build_client().unwrap();
+        let err = DestinationClients::build(&shared, &[dest]).unwrap_err();
+        assert!(
+            err.to_string().contains("destination 0"),
+            "error should name the destination, got: {}",
+            err
         );
     }
 
