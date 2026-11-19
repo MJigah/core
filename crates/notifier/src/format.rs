@@ -9,11 +9,6 @@
 //!   is the alert's `alert_id`.
 //! - `teams`: a Microsoft Teams Incoming Webhook / Workflows message carrying
 //!   one Adaptive Card.
-//!
-//! Batched delivery (`batch_alerts = true`) renders a digest per destination
-//! via [`render_batch_body`]: chat formats get a single digest message and
-//! PagerDuty gets one `trigger` event per alert (Events API v2 has no batch
-//! envelope), so no format silently drops alerts.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -43,32 +38,6 @@ pub fn render_body(
             payload,
             routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?,
         ),
-    };
-    Ok(serde_json::to_string(&body)?)
-}
-
-/// Renders the request body for a batch of alerts destined for one
-/// destination. `routing_key` is required for PagerDuty and ignored otherwise.
-///
-/// - `txwatch`: a JSON array of payloads.
-/// - `slack` / `discord`: a single digest message summarising every alert.
-/// - `pagerduty`: a JSON array of `trigger` events (one per alert).
-pub fn render_batch_body(
-    format: WebhookFormat,
-    payloads: &[AlertPayload],
-    routing_key: Option<&str>,
-) -> Result<String> {
-    let body = match format {
-        WebhookFormat::Txwatch | WebhookFormat::Template => serde_json::to_value(payloads)?,
-        WebhookFormat::Slack => slack_digest(payloads),
-        WebhookFormat::Discord => discord_digest(payloads),
-        WebhookFormat::Teams => teams_digest(payloads),
-        WebhookFormat::Pagerduty => {
-            let key =
-                routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
-            Value::Array(payloads.iter().map(|p| pagerduty(p, key)).collect())
-        }
-        WebhookFormat::Template => serde_json::to_value(payloads)?,
     };
     Ok(serde_json::to_string(&body)?)
 }
@@ -414,6 +383,13 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
 
 // ── Microsoft Teams ───────────────────────────────────────────────────────────
 
+/// Teams Incoming Webhooks and Workflows reject payloads over roughly 28 KB,
+/// so fact titles and values are truncated and the digest's fact count is
+/// capped to keep the rendered body well under that limit.
+const TEAMS_FACT_TITLE_MAX: usize = 120;
+const TEAMS_FACT_VALUE_MAX: usize = 300;
+const TEAMS_DIGEST_FACTS_MAX: usize = 40;
+
 /// Wraps an Adaptive Card body in the message envelope accepted by Teams
 /// Incoming Webhooks and Workflows ("Post to a channel when a webhook request
 /// is received").
@@ -450,13 +426,16 @@ fn teams_color(p: &AlertPayload) -> &'static str {
 /// Microsoft Teams message with one Adaptive Card.
 pub fn teams(p: &AlertPayload) -> Value {
     let mut facts = vec![
-        json!({ "title": "Contract", "value": p.contract_id }),
-        json!({ "title": "Transaction", "value": p.transaction_hash }),
+        json!({ "title": "Contract", "value": truncate(&p.contract_id, TEAMS_FACT_VALUE_MAX) }),
+        json!({ "title": "Transaction", "value": truncate(&p.transaction_hash, TEAMS_FACT_VALUE_MAX) }),
     ];
     for (name, value) in details(p) {
-        facts.push(json!({ "title": name, "value": value }));
+        facts.push(json!({
+            "title": truncate(name, TEAMS_FACT_TITLE_MAX),
+            "value": truncate(&value, TEAMS_FACT_VALUE_MAX),
+        }));
     }
-    facts.push(json!({ "title": "Time", "value": p.timestamp_iso }));
+    facts.push(json!({ "title": "Time", "value": truncate(&p.timestamp_iso, TEAMS_FACT_VALUE_MAX) }));
 
     teams_message(
         vec![
@@ -484,30 +463,47 @@ pub fn teams(p: &AlertPayload) -> Value {
     )
 }
 
-/// Microsoft Teams digest message summarising a batch of alerts.
+/// Microsoft Teams digest message summarising a batch of alerts. Fact titles
+/// and values are truncated and the fact count is capped so the body stays
+/// under the Teams payload limit.
 pub fn teams_digest(payloads: &[AlertPayload]) -> Value {
     let facts: Vec<Value> = payloads
         .iter()
+        .take(TEAMS_DIGEST_FACTS_MAX)
         .map(|p| {
             json!({
-                "title": format!("{} on {} ({})", p.rule_triggered, p.label, p.network),
-                "value": format!("[{}]({})", p.transaction_hash, p.explorer_link),
+                "title": truncate(
+                    &format!("{} on {} ({})", p.rule_triggered, p.label, p.network),
+                    TEAMS_FACT_TITLE_MAX,
+                ),
+                "value": truncate(
+                    &format!("[{}]({})", p.transaction_hash, p.explorer_link),
+                    TEAMS_FACT_VALUE_MAX,
+                ),
             })
         })
         .collect();
-    teams_message(
-        vec![
-            json!({
-                "type": "TextBlock",
-                "text": format!("TxWatch: {} alert(s)", payloads.len()),
-                "weight": "Bolder",
-                "size": "Medium",
-                "wrap": true,
-            }),
-            json!({ "type": "FactSet", "facts": facts }),
-        ],
-        vec![],
-    )
+    let mut body = vec![json!({
+        "type": "TextBlock",
+        "text": format!("TxWatch: {} alert(s)", payloads.len()),
+        "weight": "Bolder",
+        "size": "Medium",
+        "wrap": true,
+    })];
+    if payloads.len() > TEAMS_DIGEST_FACTS_MAX {
+        body.push(json!({
+            "type": "TextBlock",
+            "text": format!(
+                "…and {} more alert(s)",
+                payloads.len() - TEAMS_DIGEST_FACTS_MAX
+            ),
+            "isSubtle": true,
+            "size": "Small",
+            "wrap": true,
+        }));
+    }
+    body.push(json!({ "type": "FactSet", "facts": facts }));
+    teams_message(body, vec![])
 }
 
 // ── PagerDuty ─────────────────────────────────────────────────────────────────
@@ -620,46 +616,19 @@ mod tests {
     }
 
     #[test]
-    fn txwatch_batch_is_array_of_payloads() {
+    fn slack_digest_is_single_message() {
         let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Txwatch, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value.as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn slack_batch_is_single_digest() {
-        let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Slack, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
+        let value = slack_digest(&payloads);
         assert!(value["text"].as_str().unwrap().contains("2 alert(s)"));
         assert!(value["blocks"].is_array());
     }
 
     #[test]
-    fn discord_batch_is_single_digest() {
+    fn discord_digest_is_single_message() {
         let payloads = vec![fixture()];
-        let body = render_batch_body(WebhookFormat::Discord, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
+        let value = discord_digest(&payloads);
         assert!(value["content"].as_str().unwrap().contains("1 alert(s)"));
         assert_eq!(value["allowed_mentions"]["parse"], json!([]));
-    }
-
-    #[test]
-    fn pagerduty_batch_is_array_of_events() {
-        let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Pagerduty, &payloads, Some("rk")).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
-        let events = value.as_array().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["routing_key"], "rk");
-        assert_eq!(events[0]["event_action"], "trigger");
-    }
-
-    #[test]
-    fn pagerduty_batch_requires_routing_key() {
-        let payloads = vec![fixture()];
-        assert!(render_batch_body(WebhookFormat::Pagerduty, &payloads, None).is_err());
     }
 
     #[test]
@@ -768,8 +737,7 @@ mod tests {
             .unwrap()
             .starts_with("*Time*"));
 
-        let digest = render_batch_body(WebhookFormat::Slack, &vec![p; 50], None).unwrap();
-        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let digest = slack_digest(&vec![p; 50]);
         assert!(
             digest["blocks"][1]["text"]["text"]
                 .as_str()
@@ -888,12 +856,43 @@ mod tests {
         );
         assert_eq!(render(WebhookFormat::Teams, &p), expected);
 
-        let digest =
-            render_batch_body(WebhookFormat::Teams, &[fixture(), fixture()], None).unwrap();
-        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let digest = teams_digest(&[fixture(), fixture()]);
         let card = &digest["attachments"][0]["content"];
         assert_eq!(card["body"][0]["text"], "TxWatch: 2 alert(s)");
         assert_eq!(card["body"][1]["facts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn teams_digest_stays_under_the_payload_limit() {
+        let mut p = fixture();
+        p.rule_triggered = "r".repeat(500);
+        p.label = "l".repeat(500);
+        p.network = "n".repeat(500);
+        p.transaction_hash = "t".repeat(500);
+        p.explorer_link = format!("https://x.example/{}", "u".repeat(500));
+        let payloads = vec![p; 50];
+        let digest = teams_digest(&payloads);
+        let body = serde_json::to_string(&digest).unwrap();
+        assert!(body.len() < 28 * 1024, "body was {} bytes", body.len());
+        let card = &digest["attachments"][0]["content"];
+        let facts = card["body"][2]["facts"].as_array().unwrap();
+        assert_eq!(facts.len(), TEAMS_DIGEST_FACTS_MAX);
+        assert!(facts.iter().all(|f| f["title"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= TEAMS_FACT_TITLE_MAX));
+        assert!(facts.iter().all(|f| f["value"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= TEAMS_FACT_VALUE_MAX));
+        assert!(card["body"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("10 more alert(s)"));
     }
 
     #[test]

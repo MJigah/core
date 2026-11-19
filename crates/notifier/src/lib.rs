@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! txwatch-notifier delivers webhook payloads over HTTP with retry and backoff,
-//! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
+//! exposing `send_webhook`, `send_to_destination` and `send_webhook_batch`
+//! helpers for webhook delivery. Batched delivery always posts a single
+//! `{"alerts": [...]}` body per request; it does not render per-destination
+//! digests.
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;

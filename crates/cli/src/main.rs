@@ -25,6 +25,11 @@ const VERSION: &str = concat!(
     ")"
 );
 
+/// Default number of contracts polled concurrently. Shared by the
+/// `watch --concurrency` flag and the config's `effective_concurrency()` so the
+/// two defaults never disagree.
+const DEFAULT_CONCURRENCY: usize = 8;
+
 #[derive(Parser)]
 #[command(
     name    = "txwatch",
@@ -110,8 +115,8 @@ enum Command {
         watch_config: bool,
 
         /// Maximum number of contracts polled concurrently
-        #[arg(long, default_value_t = 10)]
-        concurrency: usize,
+        #[arg(long)]
+        concurrency: Option<usize>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -950,7 +955,11 @@ async fn main() -> Result<()> {
         } => {
             let config_path = required_config(&cli.config)?;
             let cfg = load_config(&cli)?;
-            let concurrency = concurrency.max(1);
+            // An explicit --concurrency wins; otherwise use the config value.
+            let concurrency = match concurrency {
+                Some(n) => n.max(1),
+                None => cfg.effective_concurrency(),
+            };
 
             if once {
                 info!(
@@ -960,7 +969,8 @@ async fn main() -> Result<()> {
                     concurrency,
                     "running a single TxWatch poll cycle"
                 );
-                let report = txwatch_poller::run_once(cfg, dry_run).await?;
+                let report =
+                    txwatch_poller::run_once_with_concurrency(cfg, dry_run, concurrency).await?;
                 info!(
                     transactions = report.transactions,
                     alerts = report.alerts,
@@ -1115,10 +1125,11 @@ fn render_init_config(
         parts
     };
 
-    // Optional horizon_url override line.
-    let horizon_line = match horizon_url {
-        Some(url) => format!("horizon_url = {}\n", quote(url)?),
-        None => String::new(),
+    // A custom Horizon URL makes the network a custom inline table; otherwise
+    // the network is just its name.
+    let network_value = match horizon_url {
+        Some(url) => format!("{{ horizon_url = {} }}", quote(url)?),
+        None => quote(network)?,
     };
 
     Ok(format!(
@@ -1129,14 +1140,13 @@ poll_interval_seconds = 10
 label       = {label}
 contract_id = {contract_id}
 network     = {network}
-{horizon_line}webhook_url = {webhook_url}
+webhook_url = {webhook_url}
 # webhook_secret = "${{TXWATCH_WEBHOOK_SECRET}}"   # optional: signs each webhook
 
 {rule_toml}"#,
         label = quote(label)?,
         contract_id = quote(contract_id)?,
-        network = quote(network)?,
-        horizon_line = horizon_line,
+        network = network_value,
         webhook_url = quote(webhook_url)?,
         rule_toml = rule_toml,
     ))

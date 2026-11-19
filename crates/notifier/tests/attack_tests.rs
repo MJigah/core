@@ -379,3 +379,40 @@ async fn test_rule_webhook_override_replaces_destinations_array() {
     second_server.verify().await;
     default_server.verify().await;
 }
+
+/// Teams Incoming Webhooks / Workflows reject payloads over roughly 28 KB.
+/// A 50-alert digest with long rule labels and long fact values must be
+/// truncated (fact titles/values) and fact-count capped so the rendered body
+/// stays under the limit instead of failing the request.
+#[test]
+fn test_teams_digest_body_stays_under_size_limit() {
+    const TEAMS_LIMIT: usize = 28 * 1024;
+
+    let long_label = "X".repeat(512);
+    let long_value = "Y".repeat(4096);
+
+    let mut payload = test_payload("TeamsDigestSizeLimit");
+    payload.alerts = (0..50)
+        .map(|i| {
+            let mut alert = test_payload(&format!("{long_label}-{i}"));
+            alert.rule_name = Some(format!("{long_label}-{i}"));
+            alert.contract_id = Some(format!("{long_label}-{i}"));
+            alert.message = Some(long_value.clone());
+            alert
+        })
+        .collect();
+
+    let body = txwatch_notifier::format::teams_digest(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams digest body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+    );
+
+    let body = txwatch_notifier::format::teams(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+    );
+}

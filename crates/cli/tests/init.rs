@@ -274,6 +274,50 @@ fn init_custom_horizon_url() {
     );
 }
 
+/// #470: --horizon-url must render the network as an inline table so the
+/// generated config is accepted by `validate`.
+#[test]
+fn init_custom_horizon_url_renders_inline_network_table() {
+    let output = fresh_output("horizon_url_inline");
+    let result = init(
+        &output,
+        &[
+            "--contract-id",
+            CONTRACT_ID,
+            "--network",
+            "testnet",
+            "--webhook-url",
+            "https://hooks.example.com/alerts",
+            "--horizon-url",
+            "http://localhost:8000",
+        ],
+    );
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let written = fs::read_to_string(&output).unwrap();
+    assert!(
+        written.contains(r#"network     = { horizon_url = "http://localhost:8000" }"#),
+        "expected inline network table in output:\n{written}"
+    );
+    assert!(
+        !written.contains(r#"network     = "testnet""#),
+        "network must not be rendered as a plain string when --horizon-url is given:\n{written}"
+    );
+
+    let validate = txwatch()
+        .args(["--config", output.to_str().unwrap(), "validate"])
+        .status()
+        .unwrap();
+    assert!(
+        validate.success(),
+        "generated config with --horizon-url must pass validate"
+    );
+}
+
 /// #229: --network validates known network names before prompting.
 #[test]
 fn init_rejects_unknown_network() {
