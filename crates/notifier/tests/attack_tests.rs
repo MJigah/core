@@ -379,3 +379,143 @@ async fn test_rule_webhook_override_replaces_destinations_array() {
     second_server.verify().await;
     default_server.verify().await;
 }
+
+/// PagerDuty Events API v2 rejects `payload.summary` longer than 1024
+/// characters. A composite rule with a huge account list must be truncated
+/// (with an ellipsis) rather than rejected, and `source` / `custom_details`
+/// must be capped as well.
+#[test]
+fn test_pagerduty_oversized_label_is_truncated() {
+    let mut payload = test_payload("SourceAccount");
+    let huge_label = format!(
+        "SourceAccount(Any({}))",
+        (0..200)
+            .map(|i| format!("G{:055}", i))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    payload.label = huge_label;
+
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
+
+    let summary = value["payload"]["summary"]
+        .as_str()
+        .expect("summary must be a string");
+    assert!(
+        summary.chars().count() <= 1024,
+        "summary must be capped at 1024 characters, got {}",
+        summary.chars().count()
+    );
+    assert!(
+        summary.ends_with('…'),
+        "truncated summary must end with an ellipsis, got: {summary}"
+    );
+
+    let source = value["payload"]["source"]
+        .as_str()
+        .expect("source must be a string");
+    assert!(
+        source.chars().count() <= 1024,
+        "source must be capped, got {} characters",
+        source.chars().count()
+    );
+
+    let custom_details = value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+    let details_len: usize = custom_details
+        .iter()
+        .map(|(k, v)| k.chars().count() + v.to_string().chars().count())
+        .sum();
+    assert!(
+        details_len <= 8192,
+        "custom_details must be capped, got {details_len} characters"
+    );
+}
+
+/// Snapshot test: a fully populated payload must surface all alert context in
+/// `custom_details` (so responders see it) and must omit `null` fields.
+#[test]
+fn test_pagerduty_custom_details_snapshot() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.alert_id = "alert-123".to_string();
+    payload.rule_type = "LargeTransfer".to_string();
+    payload.severity = Some("critical".to_string());
+    payload.source_account = Some("GSOURCE".to_string());
+    payload.fee_account = Some("GFEE".to_string());
+    payload.memo = Some("memo-text".to_string());
+    payload.ledger = Some(12345);
+    payload.matched_events = Some(3);
+    payload.suppressed_count = Some(2);
+    payload.observed_count = Some(7);
+    payload.resolved = true;
+    payload.enrichment_incomplete = true;
+
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
+    let custom_details = value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+
+    for key in [
+        "alert_id",
+        "rule_type",
+        "severity",
+        "source_account",
+        "fee_account",
+        "memo",
+        "ledger",
+        "matched_events",
+        "suppressed_count",
+        "observed_count",
+        "resolved",
+        "enrichment_incomplete",
+    ] {
+        assert!(
+            custom_details.contains_key(key),
+            "custom_details must include {key}, got: {custom_details:?}"
+        );
+    }
+
+    assert_eq!(custom_details["alert_id"], "alert-123");
+    assert_eq!(custom_details["rule_type"], "LargeTransfer");
+    assert_eq!(custom_details["severity"], "critical");
+    assert_eq!(custom_details["source_account"], "GSOURCE");
+    assert_eq!(custom_details["fee_account"], "GFEE");
+    assert_eq!(custom_details["memo"], "memo-text");
+    assert_eq!(custom_details["ledger"], 12345);
+    assert_eq!(custom_details["matched_events"], 3);
+    assert_eq!(custom_details["suppressed_count"], 2);
+    assert_eq!(custom_details["observed_count"], 7);
+    assert_eq!(custom_details["resolved"], true);
+    assert_eq!(custom_details["enrichment_incomplete"], true);
+
+    // Nulls must be skipped.
+    let mut sparse = test_payload("LargeTransfer");
+    sparse.severity = None;
+    sparse.source_account = None;
+    sparse.fee_account = None;
+    sparse.memo = None;
+    sparse.ledger = None;
+    sparse.matched_events = None;
+    sparse.suppressed_count = None;
+    sparse.observed_count = None;
+    let sparse_value = txwatch_notifier::format::pagerduty(&sparse, "pd-key");
+    let sparse_details = sparse_value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+    for key in [
+        "severity",
+        "source_account",
+        "fee_account",
+        "memo",
+        "ledger",
+        "matched_events",
+        "suppressed_count",
+        "observed_count",
+    ] {
+        assert!(
+            !sparse_details.contains_key(key),
+            "custom_details must omit null {key}, got: {sparse_details:?}"
+        );
+    }
+}
