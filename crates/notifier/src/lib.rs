@@ -23,7 +23,7 @@ pub mod format;
 pub mod kyc_auth;
 pub use kyc_auth::verify_kyc_webhook;
 
-const MAX_RETRIES: u32 = 3;
+const MAX_ATTEMPTS: u32 = 3;
 
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
@@ -56,8 +56,9 @@ pub async fn send_webhook_simple(
     send_webhook(client, url, payload, secret, rx).await
 }
 
-/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
+/// POST `payload` to `url`, making up to `MAX_ATTEMPTS` attempts in total
+/// (i.e. at most 2 retries) with exponential backoff between them
+/// (2 s → 4 s). Logs each attempt.
 /// If `secret` is Some, every request carries an
 /// `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` header; see
 /// `docs/verifying-webhooks.md`.
@@ -168,6 +169,21 @@ pub async fn send_to_destination_simple(
     send_to_destination(client, destination, payload, rx).await
 }
 
+/// Send a real `test: true` payload to `destination` using its own client
+/// (mTLS identity and extra CA certificate) and configured headers/secret.
+///
+/// This is the delivery used by `validate --check-webhooks=post`: unlike a
+/// bare `HEAD`/`OPTIONS` probe it exercises the destination's credentials and
+/// custom headers, so a success confirms the configured request actually works.
+pub async fn send_test_to_destination(
+    client: &Client,
+    destination: &WebhookDestination,
+    label: &str,
+) -> Result<DeliveryResult> {
+    let payload = test_payload(label);
+    send_to_destination_simple(client, destination, &payload).await
+}
+
 /// Maximum number of alerts in one batched POST; larger sets are split.
 pub const MAX_BATCH_SIZE: usize = 50;
 
@@ -228,7 +244,7 @@ async fn deliver(
     let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=MAX_ATTEMPTS {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -305,7 +321,7 @@ async fn deliver(
             }
         }
 
-        if attempt < MAX_RETRIES {
+        if attempt < MAX_ATTEMPTS {
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
                 res = &mut shutdown, if shutdown_live => {
@@ -323,7 +339,7 @@ async fn deliver(
         }
     }
 
-    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} attempts", MAX_ATTEMPTS));
     error!(
         url  = %url,
         rule = %payload.rule_triggered,
@@ -902,6 +918,36 @@ mod tests {
         let mut p = sample_payload();
         p.transaction_hash = tx.into();
         p
+    }
+
+    #[tokio::test]
+    async fn send_test_to_destination_delivers_test_payload_with_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("Authorization", "Bearer t0ken"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(
+            format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Txwatch,
+        );
+        dest.headers
+            .0
+            .insert("Authorization".into(), "Bearer t0ken".into());
+
+        let delivery = send_test_to_destination(&build_client().unwrap(), &dest, "Probe")
+            .await
+            .unwrap();
+        assert_eq!(delivery.final_status, 200);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["test"], true);
+        assert_eq!(body["label"], "Probe");
     }
 
     #[tokio::test]
