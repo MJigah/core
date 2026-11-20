@@ -849,51 +849,6 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
         .filter_map(|(rule_index, entry)| {
             let rule: &AlertRule = entry.as_ref();
             match eval_rule(rule, tx) {
-                Ok(true) => Some(AlertPayload {
-                    schema_version: 1,
-                    alert_id: alert_id(contract_id, &tx.hash, &rule.label()),
-                    label: label.to_string(),
-                    contract_id: contract_id.to_string(),
-                    network: network.to_string(),
-                    // #44: Use the single canonical implementations from txwatch-config.
-                    rule_type: rule.rule_type().to_string(),
-                    rule_triggered: rule.label(),
-                    transaction_hash: tx.hash.clone(),
-                    function_name: tx.function_names.first().cloned(),
-                    function_names: tx.function_names.clone(),
-                    function_args: tx.invocations.clone(),
-                    amount_xlm,
-                    amount_stroops: tx.amount_stroops,
-                    amount_xlm_decimal: amount_xlm_decimal.clone(),
-                    fee_charged_stroops: tx.fee_charged_stroops,
-                    source_account: tx.source_account.clone(),
-                    // Only surface the fee payer when it differs from the
-                    // source account (fee-bump transactions, issue #251).
-                    fee_account: tx
-                        .fee_account
-                        .clone()
-                        .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
-                    // Per-rule delivery overrides, absent unless the rule sets them.
-                    severity: entry.severity().map(|s| s.to_string()),
-                    effective_webhook_url: entry.webhook_url().map(str::to_owned),
-                    effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
-                    timestamp,
-                    timestamp_iso: timestamp_iso.clone(),
-                    horizon_link: horizon_link.clone(),
-                    explorer_link: explorer_link.clone(),
-                    ledger: tx.ledger,
-                    memo: tx.memo.clone(),
-                    memo_type: tx.memo_type.clone(),
-                    operation_count: tx.operation_count,
-                    resolved: false,
-                    matched_events: matched_events(rule, tx),
-                    suppressed_count: 0,
-                    observed_count: None,
-                    test: false,
-                    old_wasm_hash: upgrade_hashes(rule, tx).and_then(|(o, _)| o),
-                    new_wasm_hash: upgrade_hashes(rule, tx).and_then(|(_, n)| n),
-                    enrichment_incomplete: tx.enrichment_incomplete,
-                }),
                 Ok(true) => {
                     let rule_type = rule.rule_type().to_string();
                     let rule_triggered = rule.label();
@@ -922,6 +877,12 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                         amount_xlm_decimal: amount_xlm_decimal.clone(),
                         fee_charged_stroops: tx.fee_charged_stroops,
                         source_account: tx.source_account.clone(),
+                        // Only surface the fee payer when it differs from the
+                        // source account (fee-bump transactions, issue #251).
+                        fee_account: tx
+                            .fee_account
+                            .clone()
+                            .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
                         // Per-rule delivery overrides, absent unless the rule sets them.
                         severity: entry.severity().map(|s| s.to_string()),
                         effective_webhook_url: entry.webhook_url().map(str::to_owned),
@@ -1095,6 +1056,7 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::SourceAccount {
             mode,
+            field,
             accounts,
             alert_unless,
             allow,
@@ -1280,6 +1242,7 @@ fn rule_label(rule: &AlertRule) -> String {
         }
         AlertRule::SourceAccount {
             mode,
+            field,
             accounts,
             alert_unless,
             allow,
@@ -1303,7 +1266,12 @@ fn rule_label(rule: &AlertRule) -> String {
                     txwatch_config::SourceAccountMode::In => "in",
                     txwatch_config::SourceAccountMode::NotIn => "not_in",
                 };
-                format!("SourceAccount({}: [{}])", mode_str, list.join(", "))
+                format!(
+                    "SourceAccount({}{}: [{}])",
+                    field_str,
+                    mode_str,
+                    list.join(", ")
+                )
             } else {
                 let mut parts = Vec::new();
                 if !allow.is_empty() {
@@ -1312,7 +1280,7 @@ fn rule_label(rule: &AlertRule) -> String {
                 if !deny.is_empty() {
                     parts.push(format!("deny=[{}]", deny.join(", ")));
                 }
-                format!("SourceAccount({})", parts.join(", "))
+                format!("SourceAccount({}{})", field_str, parts.join(", "))
             }
         }
         AlertRule::All { rules } => {
@@ -1330,6 +1298,62 @@ fn rule_label(rule: &AlertRule) -> String {
         }
         AlertRule::ContractUpgraded => "ContractUpgraded".into(),
         AlertRule::Rate { .. } | AlertRule::Memo { .. } => rule.label(),
+    }
+}
+
+// ── Synthetic payloads ────────────────────────────────────────────────────────
+
+/// Builds an alert payload that is not tied to a transaction (NoActivity
+/// incidents and recoveries, cooldown summaries). Every transaction-derived
+/// field is empty; callers set `suppressed_count` etc. on the result.
+#[allow(clippy::too_many_arguments)]
+fn synthetic_payload(
+    ctx: &EvalContext<'_>,
+    rule_type: &str,
+    rule_triggered: String,
+    alert_id: String,
+    now: DateTime<Utc>,
+    horizon_link: String,
+    explorer_link: String,
+    resolved: bool,
+) -> AlertPayload {
+    AlertPayload {
+        schema_version: 1,
+        alert_id,
+        label: ctx.label.to_string(),
+        contract_id: ctx.contract_id.to_string(),
+        network: ctx.network.to_string(),
+        rule_type: rule_type.to_string(),
+        rule_triggered,
+        transaction_hash: String::new(),
+        function_name: None,
+        function_names: vec![],
+        function_args: vec![],
+        amount_xlm: None,
+        amount_stroops: None,
+        amount_xlm_decimal: None,
+        fee_charged_stroops: None,
+        source_account: None,
+        fee_account: None,
+        severity: None,
+        timestamp: now.timestamp(),
+        timestamp_iso: now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        horizon_link,
+        explorer_link,
+        effective_webhook_url: None,
+        effective_webhook_secret: None,
+        ledger: None,
+        memo: None,
+        memo_type: None,
+        operation_count: None,
+        resolved,
+        matched_events: vec![],
+        suppressed_count: 0,
+        observed_count: None,
+        test: false,
+        old_wasm_hash: None,
+        new_wasm_hash: None,
+        enrichment_incomplete: false,
     }
 }
 
@@ -1396,11 +1420,9 @@ pub fn check_no_activity(
     let is_quiet = quiet_since >= threshold;
 
     let ts = now.timestamp();
-    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    // Synthetic payloads have no transaction — use empty hash and link to Horizon
-    // account page rather than a specific transaction.
-    let synthetic_hash = String::new();
+    // Synthetic payloads have no transaction — link to the Horizon account
+    // page rather than a specific transaction.
     let synthetic_horizon_link = format!("{}/accounts/{}", horizon_base, ctx.contract_id);
     let synthetic_explorer_link = match explorer_base {
         Some(base) => format!("{}/contract/{}", base, ctx.contract_id),
@@ -1422,45 +1444,16 @@ pub fn check_no_activity(
             *state = NoActivityState::Alerting {
                 incident_alert_id: incident_id.clone(),
             };
-            Some(AlertPayload {
-                label: ctx.label.to_string(),
-                contract_id: ctx.contract_id.to_string(),
-                network: ctx.network.to_string(),
-                rule_type: "NoActivity".into(),
+            Some(synthetic_payload(
+                ctx,
+                "NoActivity",
                 rule_triggered,
-                alert_id: incident_id,
-                schema_version: 1,
-                amount_stroops: None,
-                amount_xlm_decimal: None,
-                source_account: None,
-                fee_account: None,
-                severity: None,
-                effective_webhook_url: None,
-                effective_webhook_secret: None,
-                ledger: None,
-                memo: None,
-                memo_type: None,
-                operation_count: None,
-                matched_events: vec![],
-                suppressed_count: 0,
-                observed_count: None,
-                test: false,
-                old_wasm_hash: None,
-                new_wasm_hash: None,
-                enrichment_incomplete: false,
-
-                transaction_hash: synthetic_hash,
-                function_name: None,
-                function_names: vec![],
-                function_args: vec![],
-                amount_xlm: None,
-                fee_charged_stroops: None,
-                timestamp: ts,
-                timestamp_iso: ts_iso,
-                horizon_link: synthetic_horizon_link,
-                explorer_link: synthetic_explorer_link,
-                resolved: false,
-            })
+                incident_id,
+                now,
+                synthetic_horizon_link,
+                synthetic_explorer_link,
+                false,
+            ))
         }
         // Already alerting and activity has resumed → fire recovery.
         (NoActivityState::Alerting { incident_alert_id }, false) => {
@@ -1486,45 +1479,16 @@ pub fn check_no_activity(
                 _ => last_horizon_link.clone(),
             };
             let rule_triggered = format!("NoActivity({}min) resolved", minutes);
-            Some(AlertPayload {
-                label: ctx.label.to_string(),
-                contract_id: ctx.contract_id.to_string(),
-                network: ctx.network.to_string(),
-                rule_type: "NoActivity".into(),
+            Some(synthetic_payload(
+                ctx,
+                "NoActivity",
                 rule_triggered,
-                alert_id: recovery_alert_id,
-                schema_version: 1,
-                amount_stroops: None,
-                amount_xlm_decimal: None,
-                source_account: None,
-                fee_account: None,
-                severity: None,
-                effective_webhook_url: None,
-                effective_webhook_secret: None,
-                ledger: None,
-                memo: None,
-                memo_type: None,
-                operation_count: None,
-                matched_events: vec![],
-                suppressed_count: 0,
-                observed_count: None,
-                test: false,
-                old_wasm_hash: None,
-                new_wasm_hash: None,
-                enrichment_incomplete: false,
-
-                transaction_hash: synthetic_hash,
-                function_name: None,
-                function_names: vec![],
-                function_args: vec![],
-                amount_xlm: None,
-                fee_charged_stroops: None,
-                timestamp: ts,
-                timestamp_iso: ts_iso,
-                horizon_link: last_horizon_link,
-                explorer_link: last_explorer_link,
-                resolved: true,
-            })
+                recovery_alert_id,
+                now,
+                last_horizon_link,
+                last_explorer_link,
+                true,
+            ))
         }
         _ => None,
     }
@@ -1697,7 +1661,6 @@ impl CooldownTracker {
                     state.last_fired = now;
 
                     let ts = now.timestamp();
-                    let ts_iso = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     let alert_id = alert_id(
                         &ctx.network_id,
                         ctx.contract_id,
@@ -1707,42 +1670,18 @@ impl CooldownTracker {
                         rule_index,
                     );
 
-                    summaries.push(AlertPayload {
-                        label: ctx.label.to_string(),
-                        contract_id: ctx.contract_id.to_string(),
-                        network: ctx.network.to_string(),
-                        rule_type: rule_cfg.rule.rule_type().to_string(),
-                        rule_triggered: rule_trig,
+                    let mut summary = synthetic_payload(
+                        ctx,
+                        rule_cfg.rule.rule_type(),
+                        rule_trig,
                         alert_id,
-                        schema_version: 1,
-                        amount_stroops: None,
-                        amount_xlm_decimal: None,
-                        source_account: None,
-                        fee_account: None,
-                        severity: None,
-                        effective_webhook_url: None,
-                        effective_webhook_secret: None,
-                        ledger: None,
-                        memo: None,
-                        memo_type: None,
-                        operation_count: None,
-                        matched_events: vec![],
-                        suppressed_count,
-                        test: false,
-                        old_wasm_hash: None,
-                        new_wasm_hash: None,
-                        enrichment_incomplete: false,
-                        transaction_hash: String::new(),
-                        function_name: None,
-                        function_names: vec![],
-                        amount_xlm: None,
-                        fee_charged_stroops: None,
-                        timestamp: ts,
-                        timestamp_iso: ts_iso,
-                        horizon_link: synthetic_horizon_link.clone(),
-                        explorer_link: synthetic_explorer_link.clone(),
-                        resolved: false,
-                    });
+                        now,
+                        synthetic_horizon_link.clone(),
+                        synthetic_explorer_link.clone(),
+                        false,
+                    );
+                    summary.suppressed_count = suppressed_count;
+                    summaries.push(summary);
                 }
             }
         }
@@ -1782,7 +1721,7 @@ impl RateTracker {
         now: DateTime<Utc>,
     ) -> Vec<AlertPayload> {
         let mut out = Vec::new();
-        for entry in rules.iter().filter(|e| e.enabled()) {
+        for (rule_index, entry) in rules.iter().enumerate().filter(|(_, e)| e.enabled()) {
             let rule: &AlertRule = entry.as_ref();
             let AlertRule::Rate {
                 rule: inner,
@@ -1836,7 +1775,14 @@ impl RateTracker {
             let mut payloads = evaluate(ctx, std::slice::from_ref(&inner.rule), tx, None);
             if let Some(mut payload) = payloads.pop() {
                 payload.rule_type = rule.rule_type().to_string();
-                payload.alert_id = alert_id(ctx.contract_id, &tx.hash, &label);
+                payload.alert_id = alert_id(
+                    &ctx.network_id,
+                    ctx.contract_id,
+                    &tx.hash,
+                    rule.rule_type(),
+                    &label,
+                    rule_index,
+                );
                 payload.rule_triggered = label;
                 payload.observed_count = Some(observed);
                 payload.severity = entry.severity().map(|s| s.to_string());
@@ -3276,6 +3222,161 @@ mod tests {
             "label must distinguish fee_account rules, got: {}",
             label
         );
+    }
+
+    // ── Issue #371: fee_account only when it differs ─────────────────────────
+
+    #[test]
+    fn non_fee_bump_transaction_serialises_without_fee_account() {
+        let mut tx = make_tx(true, &[], None);
+        // Horizon reports fee_account == source_account for regular transactions.
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.fee_account = tx.source_account.clone();
+        let payloads = run(&[entry(AlertRule::AnyTransaction)], &tx);
+        assert_eq!(payloads.len(), 1);
+        let json = serde_json::to_value(&payloads[0]).unwrap();
+        assert!(json.get("fee_account").is_none(), "got: {json}");
+        assert_eq!(
+            json.get("source_account").and_then(|v| v.as_str()),
+            Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN")
+        );
+    }
+
+    // ── Issue #372: SourceAccount `field` on regular and fee-bump txs ────────
+
+    #[test]
+    fn source_account_field_matrix_regular_and_fee_bump() {
+        use txwatch_config::{SourceAccountField, SourceAccountMode};
+        const INNER: &str = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        const PAYER: &str = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN";
+        let rule = |field, account: &str| {
+            entry(AlertRule::SourceAccount {
+                mode: SourceAccountMode::In,
+                field,
+                accounts: vec![account.into()],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })
+        };
+
+        // Regular transaction: source and fee payer are the same account.
+        let mut regular = make_tx(true, &[], None);
+        regular.source_account = Some(PAYER.into());
+        regular.fee_account = Some(PAYER.into());
+        // Fee-bump transaction: the fee payer differs from the inner source.
+        let mut fee_bump = make_tx(true, &[], None);
+        fee_bump.source_account = Some(INNER.into());
+        fee_bump.fee_account = Some(PAYER.into());
+
+        let cases = [
+            (&regular, SourceAccountField::Source, PAYER, true),
+            (&regular, SourceAccountField::FeeAccount, PAYER, true),
+            (&regular, SourceAccountField::Source, INNER, false),
+            (&regular, SourceAccountField::FeeAccount, INNER, false),
+            (&fee_bump, SourceAccountField::Source, INNER, true),
+            (&fee_bump, SourceAccountField::Source, PAYER, false),
+            (&fee_bump, SourceAccountField::FeeAccount, PAYER, true),
+            (&fee_bump, SourceAccountField::FeeAccount, INNER, false),
+        ];
+        for (tx, field, account, fires) in cases {
+            let payloads = run(&[rule(field, account)], tx);
+            assert_eq!(
+                payloads.len(),
+                usize::from(fires),
+                "field={:?} account={} source={:?} fee={:?}",
+                field,
+                account,
+                tx.source_account,
+                tx.fee_account
+            );
+        }
+    }
+
+    #[test]
+    fn source_account_rule_label_matches_config_label() {
+        use txwatch_config::{SourceAccountField, SourceAccountMode};
+        for field in [SourceAccountField::Source, SourceAccountField::FeeAccount] {
+            for (accounts, allow) in [
+                (vec!["GA".to_string()], vec![]),
+                (vec![], vec!["GA".to_string()]),
+            ] {
+                let rule = AlertRule::SourceAccount {
+                    mode: SourceAccountMode::NotIn,
+                    field,
+                    accounts,
+                    alert_unless: vec![],
+                    allow,
+                    deny: vec![],
+                };
+                assert_eq!(rule_label(&rule), rule.label());
+            }
+        }
+    }
+
+    // ── Issue #373: Rate alert IDs use the six-argument alert_id ─────────────
+
+    #[test]
+    fn rate_alert_id_includes_network_and_rule_index() {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+            network: "testnet",
+            network_id: "testnet".into(),
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: None,
+        };
+        let rate = AlertRule::Rate {
+            rule: Box::new(entry(AlertRule::AnyTransaction)),
+            count: 1,
+            window_seconds: 60,
+        };
+        let rules = [entry(AlertRule::TransactionFailed), entry(rate.clone())];
+        let tx = make_tx(true, &[], None);
+        let now: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+
+        let payloads = RateTracker::new().evaluate(&ctx, &rules, &tx, now);
+        assert_eq!(payloads.len(), 1);
+        let p = &payloads[0];
+        assert_eq!(p.rule_type, "Rate");
+        assert_eq!(p.observed_count, Some(1));
+        assert_eq!(
+            p.alert_id,
+            alert_id("testnet", ctx.contract_id, &tx.hash, "Rate", &rate.label(), 1)
+        );
+        assert_ne!(
+            p.alert_id,
+            alert_id("testnet", ctx.contract_id, &tx.hash, "Rate", &rate.label(), 0)
+        );
+    }
+
+    #[test]
+    fn synthetic_payload_has_no_transaction_fields() {
+        let ctx = EvalContext {
+            label: "Label",
+            contract_id: "CA",
+            network: "testnet",
+            network_id: "testnet".into(),
+            horizon_base: "https://h",
+            explorer_base: None,
+        };
+        let now: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let p = synthetic_payload(
+            &ctx,
+            "NoActivity",
+            "NoActivity(5min)".into(),
+            "id".into(),
+            now,
+            "h".into(),
+            "e".into(),
+            true,
+        );
+        assert!(p.function_args.is_empty());
+        assert_eq!(p.observed_count, None);
+        assert_eq!(p.transaction_hash, "");
+        assert_eq!(p.timestamp, now.timestamp());
+        assert_eq!(p.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert!(p.resolved);
     }
 
     #[test]

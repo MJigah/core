@@ -2353,8 +2353,6 @@ fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let deserializer =
-        toml::Deserializer::parse(raw).map_err(|e| anyhow!("{} (in {})", e, path.display()))?;
     // serde_path_to_error::deserialize owns the Track that Deserializer::new
     // otherwise requires, so the field path survives into the error message.
     let deserializer = toml::Deserializer::parse(raw)
