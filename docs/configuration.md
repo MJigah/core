@@ -27,15 +27,42 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `poll_interval_seconds`       | u64             | no       | `10`    | How often to poll Horizon (seconds). Must be ≥ 5 and ≤ 3600. Each contract can override it (see below). |
 | `contracts`                   | array of tables | yes      | —       | The `[[contracts]]` entries (see below). At least one is required; labels must be unique (case-insensitive), and each `(network, contract_id)` pair may appear only once. |
 | `cursor_file`                 | string (path)   | no       | unset   | JSON file used to persist the per-contract cursor map. Loaded on startup and rewritten after each poll cycle. When unset, cursors start at Horizon's `now` and are not persisted. A missing or unparsable file falls back to `now`. Cursors are keyed `<network>:<contract_id>`; a file written by an older version (keyed by bare contract ID) is migrated automatically, except for a contract ID watched on several networks, which starts from `now`. See [Cursor file locking and state](#cursor-file-locking-and-state). |
-| `concurrency`                 | usize           | no       | `10`    | Maximum number of contracts polled concurrently by `txwatch watch --once`. Must be 1–1000. `txwatch watch` polls every contract in its own task and ignores this setting. |
+| `state_file`                  | string (path)   | no       | unset   | JSON file used to persist runtime state that is not a cursor: per-rule cooldowns, `NoActivity` incident state and `Rate` windows. Loaded on startup and rewritten after each poll cycle. When unset, this state is kept in memory and resets on restart. Supports [environment interpolation](#environment-variable-interpolation). See [State file](#state-file). |
+| `concurrency`                 | usize           | no       | `8`     | Maximum number of contracts polled concurrently by `txwatch watch --once`. Must be 1–256 (`DEFAULT_CONCURRENCY = 8`, `MAX_CONCURRENCY = 256` in `txwatch-config`). `txwatch watch` polls every contract in its own task and ignores this setting. |
 | `http_pool_max_idle_per_host` | usize           | no       | `10`    | Maximum idle connections kept per host in the HTTP pool. Must be 1–100. Lower values use less memory; higher values help with many contracts. |
 | `http_tcp_keepalive_secs`     | u64             | no       | `30`    | TCP keepalive interval (seconds) for pooled HTTP connections. Must be ≤ 7200; `0` disables keepalive. |
 | `http_connection_verbose`     | bool            | no       | `false` | Reserved for HTTP connection-pool debug output. Accepted by the parser but currently has no effect. |
 | `max_pages_per_cycle`         | usize           | no       | `10`    | Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Must be 1–1000. Pages are processed as they arrive; when the cap is hit a warning is logged and the next cycle continues from the saved cursor. |
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 | `summary_interval_seconds`    | u64             | no       | `60`    | How often the poller logs a periodic summary line (seconds). Set to `0` to disable the periodic summary entirely. |
+| `cooldown_summary`            | bool            | no       | `false` | When `true`, the periodic summary line includes, per contract, the rules currently in cooldown and the seconds remaining. Has no effect when `summary_interval_seconds = 0`. |
+| `readiness_policy`            | string          | no       | `"any"` | How `txwatch watch` decides it is ready for its readiness probe: `"any"` (ready as soon as the process is up), `"first_poll"` (ready after every contract has completed one poll cycle) or `"all_healthy"` (ready only when no contract is in a failing streak). |
+| `include`                     | array of strings | no      | unset   | Paths of additional TOML files to merge into this configuration, relative to the including file. Each file is parsed as a partial config; `contracts` are appended and scalar fields in the including file win. Includes are resolved recursively with a depth limit of 8 and cycles are rejected. |
 
 Unknown top-level keys are rejected.
+
+### State file
+
+`state_file` holds the state that is not a Horizon cursor, so it can be shared by several contracts or
+kept separate from `cursor_file`:
+
+```json
+{
+  "version": 1,
+  "cooldowns": { "testnet:CAAA...:LargeTransfer(>=10000XLM)": 1705316096 },
+  "no_activity": { "testnet:CAAA...:NoActivity": { "alerting": true, "since": 1705316096 } },
+  "rate_windows": { "testnet:CAAA...:Rate(10x TransactionFailed in 300s)": [1705316000, 1705316050] }
+}
+```
+
+- `version` — format version. Version `1` is written by current releases.
+- `cooldowns` — per-contract, per-rule timestamp (Unix seconds) of the last alert sent.
+- `no_activity` — per-contract `NoActivity` state, so an open incident is not re-fired after a restart.
+- `rate_windows` — per-contract, per-`Rate`-rule match timestamps inside the sliding window.
+
+When `state_file` is unset, this state is kept in memory and resets on restart. When both `cursor_file` and
+`state_file` are set, the same locking and atomic-rewrite rules described in
+[Cursor file locking and state](#cursor-file-locking-and-state) apply to `state_file` as well.
 
 ### Cursor file locking and state
 
@@ -103,21 +130,22 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `contract_id`    | string          | yes      | Stellar contract StrKey (`C…`, 56 characters). The address is fully decoded: characters outside `A–Z2–7` (lowercase, `0`, `1`, `8`, `9`), a non-contract version byte (e.g. a `G…` account) and a bad checksum are each reported as a distinct error. |
 | `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
 | `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
-| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. |
+| `label`          | string          | yes      | Human-readable name shown in logs and alert payloads. Surrounding whitespace is trimmed. Must not be blank, contain control characters (newlines, ANSI escapes, …) or exceed 128 characters; must be unique across contracts, ignoring case. |
+| `contract_id`    | string          | yes      | Stellar contract StrKey (`C…`, 56 characters). The address is fully decoded: characters outside `A–Z2–7` (lowercase, `0`, `1`, `8`, `9`), a non-contract version byte (e.g. a `G…` account) and a bad checksum are each reported as a distinct error. |
+| `network`        | string or table | yes      | `mainnet`, `testnet`, `futurenet`, or a custom network table (see below). |
+| `rules`          | array of tables | yes      | The `[[contracts.rules]]` entries (see below). At least one is required. |
 | `enabled`        | bool            | no       | Default `true`. Set `false` to pause monitoring this contract without removing it. Shown as `(disabled)` in `txwatch validate`. |
-| `webhook_url`    | string          | see below | `http://` or `https://` URL with a host that receives alerts. Shorthand for one destination, described by the `webhook_*` fields below. Required unless `webhooks` has at least one entry. |
+| `webhook_url`    | string          | see below | `http://` or `https://` URL with a host that receives alerts. Shorthand for one destination, described by the `webhook_*` fields below. Required unless `webhooks` has at least one entry. Supports [environment interpolation](#environment-variable-interpolation). |
 | `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
-| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
-| `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord`, `pagerduty` or `teams`. See [Webhook formats](#webhook-formats). |
+| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
+| `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord`, `pagerduty`, `teams` or `template`. See [Webhook formats](#webhook-formats). |
 | `webhook_headers` | table          | no       | Extra HTTP headers for `webhook_url`, e.g. `{ "Authorization" = "Bearer ${TOKEN}" }`. See [Custom headers](#custom-headers). |
 | `webhook_routing_key` | string     | no       | PagerDuty integration key; required when `webhook_format = "pagerduty"`, rejected otherwise. Supports interpolation. |
+| `webhook_template` | string       | no       | Inline body template used when `webhook_format = "template"`. Mutually exclusive with `webhook_template_file`. See [Body templates](#body-templates). |
+| `webhook_template_file` | string  | no       | Path to a body template file read at config load, used when `webhook_format = "template"`. Mutually exclusive with `webhook_template`. |
 | `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields), plus `min_severity`, `rule_types`, `template`/`template_file` and `client_cert`/`client_key`/`ca_cert`. See [Multiple destinations](#multiple-destinations). |
-| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
-| `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `soroban_rpc_url` | string         | no       | Soroban RPC endpoint used to fetch contract events for `EventEmitted` rules. Defaults to `https://soroban-testnet.stellar.org` (testnet), `https://rpc-futurenet.stellar.org` (futurenet) or the custom network's `rpc_url`. Mainnet has no default, so a mainnet contract with an `EventEmitted` rule must set it. |
-| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`); an unset variable is a startup error. |
 | `batch_alerts`   | bool            | no       | Default `false`. When `true`, all alerts from one poll cycle are sent as a single `{"alerts": [...]}` POST (at most 50 per request, larger bursts are split). Useful for digest receivers and rate-limited targets such as Slack. See [Batched payload](#batched-payload). |
-| `webhook_secret` | string          | no       | When set, every webhook POST carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` **and** the raw secret in `X-TxWatch-Secret`. Supports [environment interpolation](#environment-variable-interpolation). |
 
 Unknown keys inside a `[[contracts]]` entry (or a `[[contracts.webhooks]]` entry) are rejected. The
 `webhook_*` fields other than `webhook_url` may only be set together with `webhook_url`.
@@ -163,10 +191,20 @@ and `txwatch test-webhook --contract <label>` sends a test alert to each of them
 `[[contracts.webhooks]]` entries can limit which alerts they receive, so one contract can page
 PagerDuty only for critical alerts while Slack gets everything:
 
-| Field          | Type             | Description |
-|----------------|------------------|-------------|
-| `min_severity` | string           | `info`, `warning` or `critical`. Only alerts at or above this severity are delivered; alerts whose rule has no `severity` are skipped. |
-| `rule_types`   | array of strings | Only alerts from these rule types (e.g. `["LargeTransfer", "AdminFunctionCalled"]`) are delivered. Empty or omitted delivers every rule type. |
+| Field          | Type             | Required | Description |
+|----------------|------------------|----------|-------------|
+| `url`          | string           | yes      | `http://` or `https://` URL with a host that receives alerts. Supports [environment interpolation](#environment-variable-interpolation). |
+| `secret`       | string           | no       | When set, every POST to this destination carries `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` and the raw secret in `X-TxWatch-Secret`. Supports interpolation. |
+| `format`       | string           | no       | `txwatch` (default), `slack`, `discord`, `pagerduty`, `teams` or `template`. See [Webhook formats](#webhook-formats). |
+| `headers`      | table            | no       | Extra HTTP headers for this destination. See [Custom headers](#custom-headers). |
+| `routing_key`  | string           | no       | PagerDuty integration key; required when `format = "pagerduty"`, rejected otherwise. Supports interpolation. |
+| `template`     | string           | no       | Inline body template used when `format = "template"`. Mutually exclusive with `template_file`. |
+| `template_file`| string (path)    | no       | Path to a body template file read at config load, used when `format = "template"`. Mutually exclusive with `template`. Supports interpolation. |
+| `client_cert`  | string (path)    | no       | PEM client certificate for mutual TLS. Must be set together with `client_key`; the URL must be `https`. Supports interpolation. |
+| `client_key`   | string (path)    | no       | PEM private key for mutual TLS. Must be set together with `client_cert`. Supports interpolation. |
+| `ca_cert`      | string (path)    | no       | PEM CA bundle used to verify the destination's certificate (private CA). Requires `client_cert`/`client_key`; the URL must be `https`. Supports interpolation. |
+| `min_severity` | string           | no       | `info`, `warning` or `critical`. Only alerts at or above this severity are delivered; alerts whose rule has no `severity` are skipped. |
+| `rule_types`   | array of strings | no       | Only alerts from these rule types (e.g. `["LargeTransfer", "AdminFunctionCalled"]`) are delivered. Empty or omitted delivers every rule type. |
 
 ```toml
   [[contracts.webhooks]]
@@ -364,6 +402,7 @@ Every rule entry supports these optional fields:
 | `webhook_url`    | string | unset   | Override the contract-level `webhook_url` for this rule only. |
 | `webhook_secret` | string | unset   | Override the contract-level `webhook_secret` for this rule only. |
 | `severity`       | string | unset   | One of `info`, `warning`, `critical`. Included as `severity` in the alert payload when set. |
+| `cooldown_seconds` | u64  | unset   | Suppress further matches of this rule for this contract for this many seconds (0–604800) after an alert is sent. See below. |
 
 These fields can be combined with any rule type:
 
@@ -817,9 +856,10 @@ in an `alerts` array:
 ## `watch --once` concurrency
 
 `txwatch watch --once` polls contracts concurrently, bounded by the top-level `concurrency` setting (default
-`10`). This keeps a cron run within its schedule even with many contracts and slow Horizon responses. Lower it
-when Horizon rate limits are a concern; raise it when polling your own Horizon. `txwatch watch` is unaffected:
-it already polls every contract in its own task.
+`8`, `DEFAULT_CONCURRENCY` in `txwatch-config`; accepted range 1–256, `MAX_CONCURRENCY`). This keeps a cron run
+within its schedule even with many contracts and slow Horizon responses. Lower it when Horizon rate limits are a
+concern; raise it when polling your own Horizon. `txwatch watch` is unaffected: it already polls every contract
+in its own task.
 
 ### Environment variable interpolation
 
@@ -869,6 +909,23 @@ unterminated `${` are errors.
 Note: setting `RUST_LOG=debug` will show per-contract idle poll cycles — the
 poller emits `"no new transactions"` debug logs with the contract `label` and
 current `cursor` when a poll returns an empty page.
+
+## Keeping these tables in sync
+
+The field tables above are generated from the descriptions in
+[`txwatch-config.schema.json`](txwatch-config.schema.json), so they cannot drift from the Rust model:
+
+```sh
+cargo run -p txwatch-config --bin gen-config-docs   # rewrites the generated tables in this file
+cargo test -p txwatch-config --test docs_tables     # fails if the committed tables are stale
+```
+
+`gen-config-docs` walks the schema's `properties` (including `$defs` for `WatchedContract`,
+`WebhookDestination` and `RuleConfig`), reads each property's `description`, `type` and `default`, and
+rewrites the regions between the `<!-- BEGIN GENERATED: <table> -->` and `<!-- END GENERATED: <table> -->`
+markers in this document. The `docs_tables` test regenerates the tables in memory and compares them with
+the committed file, so a schema change without a regenerated document fails CI. Edit the schema (and the
+Rust doc comments it is derived from), then run `gen-config-docs`; do not edit the generated tables by hand.
 
 ## Full example
 

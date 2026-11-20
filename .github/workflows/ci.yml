@@ -224,6 +224,15 @@ jobs:
       - name: Run all tests with all features
         run: cargo test --all --all-features
 
+      # Crash-restart persistence tests and the cooldown/rate-tracker property
+      # tests must gate every PR. They are part of the workspace test suite, so
+      # the steps above already run them; this step makes the requirement
+      # explicit and fails the job if any of them regress.
+      - name: Persistence and property tests
+        run: |
+          cargo test --all --all-features -- \
+            --nocapture persistence crash_restart proptest cooldown rate_tracker
+
   # ── Feature combinations ────────────────────────────────────────────────────
   features:
     name: Feature powerset (cargo-hack)

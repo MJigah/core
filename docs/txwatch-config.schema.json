@@ -13,6 +13,14 @@
     "http_connection_verbose": { "type": ["boolean", "null"] },
     "max_pages_per_cycle": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Default: 10." },
     "max_contracts": { "type": ["integer", "null"], "minimum": 1, "maximum": 10000, "description": "Maximum number of [[contracts]] entries. Default: 100." },
+    "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 256, "description": "Maximum number of contracts polled concurrently in one cycle (used by watch and watch --once). Default: 8. Maximum: 256." },
+    "state_file": { "type": ["string", "null"], "description": "Path to the JSON state file used to persist per-contract cursors and rule state across restarts. When unset, state is kept in memory only and cursors restart from the beginning on each run." },
+    "readiness_policy": { "$ref": "#/$defs/ReadinessPolicy" },
+    "include": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Glob patterns selecting additional TOML files to merge into this configuration (e.g. \"contracts/*.toml\"). Matched files are loaded and their [[contracts]] entries appended." },
+    "cooldown_summary": { "type": ["boolean", "null"], "description": "When true, log a summary of alerts suppressed by rule cooldowns at the end of each poll cycle. Default: false." },
+    "min_severity": { "$ref": "#/$defs/Severity", "description": "Minimum severity an alert must have to be delivered. Alerts below this level are dropped before dispatch. Default: \"info\"." },
+    "rule_types": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Allowlist of rule type names (e.g. \"LargeTransfer\", \"EventEmitted\"). When set, only rules whose type appears in this list are evaluated; all others are skipped." },
+    "contracts": { "type": "array", "items": { "$ref": "#/$defs/WatchedContract" }, "minItems": 1, "description": "Watched contracts. Each entry defines a contract, its network, and the rules evaluated against its transactions and events." }
     "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 256, "description": "Maximum number of contracts polled concurrently in one cycle (used by watch and watch --once). Default: 10." },
     "state_file": { "type": ["string", "null"], "description": "Path to the persisted watcher state file. Defaults to the platform state directory." },
     "readiness_policy": { "$ref": "#/$defs/ReadinessPolicy" },
@@ -31,28 +39,28 @@
         { "required": ["webhooks"], "properties": { "webhooks": { "minItems": 1 } } }
       ],
       "properties": {
-        "label": { "type": "string", "maxLength": 128 },
-        "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$" },
+        "label": { "type": "string", "maxLength": 128, "description": "Human-readable name used in logs and alert payloads." },
+        "contract_id": { "type": "string", "pattern": "^C[A-Z2-7]{55}$", "description": "Stellar contract ID (strkey, starting with \"C\")." },
         "network": { "oneOf": [
           { "enum": ["mainnet", "testnet", "futurenet"] },
           { "type": "object", "required": ["horizon_url"], "additionalProperties": false,
             "properties": {
-              "horizon_url": { "type": "string", "format": "uri" },
+              "horizon_url": { "type": "string", "format": "uri", "description": "Horizon endpoint for this network." },
               "rpc_url": { "type": ["string", "null"], "format": "uri", "description": "Soroban RPC endpoint for this network." },
-              "explorer_url": { "type": ["string", "null"], "format": "uri" },
-              "passphrase": { "type": ["string", "null"] }
+              "explorer_url": { "type": ["string", "null"], "format": "uri", "description": "Block explorer base URL used to build links in alert payloads." },
+              "passphrase": { "type": ["string", "null"], "description": "Network passphrase used when signing or decoding transactions." }
             } }
-        ] },
+        ], "description": "Network name (\"mainnet\", \"testnet\", \"futurenet\") or an inline table with explicit endpoints." },
         "soroban_rpc_url": { "type": ["string", "null"], "format": "uri", "description": "Soroban RPC endpoint used for contract event lookups." },
         "webhook_url": { "type": "string", "format": "uri", "description": "Shorthand for a single destination; described by the webhook_* fields." },
-        "webhook_secret": { "type": ["string", "null"] },
-        "webhook_format": { "$ref": "#/$defs/WebhookFormat" },
-        "webhook_headers": { "$ref": "#/$defs/WebhookHeaders" },
+        "webhook_secret": { "type": ["string", "null"], "description": "HMAC secret used to sign requests to the shorthand webhook_url destination." },
+        "webhook_format": { "$ref": "#/$defs/WebhookFormat", "description": "Payload format for the shorthand webhook_url destination. Default: \"txwatch\"." },
+        "webhook_headers": { "$ref": "#/$defs/WebhookHeaders", "description": "Extra HTTP headers for the shorthand webhook_url destination." },
         "webhook_routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when webhook_format = \"pagerduty\"." },
-        "webhooks": { "type": "array", "items": { "$ref": "#/$defs/WebhookDestination" } },
-        "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600 },
+        "webhooks": { "type": "array", "items": { "$ref": "#/$defs/WebhookDestination" }, "description": "Additional webhook destinations. May be combined with webhook_url." },
+        "poll_interval_seconds": { "type": ["integer", "null"], "minimum": 5, "maximum": 3600, "description": "Per-contract poll interval override in seconds. Defaults to the top-level poll_interval_seconds." },
         "batch_alerts": { "type": "boolean", "default": false, "description": "Deliver each poll cycle's alerts as one {\"alerts\": [...]} POST (split into batches of at most 50)." },
-        "rules": { "type": "array", "items": { "$ref": "#/$defs/AlertRule" }, "minItems": 1 }
+        "rules": { "type": "array", "items": { "$ref": "#/$defs/AlertRule" }, "minItems": 1, "description": "Alert rules evaluated for this contract." }
       }
     },
     "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty", "teams"], "default": "txwatch" },
@@ -81,11 +89,15 @@
     "WebhookDestination": {
       "type": "object", "required": ["url"], "additionalProperties": false,
       "properties": {
-        "url": { "type": "string", "format": "uri" },
-        "secret": { "type": ["string", "null"] },
-        "format": { "$ref": "#/$defs/WebhookFormat" },
-        "headers": { "$ref": "#/$defs/WebhookHeaders" },
-        "routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when format = \"pagerduty\"." }
+        "url": { "type": "string", "format": "uri", "description": "Destination URL that receives alert POSTs." },
+        "secret": { "type": ["string", "null"], "description": "HMAC secret used to sign requests to this destination (sent as the X-TxWatch-Signature header)." },
+        "format": { "$ref": "#/$defs/WebhookFormat", "description": "Payload format for this destination. Default: \"txwatch\"." },
+        "headers": { "$ref": "#/$defs/WebhookHeaders", "description": "Extra HTTP headers sent with each request to this destination." },
+        "routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when format = \"pagerduty\"." },
+        "tls_ca_file": { "type": ["string", "null"], "description": "Path to a PEM CA bundle used to verify this destination's TLS certificate." },
+        "tls_client_cert_file": { "type": ["string", "null"], "description": "Path to a PEM client certificate presented for mutual TLS to this destination." },
+        "tls_client_key_file": { "type": ["string", "null"], "description": "Path to the PEM private key matching tls_client_cert_file." },
+        "tls_insecure": { "type": ["boolean", "null"], "description": "When true, skip TLS certificate verification for this destination. Not recommended outside testing. Default: false." }
       },
       "if": { "properties": { "format": { "const": "pagerduty" } }, "required": ["format"] },
       "then": { "required": ["routing_key"] }
@@ -94,6 +106,15 @@
       "oneOf": [
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "AnyTransaction" } } },
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "TransactionFailed" } } },
+        { "type": "object", "required": ["type", "threshold_xlm"], "properties": { "type": { "const": "LargeTransfer" }, "threshold_xlm": { "type": "integer", "minimum": 1, "description": "Minimum transfer amount in XLM that triggers the alert." }, "direction": { "$ref": "#/$defs/TransferDirection" } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionCalled" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$", "description": "Contract function name to match." }, "args": { "type": "array", "items": { "$ref": "#/$defs/FunctionArg" }, "description": "Match invocation parameters by position; all entries must match." } } },
+        { "type": "object", "required": ["type", "function_names"], "properties": { "type": { "const": "AdminFunctionCalled" }, "function_names": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" }, "description": "Function names treated as administrative; any invocation of one triggers the alert." } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "HighFee" }, "threshold_stroops": { "type": "integer", "description": "Fee threshold in stroops; transactions at or above it trigger the alert." }, "threshold_xlm": { "type": ["integer", "null"], "description": "Convenience fee threshold in XLM; converted to stroops and merged with threshold_stroops." } } },
+        { "type": "object", "required": ["type", "rule", "count", "window_seconds"], "properties": { "type": { "const": "Rate" }, "rule": { "$ref": "#/$defs/AlertRule", "description": "Nested rule whose matches are counted." }, "count": { "type": "integer", "minimum": 1, "maximum": 1000000, "description": "Number of nested-rule matches required within the window to fire." }, "window_seconds": { "type": "integer", "minimum": 1, "maximum": 604800, "description": "Length of the sliding window in seconds (max 7 days)." } }, "description": "Fires once per breach when the nested rule matches at least `count` times within a sliding `window_seconds` window." },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "Memo" }, "memo_type": { "enum": ["none", "text", "id", "hash", "return"], "description": "Restrict matching to a specific memo type." }, "equals": { "type": "string", "minLength": 1, "description": "Exact memo value to match." }, "prefix": { "type": "string", "minLength": 1, "description": "Memo prefix to match." } }, "oneOf": [ { "required": ["equals"] }, { "required": ["prefix"] } ], "description": "Matches the transaction memo; exactly one of `equals` or `prefix` is required." },
+        { "type": "object", "required": ["type", "asset_code"], "properties": { "type": { "const": "AssetTransfer" }, "asset_code": { "type": "string", "pattern": "^[A-Z0-9]{1,12}$", "description": "Asset code to match (e.g. \"USDC\")." }, "issuer": { "type": ["string", "null"], "description": "Asset issuer account; when set, only transfers of this issuer's asset match." }, "min_amount": { "type": ["integer", "null"], "minimum": 0, "description": "Minimum transfer amount in the asset's smallest unit." } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionArgumentMatched" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$", "description": "Contract function name to match." }, "argument_index": { "type": "integer", "minimum": 0, "description": "Zero-based position of the argument to inspect." }, "argument_value": { "type": "string", "description": "Expected argument value (address, symbol, integer, or string)." } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractEvent" }, "topic": { "type": ["string", "null"], "description": "Optional topic filter; when set, only events whose first topic matches are considered." } } },
         { "type": "object", "required": ["type", "threshold_xlm"], "properties": { "type": { "const": "LargeTransfer" }, "threshold_xlm": { "type": "integer", "minimum": 1 }, "direction": { "$ref": "#/$defs/TransferDirection" } } },
         { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionCalled" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" }, "args": { "type": "array", "items": { "$ref": "#/$defs/FunctionArg" }, "description": "Match invocation parameters by position; all entries must match." } } },
         { "type": "object", "required": ["type", "function_names"], "properties": { "type": { "const": "AdminFunctionCalled" }, "function_names": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" } } } },
@@ -133,6 +154,16 @@
       "enum": ["in", "out", "any"],
       "default": "any",
       "description": "For LargeTransfer: only count balance changes where the watched contract is the recipient (\"in\"), the sender (\"out\"), or either (\"any\")."
+    },
+    "ReadinessPolicy": {
+      "enum": ["strict", "lenient", "disabled"],
+      "default": "strict",
+      "description": "How startup readiness checks behave: \"strict\" fails startup if any contract cannot be reached, \"lenient\" logs a warning and continues, and \"disabled\" skips readiness checks entirely."
+    },
+    "Severity": {
+      "enum": ["info", "warning", "critical"],
+      "default": "info",
+      "description": "Alert severity level, ordered info < warning < critical."
     },
     "DataMatcher": {
       "type": "object", "required": ["path", "op", "value"], "additionalProperties": false,
