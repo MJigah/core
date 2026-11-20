@@ -35,3 +35,8 @@ tracing-subscriber = { workspace = true, features = ["fmt", "registry"] }
 tokio         = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 tokio-rustls  = "0.26"
 rustls        = "0.23"
+criterion     = { workspace = true }
+
+[[bench]]
+name = "template_render"
+harness = false

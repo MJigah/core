@@ -151,6 +151,25 @@ webhook_url = "https://hooks.example.com/vault-webhook"
 # apply only to that contract. You can define different webhook receivers and alert
 # rules per contract, even if they share the same network.
 
+# Optional: named webhook destinations. Use `format = "template"` for receivers
+# TxWatch doesn't natively support. `content_type` is only valid with
+# `format = "template"` and sets the request Content-Type (defaults to
+# application/json). The template is rendered with the alert payload as context.
+#
+#   [[contracts.webhooks]]
+#   name         = "chat-bridge"
+#   url          = "https://hooks.example.com/chat-bridge"
+#   format       = "template"
+#   content_type = "text/plain"
+#   template     = "{{ .rule_type }} on {{ .contract_id }}: {{ .summary }}"
+#
+#   [[contracts.webhooks]]
+#   name         = "form-endpoint"
+#   url          = "https://forms.example.com/alerts"
+#   format       = "template"
+#   content_type = "application/x-www-form-urlencoded"
+#   template     = "contract={{ .contract_id }}&rule={{ .rule_type }}&severity={{ .severity }}"
+
 [[contracts]]
 label       = "Mainnet Bridge Gateway"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')

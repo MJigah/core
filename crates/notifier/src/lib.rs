@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 //! txwatch-notifier delivers webhook payloads over HTTP with retry and backoff,
-//! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
+//! exposing `send_webhook`, `send_to_destination` and `send_webhook_batch`
+//! helpers for webhook delivery. Batched delivery always posts a single
+//! `{"alerts": [...]}` body per request; it does not render per-destination
+//! digests.
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -23,7 +26,10 @@ pub mod format;
 pub mod kyc_auth;
 pub use kyc_auth::verify_kyc_webhook;
 
-const MAX_RETRIES: u32 = 3;
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Default `Content-Type` for webhook bodies.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/json";
 
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
@@ -56,8 +62,9 @@ pub async fn send_webhook_simple(
     send_webhook(client, url, payload, secret, rx).await
 }
 
-/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
+/// POST `payload` to `url`, making up to `MAX_ATTEMPTS` attempts in total
+/// (i.e. at most 2 retries) with exponential backoff between them
+/// (2 s → 4 s). Logs each attempt.
 /// If `secret` is Some, every request carries an
 /// `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` header; see
 /// `docs/verifying-webhooks.md`.
@@ -82,6 +89,7 @@ pub async fn send_webhook(
         client,
         url,
         body,
+        DEFAULT_CONTENT_TYPE,
         secret,
         &WebhookHeaders::default(),
         payload,
@@ -199,12 +207,24 @@ impl DestinationClients {
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
+/// The `Content-Type` to send for `destination`: its configured
+/// `content_type` (only meaningful for `format = "template"`), or
+/// [`DEFAULT_CONTENT_TYPE`].
+pub fn destination_content_type(destination: &WebhookDestination) -> &str {
+    destination
+        .content_type
+        .as_deref()
+        .unwrap_or(DEFAULT_CONTENT_TYPE)
 }
 
 /// Deliver `payload` to one configured destination: the body is rendered in
 /// the destination's [`format`](txwatch_config::WebhookFormat), and its
 /// custom headers and secret are applied. Retries as [`send_webhook`] does.
 /// Header values and secrets are never logged.
+///
+/// Template destinations are rendered through the compiled-template cache
+/// (see [`format::TemplateCache`]) so templates are compiled once per config
+/// generation rather than once per delivery.
 pub async fn send_to_destination(
     client: &Client,
     destination: &WebhookDestination,
@@ -233,16 +253,18 @@ pub async fn send_to_destination_with_client(
     );
     let _enter = span.enter();
 
-    let body = format::render_body(
+    let rendered = format::render_body(
         destination.format,
         payload,
         destination.routing_key.as_deref(),
         destination.template.as_deref(),
+        destination.content_type.as_deref(),
     )?;
     deliver(
         client,
         &destination.url,
-        body,
+        rendered.body,
+        &rendered.content_type,
         destination.secret.as_deref(),
         &destination.headers,
         payload,
@@ -259,6 +281,70 @@ pub async fn send_to_destination_simple(
 ) -> Result<DeliveryResult> {
     let (_tx, rx) = oneshot::channel();
     send_to_destination(client, destination, payload, rx).await
+}
+
+/// [`send_to_destination`] using a pre-compiled template cache, so template
+/// destinations are not recompiled on every delivery.
+pub async fn send_to_destination_cached(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    cache: &format::TemplateCache,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule = %payload.rule_triggered,
+        format = %destination.format
+    );
+    let _enter = span.enter();
+
+    let rendered = format::render_body_cached(
+        destination.format,
+        payload,
+        destination.routing_key.as_deref(),
+        destination.template.as_deref(),
+        destination.content_type.as_deref(),
+        cache,
+    )?;
+    let client = destination_client(client, destination)?;
+    deliver(
+        &client,
+        &destination.url,
+        rendered.body,
+        &rendered.content_type,
+        destination.secret.as_deref(),
+        &destination.headers,
+        payload,
+        shutdown,
+    )
+    .await
+}
+
+/// [`send_to_destination_cached`] for callers that have no shutdown signal.
+pub async fn send_to_destination_cached_simple(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    cache: &format::TemplateCache,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    send_to_destination_cached(client, destination, payload, cache, rx).await
+/// Send a real `test: true` payload to `destination` using its own client
+/// (mTLS identity and extra CA certificate) and configured headers/secret.
+///
+/// This is the delivery used by `validate --check-webhooks=post`: unlike a
+/// bare `HEAD`/`OPTIONS` probe it exercises the destination's credentials and
+/// custom headers, so a success confirms the configured request actually works.
+pub async fn send_test_to_destination(
+    client: &Client,
+    destination: &WebhookDestination,
+    label: &str,
+) -> Result<DeliveryResult> {
+    let payload = test_payload(label);
+    send_to_destination_simple(client, destination, &payload).await
 }
 
 /// Maximum number of alerts in one batched POST; larger sets are split.
@@ -299,6 +385,7 @@ pub async fn send_webhook_batch(
         client,
         url,
         body,
+        DEFAULT_CONTENT_TYPE,
         secret,
         &WebhookHeaders::default(),
         &payloads[0],
@@ -313,6 +400,7 @@ async fn deliver(
     client: &Client,
     url: &str,
     body: String,
+    content_type: &str,
     secret: Option<&str>,
     headers: &WebhookHeaders,
     payload: &AlertPayload,
@@ -321,7 +409,7 @@ async fn deliver(
     let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=MAX_ATTEMPTS {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -334,7 +422,7 @@ async fn deliver(
             req = req.header(name, value);
         }
         req = req
-            .header("Content-Type", "application/json")
+            .header("Content-Type", content_type)
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .header("X-TxWatch-Alert-Id", &payload.alert_id)
             .body(body.clone());
@@ -398,7 +486,7 @@ async fn deliver(
             }
         }
 
-        if attempt < MAX_RETRIES {
+        if attempt < MAX_ATTEMPTS {
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
                 res = &mut shutdown, if shutdown_live => {
@@ -416,7 +504,7 @@ async fn deliver(
         }
     }
 
-    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} attempts", MAX_ATTEMPTS));
     error!(
         url  = %url,
         rule = %payload.rule_triggered,
@@ -751,6 +839,7 @@ mod tests {
             &client,
             &url,
             BODY.to_owned(),
+            DEFAULT_CONTENT_TYPE,
             Some(SECRET),
             &WebhookHeaders::default(),
             &sample_payload(),
@@ -971,6 +1060,7 @@ mod tests {
 
         let mut dest = destination(
             format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Tx
             txwatch_config::WebhookFormat::Txwatch,
         );
         dest.headers = WebhookHeaders(
@@ -995,6 +1085,36 @@ mod tests {
         let mut p = sample_payload();
         p.transaction_hash = tx.into();
         p
+    }
+
+    #[tokio::test]
+    async fn send_test_to_destination_delivers_test_payload_with_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("Authorization", "Bearer t0ken"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut dest = destination(
+            format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Txwatch,
+        );
+        dest.headers
+            .0
+            .insert("Authorization".into(), "Bearer t0ken".into());
+
+        let delivery = send_test_to_destination(&build_client().unwrap(), &dest, "Probe")
+            .await
+            .unwrap();
+        assert_eq!(delivery.final_status, 200);
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["test"], true);
+        assert_eq!(body["label"], "Probe");
     }
 
     #[tokio::test]
