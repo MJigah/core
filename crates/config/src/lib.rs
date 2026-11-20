@@ -2345,10 +2345,6 @@ fn default_http_tcp_keepalive_secs() -> u64 {
     DEFAULT_HTTP_TCP_KEEPALIVE_SECS
 }
 
-fn default_summary_interval_seconds() -> u64 {
-    60
-}
-
 fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
