@@ -1635,6 +1635,8 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                         error = %error,
                         "could not fetch operation details — evaluating rules without them"
                     );
+                    #[cfg(feature = "metrics")]
+                    metrics::inc_transactions_degraded(&contract.label, contract.network.as_str());
                     SorobanDetails::default()
                 }
             };
