@@ -739,6 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn template_requires_a_body() {
+        let err = render_body(WebhookFormat::Template, &fixture(), None, None).unwrap_err();
+        assert!(err.to_string().contains("template"), "got: {}", err);
+    }
+
+    #[test]
+    fn template_body_from_file_like_string_renders() {
+        // Mirrors the CLI flow: the body is read from `--template-file` (or
+        // `--template`) and handed to `render_body` unchanged.
+        let file_contents = "{\n  \"content\": \"{{ rule_triggered }} on {{ label }}\",\n  \"tx\": \"{{ transaction_hash }}\"\n}\n";
+        let body = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some(file_contents),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["content"], "LargeTransfer(>=10000XLM) on Escrow <main> & co");
+        assert_eq!(v["tx"], "abc123");
+    }
+
+    #[test]
     fn pagerduty_requires_a_routing_key() {
         let err = render_body(WebhookFormat::Pagerduty, &fixture(), None, None).unwrap_err();
         assert!(err.to_string().contains("routing_key"), "got: {}", err);

@@ -221,6 +221,196 @@ async fn check_webhooks_method_not_allowed_falls_back_to_options() {
     );
 }
 
+// ── #475: JSON mode must agree with text mode on failures ────────────────────
+
+async fn run_validate_json_webhooks(config: &PathBuf) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn check_webhooks_json_404_is_failure() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&receiver)
+        .await;
+    Mock::given(method("OPTIONS"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&receiver)
+        .await;
+
+    let config = write_config_custom_network(
+        "webhook_json_404",
+        &format!("{}/hook", receiver.uri()),
+        "http://127.0.0.1:1",
+    );
+
+    let (success, stdout) = run_validate_json_webhooks(&config).await;
+    assert!(!success, "404 must fail in JSON mode; stdout: {stdout}");
+    assert!(
+        stdout.contains("\"ok\": false") || stdout.contains("\"ok\":false"),
+        "expected \"ok\": false in JSON output: {stdout}"
+    );
+    assert!(
+        stdout.contains("404"),
+        "expected status 404 in JSON output: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn check_webhooks_json_500_is_failure() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&receiver)
+        .await;
+    Mock::given(method("OPTIONS"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&receiver)
+        .await;
+
+    let config = write_config_custom_network(
+        "webhook_json_500",
+        &format!("{}/hook", receiver.uri()),
+        "http://127.0.0.1:1",
+    );
+
+    let (success, stdout) = run_validate_json_webhooks(&config).await;
+    assert!(!success, "500 must fail in JSON mode; stdout: {stdout}");
+    assert!(
+        stdout.contains("\"ok\": false") || stdout.contains("\"ok\":false"),
+        "expected \"ok\": false in JSON output: {stdout}"
+    );
+    assert!(
+        stdout.contains("500"),
+        "expected status 500 in JSON output: {stdout}"
+    );
+}
+
+// ── #477: configured headers and POST probe ──────────────────────────────────
+
+fn write_config_custom_with_headers(
+    name: &str,
+    webhook_url: &str,
+    headers: &str,
+) -> PathBuf {
+    let cfg = env::temp_dir().join(format!("txwatch_valcheck_{name}.toml"));
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "HeaderCheck"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = {{ horizon_url = "http://127.0.0.1:1" }}
+webhook_url = "{webhook_url}"
+webhook_headers = {{ {headers} }}
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+#[tokio::test]
+async fn check_webhooks_sends_configured_headers() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(wiremock::matchers::header("authorization", "Bearer secret-token"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let config = write_config_custom_with_headers(
+        "webhook_headers",
+        &format!("{}/hook", receiver.uri()),
+        r#"Authorization = "Bearer secret-token""#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "configured header should be accepted; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The mock only matches when the Authorization header is present, so a
+    // successful run proves the header was sent.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reachable"),
+        "expected 'reachable' in: {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn check_webhooks_post_sends_test_payload() {
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .and(wiremock::matchers::body_string_contains("\"test\":true"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let config = write_config_custom_network(
+        "webhook_post",
+        &format!("{}/hook", receiver.uri()),
+        "http://127.0.0.1:1",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks=post",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "POST probe should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reachable"),
+        "expected 'reachable' in: {stdout}"
+    );
+}
+
 // ── #225: --check-horizon passphrase verification ────────────────────────────
 
 fn horizon_root_json(passphrase: &str) -> serde_json::Value {

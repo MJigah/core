@@ -838,3 +838,58 @@ fn validate_json_format_does_not_conflict_with_check_flags() {
     assert!(json.get("webhook_checks").is_some());
     assert!(json.get("horizon_checks").is_some());
 }
+
+/// #476: horizon check output must identify which contract each result is about.
+#[test]
+fn validate_horizon_check_output_includes_contract_attribution() {
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_horizon_attribution_test.toml");
+    fs::write(&path, VALID_CONFIG).unwrap();
+
+    // Text output: the contract label must be printed alongside the check.
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Test Contract"),
+        "expected contract label in horizon check output:\n{}",
+        stdout
+    );
+
+    // JSON output: each horizon_checks entry must carry contract and contract_id.
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+            "--check-horizon",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("stdout must be valid JSON when --format json is used with --check-horizon");
+    let checks = json["horizon_checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "one contract → one horizon check entry");
+    assert_eq!(
+        checks[0]["contract"], "Test Contract",
+        "each check must carry the contract label:\n{}",
+        stdout
+    );
+    assert_eq!(
+        checks[0]["contract_id"], "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "each check must carry the contract_id:\n{}",
+        stdout
+    );
+}

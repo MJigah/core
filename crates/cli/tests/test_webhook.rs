@@ -211,6 +211,112 @@ webhook_url = "https://hooks.example.com/test"
 }
 
 #[test]
+fn test_webhook_accepts_teams_and_template_formats() {
+    for format in ["teams", "template"] {
+        let output = txwatch_bin()
+            .args([
+                "test-webhook",
+                "--url",
+                "http://127.0.0.1:1/webhook",
+                "--format",
+                format,
+                "--template",
+                r#"{"text": "{{ label }}"}"#,
+                "--secret",
+                "local-secret",
+            ])
+            .output()
+            .expect("failed to run txwatch");
+
+        // The webhook is unreachable, so exit code 1 is expected, but the
+        // format value must not be rejected as invalid.
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "expected exit code 1 (unreachable webhook) for format {format}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("invalid value") && !stderr.contains("possible values"),
+            "format {format} should be accepted, got: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_webhook_template_format_requires_template_body() {
+    let output = txwatch_bin()
+        .args([
+            "test-webhook",
+            "--url",
+            "http://127.0.0.1:1/webhook",
+            "--format",
+            "template",
+            "--secret",
+            "local-secret",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 when --format template is used without a template"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("template"),
+        "expected a clear error mentioning the missing template, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_webhook_template_format_with_inline_template() {
+    let output = txwatch_bin()
+        .args([
+            "test-webhook",
+            "--url",
+            "http://127.0.0.1:1/webhook",
+            "--format",
+            "template",
+            "--template",
+            r#"{"text": {{ label }}}"#,
+            "--secret",
+            "local-secret",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    // The webhook is unreachable, so exit code 1 is expected, but the inline
+    // template must be accepted rather than rejected by format validation.
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("invalid value") && !stderr.contains("possible values"),
+        "inline template should be accepted, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_webhook_format_help_lists_teams_and_template() {
+    let output = txwatch_bin()
+        .args(["test-webhook", "--help"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(output.status.success(), "expected --help to succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("teams"),
+        "expected --format help to list 'teams', got: {stdout}"
+    );
+    assert!(
+        stdout.contains("template"),
+        "expected --format help to list 'template', got: {stdout}"
+    );
+}
+
+#[test]
 fn test_webhook_contract_miss_lists_configured_labels() {
     let dir = env::temp_dir();
     let cfg_path = dir.join("txwatch_test_webhook_contract_miss.toml");
