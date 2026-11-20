@@ -287,16 +287,17 @@ impl fmt::Display for Severity {
     }
 }
 
-/// A validated Stellar G-address (56 chars, starts with 'G').
+/// A validated Stellar G-address (56 chars, starts with 'G') or muxed
+/// M-address (69 chars, starts with 'M').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
     // Accept muxed accounts (M...) and extract underlying account, or validate account directly (#238)
     let account = if addr.starts_with('M') {
-        // Muxed account: M... wraps a G... account with ID
-        // For validation purposes, we only need to verify the format is present
-        if addr.len() < 72 || addr.len() > 76 {
+        // Muxed account StrKey: 1 version byte + 32 key bytes + 8 ID bytes +
+        // 2 checksum bytes = 43 bytes, which is exactly 69 base32 characters.
+        if addr.len() != 69 {
             bail!(
                 "contract '{}': {} '{}' is not a valid Stellar muxed account \
-                 (M-prefixed addresses must be 72-76 characters)",
+                 (M-prefixed addresses must be exactly 69 characters)",
                 contract_label,
                 field,
                 addr
@@ -330,6 +331,54 @@ fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Re
             field,
             addr
         );
+    }
+
+    if account.starts_with('M') {
+        // Decode the StrKey payload and verify the version byte and CRC16
+        // checksum, mirroring `validate_contract_id` for `C…` addresses.
+        let decoded = decode_base32(account).ok_or_else(|| {
+            anyhow!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (invalid base32 encoding)",
+                contract_label,
+                field,
+                addr
+            )
+        })?;
+        if decoded.len() != 43 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (decoded length {} instead of 43)",
+                contract_label,
+                field,
+                addr,
+                decoded.len()
+            );
+        }
+        let version = decoded[0];
+        if version != 12 << 3 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (wrong version byte {}, expected {})",
+                contract_label,
+                field,
+                addr,
+                version,
+                12 << 3
+            );
+        }
+        let (payload, checksum) = decoded.split_at(decoded.len() - 2);
+        let expected = crc16_xmodem(payload);
+        let actual = u16::from_le_bytes([checksum[0], checksum[1]]);
+        if expected != actual {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (checksum mismatch)",
+                contract_label,
+                field,
+                addr
+            );
+        }
     }
 
     Ok(())
@@ -461,6 +510,11 @@ pub enum AlertRule {
         threshold_stroops: u64,
         #[serde(default)]
         threshold_xlm: Option<u64>,
+        /// Pre-computed stroops value set during validation (`threshold_xlm * 10_000_000`).
+        /// Skipped in serialisation so it does not appear in TOML or JSON config output.
+        #[serde(skip)]
+        #[schemars(skip)]
+        computed_threshold_stroops: u64,
     },
     /// Fires when the transaction source account is in (or not in) a list of G-addresses.
     #[serde(rename = "SourceAccount", alias = "source_account")]
@@ -708,6 +762,8 @@ impl<'de> Deserialize<'de> for AlertRule {
             } => AlertRule::HighFee {
                 threshold_stroops,
                 threshold_xlm,
+                // Filled in by `validate`.
+                computed_threshold_stroops: 0,
             },
             AlertRuleRepr::SourceAccount {
                 mode,
@@ -918,6 +974,7 @@ impl AlertRule {
             AlertRule::HighFee {
                 threshold_stroops,
                 threshold_xlm,
+                computed_threshold_stroops,
             } => match (*threshold_xlm, *threshold_stroops) {
                 (Some(_), s) if s > 0 => bail!(
                     "contract '{}': HighFee: specify either threshold_stroops or \
@@ -933,12 +990,16 @@ impl AlertRule {
                     contract_label
                 ),
                 (Some(xlm), 0) => {
-                    *threshold_stroops = xlm.checked_mul(10_000_000).with_context(|| {
-                        format!(
-                            "contract '{}': HighFee threshold_xlm overflow",
-                            contract_label
-                        )
-                    })?;
+                    // Store the computed value in the skipped field so a second
+                    // `validate()` (or a serialise-then-parse round-trip) does
+                    // not trip the "not both" check above (#395).
+                    *computed_threshold_stroops =
+                        xlm.checked_mul(10_000_000).with_context(|| {
+                            format!(
+                                "contract '{}': HighFee threshold_xlm overflow",
+                                contract_label
+                            )
+                        })?;
                 }
                 _ => {}
             },
@@ -5171,6 +5232,69 @@ mod tests {
             destination.headers.redacted(),
             ["Authorization: <redacted>"]
         );
+    }
+
+    #[test]
+    fn high_fee_validation_is_idempotent_and_round_trips() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::HighFee {
+            threshold_stroops: 0,
+            threshold_xlm: Some(1),
+            computed_threshold_stroops: 0,
+        })];
+        c.validate().unwrap();
+        // Validating the same rule again must succeed (#395).
+        c.validate().unwrap();
+
+        // Serialise the validated config and parse it back: both fields are
+        // emitted, but the skipped computed field is not, so parsing succeeds.
+        let serialised = toml::to_string(&c).unwrap();
+        let mut reparsed: ContractConfig = toml::from_str(&serialised).unwrap();
+        reparsed.validate().unwrap();
+        reparsed.validate().unwrap();
+    }
+
+    #[test]
+    fn high_fee_rejects_both_thresholds() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::HighFee {
+            threshold_stroops: 10_000_000,
+            threshold_xlm: Some(1),
+            computed_threshold_stroops: 0,
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_real_muxed_addresses() {
+        // Muxed addresses from the Stellar documentation.
+        for addr in [
+            "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+            "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+        ] {
+            assert_eq!(addr.len(), 69, "{}", addr);
+            assert!(
+                validate_stellar_address(addr, "test", "c").is_ok(),
+                "{}",
+                addr
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_muxed_addresses_of_wrong_length_or_checksum() {
+        let valid = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK";
+        // Wrong length (72-76 chars used to be accepted).
+        let too_long = format!("{}AAA", valid);
+        assert!(validate_stellar_address(&too_long, "test", "c").is_err());
+        let too_short = &valid[..68];
+        assert!(validate_stellar_address(too_short, "test", "c").is_err());
+        // Wrong checksum: flip the last character.
+        let mut bad = valid.to_owned();
+        bad.pop();
+        bad.push('A');
+        assert!(validate_stellar_address(&bad, "test", "c").is_err());
     }
 
     #[test]

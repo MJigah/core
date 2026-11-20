@@ -2031,6 +2031,95 @@ async fn horizon_429_is_not_a_successful_poll() {
         poll_interval_seconds: 3600,
         contracts: vec![contract],
         cursor_file: None,
+/// Issue #398: a `SourceAccount` rule listing a muxed `M…` address must match
+/// the muxed source account Horizon reports alongside the base `G…` account,
+/// and a `G…` rule must keep matching the base account.
+#[tokio::test]
+async fn source_account_rule_matches_muxed_and_base_accounts() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/horizon_muxed_source_transaction.json"
+    ))
+    .expect("muxed source fixture is valid JSON");
+    let muxed = fixture["source_account_muxed"]
+        .as_str()
+        .expect("fixture carries a muxed source account")
+        .to_string();
+    let base = fixture["source_account"]
+        .as_str()
+        .expect("fixture carries a base source account")
+        .to_string();
+    let hash = fixture["hash"].as_str().unwrap().to_string();
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [fixture.clone()] }
+        })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Both the muxed and the base rule must fire for this transaction.
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![
+            AlertRule::SourceAccount {
+                accounts: vec![muxed.clone()],
+            },
+            AlertRule::SourceAccount {
+                accounts: vec![base.clone()],
+            },
+        ],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
+    };
+
+    let report = txwatch_poller::run_once(cfg, false)
+        .await
+        .expect("the muxed fixture must poll cleanly");
+    assert_eq!(report.poll_failures, 0);
+    assert_eq!(report.transactions, 1);
+    assert_eq!(
+        report.alerts, 2,
+        "both the muxed M… rule and the base G… rule must fire for {hash}"
+    );
+
+    let requests = receiver.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "expected one webhook per matching rule");
+}
+
 /// Issue #278: cursor persistence must not block the poll loop. With many
 /// contracts and a deliberately slow writer, every contract must still be
 /// polled promptly; the writes are coalesced and performed off the async

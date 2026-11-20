@@ -65,6 +65,18 @@ pub struct HorizonTransaction {
     /// `source_account` for regular transactions; for fee-bump
     /// transactions it is the fee-bump (outer) source account.
     pub fee_account: Option<String>,
+    // ── Issue #398: muxed account fields ──────────────────────────────────────
+    /// Muxed (`M…`) form of the transaction's source account, when the
+    /// source is a muxed account. Horizon always reports the underlying
+    /// `G…` account in `source_account`.
+    #[serde(default)]
+    pub source_account_muxed: Option<String>,
+    /// The muxed account id embedded in `source_account_muxed`.
+    #[serde(default)]
+    pub source_account_muxed_id: Option<String>,
+    /// Muxed (`M…`) form of the fee payer, when it is a muxed account.
+    #[serde(default)]
+    pub fee_account_muxed: Option<String>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
@@ -3313,6 +3325,111 @@ mod tests {
         );
     }
 
+    // ── Issue #398: muxed source accounts ─────────────────────────────────────
+
+    #[test]
+    fn source_account_muxed_entry_matches_muxed_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "M… entries must match source_account_muxed"
+        );
+    }
+
+    #[test]
+    fn source_account_muxed_entry_does_not_match_base_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "a different M… entry must not match"
+        );
+    }
+
+    #[test]
+    fn source_account_g_entry_does_not_match_muxed_source() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.source_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::Source,
+                accounts: vec![
+                    "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "G… entries must not match the muxed source"
+        );
+    }
+
+    #[test]
+    fn source_account_muxed_fee_account_entry_matches() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into());
+        tx.fee_account = Some("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN".into());
+        tx.fee_account_muxed =
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into());
+        let payloads = run(
+            &[entry(AlertRule::SourceAccount {
+                mode: txwatch_config::SourceAccountMode::In,
+                field: txwatch_config::SourceAccountField::FeeAccount,
+                accounts: vec![
+                    "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ".into(),
+                ],
+                alert_unless: vec![],
+                allow: vec![],
+                deny: vec![],
+            })],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "M… entries must match fee_account_muxed for field=fee_account"
+        );
+    }
+
     #[test]
     fn source_account_field_fee_account_label_mentions_field() {
         use txwatch_config::{SourceAccountField, SourceAccountMode};
@@ -3383,6 +3500,45 @@ mod tests {
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert!(!enriched.enrichment_incomplete);
     }
+
+    #[test]
+    fn from_horizon_deserialises_muxed_account_fields() {
+        let raw: HorizonTransaction = serde_json::from_value(serde_json::json!({
+            "hash": "h1",
+            "created_at": "2024-06-01T00:00:00Z",
+            "successful": true,
+            "paging_token": "1",
+            "source_account": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+            "source_account_muxed": "MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ",
+            "source_account_muxed_id": "1234",
+            "fee_account_muxed": "MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        }))
+        .unwrap();
+        assert_eq!(
+            raw.source_account_muxed.as_deref(),
+            Some("MAAAAAAAAAAAACXQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQZQ")
+        );
+        assert_eq!(raw.source_account_muxed_id.as_deref(), Some("1234"));
+        assert_eq!(
+            raw.fee_account_muxed.as_deref(),
+            Some("MBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+        );
+    }
+
+    #[test]
+    fn from_horizon_muxed_fields_default_to_none() {
+        let raw: HorizonTransaction = serde_json::from_value(serde_json::json!({
+            "hash": "h1",
+            "created_at": "2024-06-01T00:00:00Z",
+            "successful": true,
+            "paging_token": "1",
+            "source_account": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        }))
+        .unwrap();
+        assert!(raw.source_account_muxed.is_none());
+        assert!(raw.source_account_muxed_id.is_none());
+        assert!(raw.fee_account_muxed.is_none());
+    }
 }
 
 // ── Property-based tests (#61) ────────────────────────────────────────────────
@@ -3411,6 +3567,9 @@ mod prop_tests {
             fee_charged_stroops: fee_stroops,
             source_account: None,
             fee_account: None,
+            source_account_muxed: None,
+            source_account_muxed_id: None,
+            fee_account_muxed: None,
             ledger: None,
             memo: None,
             memo_type: None,
