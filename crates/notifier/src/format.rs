@@ -174,6 +174,44 @@ fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// Truncates a multi-line block on a line boundary, appending
+/// `… and N more` for the dropped lines. Never cuts inside `<…>` markup: if
+/// the last kept line would end mid-markup it is dropped too.
+fn truncate_lines(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in &lines {
+        let extra = if kept.is_empty() { 0 } else { 1 };
+        if used + extra + line.chars().count() > max {
+            break;
+        }
+        used += extra + line.chars().count();
+        kept.push(line);
+    }
+    // Drop a trailing line whose `<…>` markup is unterminated.
+    while let Some(last) = kept.last() {
+        let opens = last.matches('<').count();
+        let closes = last.matches('>').count();
+        if opens > closes {
+            kept.pop();
+        } else {
+            break;
+        }
+    }
+    let dropped = lines.len() - kept.len();
+    let suffix = format!("… and {} more", dropped);
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&suffix);
+    truncate(&out, max)
+}
+
 /// Normalises the configured rule severity to one of `info`, `warning`,
 /// `critical`. Returns `None` when the payload carries no severity so callers
 /// can fall back to the rule-type heuristic.
@@ -323,7 +361,7 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
             },
             {
                 "type": "section",
-                "text": { "type": "mrkdwn", "text": truncate(&lines.join("\n"), SLACK_TEXT_MAX) },
+                "text": { "type": "mrkdwn", "text": truncate_lines(&lines.join("\n"), SLACK_TEXT_MAX) },
             },
         ],
     })
@@ -348,40 +386,98 @@ fn discord_color(p: &AlertPayload) -> u32 {
     }
 }
 
+/// Escapes the characters Discord treats as markdown so untrusted values
+/// (labels, rule text, memos) can never inject masked links, spoilers or
+/// formatting.
+fn discord_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '*' | '_' | '~' | '|' | '>' | '[' | ']' | '(' | ')' | '`'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Discord embed limits; exceeding any of them makes Discord answer HTTP 400.
+const DISCORD_FIELD_MAX: usize = 1024;
+const DISCORD_FIELDS_MAX: usize = 25;
+const DISCORD_EMBED_TOTAL_MAX: usize = 6000;
+
 /// Discord webhook message.
 pub fn discord(p: &AlertPayload) -> Value {
-    let mut fields = vec![
-        json!({ "name": "Contract", "value": format!("`{}`", p.contract_id), "inline": false }),
-        json!({
-            "name": "Transaction",
-            "value": truncate(&format!("[{}]({})", p.transaction_hash, p.explorer_link), 1024),
-            "inline": false,
-        }),
-    ];
+    let title = truncate(
+        &if p.resolved {
+            format!("✅ Resolved: {}", discord_escape(&p.rule_triggered))
+        } else {
+            discord_escape(&p.rule_triggered)
+        },
+        256,
+    );
+    let description = truncate(
+        &format!(
+            "{} ({})",
+            discord_escape(&p.label),
+            discord_escape(&p.network)
+        ),
+        4096,
+    );
+
+    // Running total of embed text: title, description, field names and values.
+    let mut used = title.chars().count() + description.chars().count();
+
+    let mut fields: Vec<Value> = Vec::new();
+    let mut push_field = |name: &str, value: String, inline: bool, used: &mut usize| {
+        if fields.len() >= DISCORD_FIELDS_MAX {
+            return;
+        }
+        let value = truncate(&value, DISCORD_FIELD_MAX);
+        let cost = name.chars().count() + value.chars().count();
+        if *used + cost > DISCORD_EMBED_TOTAL_MAX {
+            return;
+        }
+        *used += cost;
+        fields.push(json!({ "name": name, "value": value, "inline": inline }));
+    };
+
+    push_field(
+        "Contract",
+        format!("`{}`", discord_escape(&p.contract_id)),
+        false,
+        &mut used,
+    );
+    push_field(
+        "Transaction",
+        format!(
+            "[{}]({})",
+            discord_escape(&p.transaction_hash),
+            p.explorer_link
+        ),
+        false,
+        &mut used,
+    );
     for (name, value) in details(p) {
-        fields.push(json!({ "name": name, "value": truncate(&value, 1024), "inline": true }));
+        push_field(name, discord_escape(&value), true, &mut used);
     }
-    fields.push(json!({
-        "name": "Horizon",
-        "value": truncate(&format!("[transaction]({})", p.horizon_link), 1024),
-        "inline": true,
-    }));
+    push_field(
+        "Horizon",
+        format!("[transaction]({})", p.horizon_link),
+        true,
+        &mut used,
+    );
 
     json!({
         "username": "TxWatch",
-        "content": truncate(&headline(p), 2000),
+        "content": truncate(&discord_escape(&headline(p)), 2000),
         "allowed_mentions": { "parse": [] },
         "embeds": [{
-            "title": truncate(
-                &if p.resolved {
-                    format!("✅ Resolved: {}", p.rule_triggered)
-                } else {
-                    p.rule_triggered.clone()
-                },
-                256,
-            ),
+            "title": title,
             "url": p.explorer_link,
-            "description": truncate(&format!("{} ({})", p.label, p.network), 4096),
+            "description": description,
             "color": discord_color(p),
             "timestamp": p.timestamp_iso,
             "fields": fields,
@@ -396,7 +492,11 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
     for p in payloads {
         lines.push(format!(
             "• {} on {} ({}) — [{}]({})",
-            p.rule_triggered, p.label, p.network, p.transaction_hash, p.explorer_link
+            discord_escape(&p.rule_triggered),
+            discord_escape(&p.label),
+            discord_escape(&p.network),
+            discord_escape(&p.transaction_hash),
+            p.explorer_link
         ));
     }
     json!({
@@ -917,6 +1017,94 @@ mod tests {
         let card = &digest["attachments"][0]["content"];
         assert_eq!(card["body"][0]["text"], "TxWatch: 2 alert(s)");
         assert_eq!(card["body"][1]["facts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn discord_enforces_embed_limits() {
+        let mut p = fixture();
+        p.rule_triggered = "x".repeat(5000);
+        p.label = "y".repeat(4000);
+        p.function_names = vec!["f".repeat(3000)];
+        p.source_account = Some("G".repeat(2000));
+        p.ledger = Some(1);
+        p.memo = Some("m".repeat(2000));
+        p.severity = Some("critical".into());
+        p.suppressed_count = 2;
+        p.amount_xlm_decimal = Some("1.5".into());
+        p.matched_events = (0..10)
+            .map(|i| txwatch_rules::MatchedEvent {
+                topics: vec![json!(format!("event-{}-{}", i, "z".repeat(200)))],
+                data: Value::Null,
+            })
+            .collect();
+        let discord = render(WebhookFormat::Discord, &p);
+        let embed = &discord["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields.len() <= 25);
+        let mut total = embed["title"].as_str().unwrap().chars().count()
+            + embed["description"].as_str().unwrap().chars().count();
+        for f in fields {
+            let name = f["name"].as_str().unwrap();
+            let value = f["value"].as_str().unwrap();
+            assert!(value.chars().count() <= 1024);
+            total += name.chars().count() + value.chars().count();
+        }
+        assert!(total <= 6000, "embed total was {}", total);
+    }
+
+    #[test]
+    fn discord_escapes_markdown_in_untrusted_values() {
+        let mut p = fixture();
+        p.label = "[click here](https://evil.example)".into();
+        p.rule_triggered = "||spoiler|| `fence`".into();
+        p.memo = Some("*bold* _it_ ~strike~ > quote \\".into());
+        let discord = render(WebhookFormat::Discord, &p);
+        let description = discord["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("\\[click here\\]\\(https://evil.example\\)"));
+        let title = discord["embeds"][0]["title"].as_str().unwrap();
+        assert!(title.contains("\\|\\|spoiler\\|\\|"));
+        assert!(title.contains("\\`fence\\`"));
+        let memo = discord["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "Memo")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(memo.contains("\\*bold\\*"));
+        assert!(memo.contains("\\_it\\_"));
+        assert!(memo.contains("\\~strike\\~"));
+        assert!(memo.contains("\\> quote"));
+        assert!(memo.contains("\\\\"));
+
+        let digest = render_batch_body(WebhookFormat::Discord, &[p], None).unwrap();
+        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let desc = digest["embeds"][0]["description"].as_str().unwrap();
+        assert!(desc.contains("\\[click here\\]"));
+    }
+
+    #[test]
+    fn slack_digest_truncates_on_line_boundaries() {
+        let payloads: Vec<AlertPayload> = (0..100)
+            .map(|i| {
+                let mut p = fixture();
+                p.transaction_hash = format!("hash{}", i);
+                p
+            })
+            .collect();
+        let body = render_batch_body(WebhookFormat::Slack, &payloads, None).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let text = value["blocks"][1]["text"]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= 3000);
+        assert!(text.contains("… and "));
+        assert!(text.ends_with(" more"));
+        // Every kept line is a complete alert line with balanced link markup.
+        for line in text.lines().filter(|l| l.starts_with('•')) {
+            assert_eq!(line.matches('<').count(), line.matches('>').count());
+            assert!(line.ends_with('>'));
+        }
     }
 
     #[test]

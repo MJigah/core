@@ -20,7 +20,7 @@ pub mod format;
 pub mod kyc_auth;
 pub use kyc_auth::verify_kyc_webhook;
 
-const MAX_RETRIES: u32 = 3;
+const MAX_ATTEMPTS: u32 = 3;
 
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
@@ -53,8 +53,9 @@ pub async fn send_webhook_simple(
     send_webhook(client, url, payload, secret, rx).await
 }
 
-/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
+/// POST `payload` to `url`, making up to `MAX_ATTEMPTS` attempts in total
+/// (i.e. at most 2 retries) with exponential backoff between them
+/// (2 s → 4 s). Logs each attempt.
 /// If `secret` is Some, every request carries an
 /// `X-TxWatch-Signature: sha256=<hex HMAC-SHA256 of the body>` header; see
 /// `docs/verifying-webhooks.md`.
@@ -240,7 +241,7 @@ async fn deliver(
     let mut shutdown_live = true;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=MAX_ATTEMPTS {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -317,7 +318,7 @@ async fn deliver(
             }
         }
 
-        if attempt < MAX_RETRIES {
+        if attempt < MAX_ATTEMPTS {
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
                 res = &mut shutdown, if shutdown_live => {
@@ -335,7 +336,7 @@ async fn deliver(
         }
     }
 
-    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} attempts", MAX_ATTEMPTS));
     error!(
         url  = %url,
         rule = %payload.rule_triggered,
