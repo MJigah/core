@@ -1477,46 +1477,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     let poll_base = poll_base_url(contract);
     let canonical_base = contract.network.horizon_base_url();
 
-    // Collect all pages of transactions.
-    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
-    let mut page_cursor = cursor.clone();
-
-    loop {
-        let page = match source.fetch_page(contract, &page_cursor).await? {
-            FetchOutcome::Page(page) => page,
-            FetchOutcome::Unsupported => {
-                warn!(
-                    contract = %contract.label,
-                    "no transaction source can serve this contract; see issue #4"
-                );
-                break;
-            }
-            FetchOutcome::RateLimited { retry_after } => {
-                // Issue #271: a 429 is not a successful empty poll. Surface it as
-                // an error so the failure streak, readiness and freshness metrics
-                // are not advanced and `NoActivity` cannot fire a false alert.
-                return Err(anyhow::anyhow!(
-                    "Horizon rate limited the poll (429); retry after {}s",
-                    retry_after.as_secs()
-                ));
-            }
-        };
-        if page.records.is_empty() {
-            break;
-        }
-        all_records.extend(page.records);
-        match page.next_cursor {
-            Some(next) => page_cursor = next,
-            None => break,
-        }
-    }
-
-    if !all_records.is_empty() {
-        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
-        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
-    }
-
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
