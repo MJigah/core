@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, EVENT_TOPIC_WILDCARD};
+use txwatch_config::{AlertRule, FunctionMatchMode, RuleConfig, Severity, EVENT_TOPIC_WILDCARD};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -591,8 +591,8 @@ pub struct AlertPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_account: Option<String>,
     /// Optional severity level from the rule definition.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub severity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<Severity>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
@@ -874,7 +874,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                         .clone()
                         .filter(|f| tx.source_account.as_deref() != Some(f.as_str())),
                     // Per-rule delivery overrides, absent unless the rule sets them.
-                    severity: entry.severity().map(|s| s.to_string()),
+                    severity: entry.severity().cloned(),
                     effective_webhook_url: entry.webhook_url().map(str::to_owned),
                     effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
                     timestamp,
@@ -923,7 +923,7 @@ pub fn evaluate<R: AsRef<AlertRule> + RuleOverrides>(
                         fee_charged_stroops: tx.fee_charged_stroops,
                         source_account: tx.source_account.clone(),
                         // Per-rule delivery overrides, absent unless the rule sets them.
-                        severity: entry.severity().map(|s| s.to_string()),
+                        severity: entry.severity().cloned(),
                         effective_webhook_url: entry.webhook_url().map(str::to_owned),
                         effective_webhook_secret: entry.webhook_secret().map(str::to_owned),
                         timestamp,
@@ -1839,7 +1839,7 @@ impl RateTracker {
                 payload.alert_id = alert_id(ctx.contract_id, &tx.hash, &label);
                 payload.rule_triggered = label;
                 payload.observed_count = Some(observed);
-                payload.severity = entry.severity().map(|s| s.to_string());
+                payload.severity = entry.severity().cloned();
                 payload.effective_webhook_url = entry.webhook_url().map(str::to_owned);
                 payload.effective_webhook_secret = entry.webhook_secret().map(str::to_owned);
                 out.push(payload);
@@ -2739,7 +2739,7 @@ mod tests {
             payloads[0].effective_webhook_secret.as_deref(),
             Some("mysecret")
         );
-        assert_eq!(payloads[0].severity.as_deref(), Some("critical"));
+        assert_eq!(payloads[0].severity, Some(Severity::Critical));
     }
 
     #[test]

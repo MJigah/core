@@ -1928,7 +1928,7 @@ async fn deliver_payload(
     }
     let destinations: Vec<WebhookDestination> = destinations
         .into_iter()
-        .filter(|d| d.accepts(payload.severity.as_deref(), &payload.rule_type))
+        .filter(|d| d.accepts(payload.severity.as_ref(), &payload.rule_type))
         .collect();
 
     *webhook_failures += deliver_to_all(client, contract, &destinations, payload).await;

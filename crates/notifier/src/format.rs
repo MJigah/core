@@ -17,7 +17,7 @@
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
-use txwatch_config::WebhookFormat;
+use txwatch_config::{Severity, WebhookFormat};
 use txwatch_rules::AlertPayload;
 
 /// Renders the request body for `format`. `routing_key` is required for
@@ -136,8 +136,8 @@ pub fn details(p: &AlertPayload) -> Vec<(&'static str, String)> {
         };
         details.push(("Memo", value));
     }
-    if let Some(severity) = p.severity.as_deref() {
-        details.push(("Severity", severity.to_owned()));
+    if let Some(severity) = &p.severity {
+        details.push(("Severity", severity.to_string()));
     }
     if p.suppressed_count > 0 {
         details.push((
@@ -178,15 +178,10 @@ fn truncate(text: &str, max: usize) -> String {
 /// `critical`. Returns `None` when the payload carries no severity so callers
 /// can fall back to the rule-type heuristic.
 fn configured_severity(p: &AlertPayload) -> Option<&'static str> {
-    let raw = p.severity.as_deref()?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    match raw.to_ascii_lowercase().as_str() {
-        "info" => Some("info"),
-        "warning" | "warn" => Some("warning"),
-        "critical" | "error" => Some("critical"),
-        _ => None,
+    match p.severity.as_ref()? {
+        Severity::Info => Some("info"),
+        Severity::Warning => Some("warning"),
+        Severity::Critical => Some("critical"),
     }
 }
 
@@ -752,7 +747,7 @@ mod tests {
         p.source_account = Some("G".into());
         p.ledger = Some(1);
         p.memo = Some("m".into());
-        p.severity = Some("critical".into());
+        p.severity = Some(Severity::Critical);
         p.suppressed_count = 2;
         p.amount_xlm_decimal = Some("1.5".into());
         let slack = render(WebhookFormat::Slack, &p);
@@ -802,7 +797,7 @@ mod tests {
         p.ledger = Some(42);
         p.memo = Some("invoice-7".into());
         p.memo_type = Some("text".into());
-        p.severity = Some("warning".into());
+        p.severity = Some(Severity::Warning);
         p.suppressed_count = 3;
 
         let slack = render(WebhookFormat::Slack, &p);

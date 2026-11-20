@@ -15,6 +15,7 @@ use tracing_subscriber::Layer;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use txwatch_config::Severity;
 use txwatch_notifier::{build_client, send_webhook, test_payload};
 
 #[tokio::test]
@@ -217,7 +218,7 @@ fn test_pagerduty_resolve_snapshot() {
 #[test]
 fn test_pagerduty_severity_overrides_rule_type_heuristic() {
     let mut payload = test_payload("AdminFunctionCalled");
-    payload.severity = Some("info".to_string());
+    payload.severity = Some(Severity::Info);
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
@@ -233,7 +234,7 @@ fn test_pagerduty_severity_overrides_rule_type_heuristic() {
 #[test]
 fn test_pagerduty_critical_large_transfer() {
     let mut payload = test_payload("LargeTransfer");
-    payload.severity = Some("critical".to_string());
+    payload.severity = Some(Severity::Critical);
 
     let value = txwatch_notifier::format::pagerduty(&payload, "routing-key");
     let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
