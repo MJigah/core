@@ -299,6 +299,49 @@ fn init_rejects_unknown_network() {
     assert!(!output.exists());
 }
 
+/// #471: the generated config must be written exactly once with mode 0600
+/// (it may contain a webhook secret), and no temp file may be left behind.
+#[cfg(unix)]
+#[test]
+fn init_writes_file_once_with_0600_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let output = fresh_output("perms");
+    let args = [
+        "--contract-id",
+        CONTRACT_ID,
+        "--network",
+        "testnet",
+        "--webhook-url",
+        "https://hooks.example.com/alerts",
+    ];
+
+    let result = init(&output, &args);
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mode = fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "generated config must be owner-only readable, got {mode:o}"
+    );
+
+    // No leftover temp file from the write.
+    let tmp = output.with_extension("toml.tmp");
+    assert!(!tmp.exists(), "temp file must not be left behind: {tmp:?}");
+
+    // --force still overwrites correctly, preserving 0600.
+    let mut forced = args.to_vec();
+    forced.push("--force");
+    assert!(init(&output, &forced).status.success());
+    assert!(fs::read_to_string(&output).unwrap().contains(CONTRACT_ID));
+    let mode = fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "forced overwrite must keep 0600, got {mode:o}");
+}
+
 /// #227: init uses create_new so a file created between the existence check
 /// and the write is not silently overwritten (TOCTOU race condition).
 /// We verify this indirectly by checking that --force is required to overwrite.

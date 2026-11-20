@@ -11,6 +11,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # NOTE: this job must be configured as a required status check for merges
+  # (branch protection on `main`), otherwise stale schemas can land.
   config-schema:
     name: Config schema is up to date
     runs-on: ubuntu-latest
@@ -23,6 +25,26 @@ jobs:
           jq -S . /tmp/txwatch-config.schema.json > /tmp/txwatch-config.schema.sorted.json
           jq -S . docs/txwatch-config.schema.json > /tmp/txwatch-config.committed.sorted.json
           diff -u /tmp/txwatch-config.committed.sorted.json /tmp/txwatch-config.schema.sorted.json
+      - name: Regenerate and compare alert batch schema
+        run: |
+          cargo run --quiet -p txwatch -- schema --batch > /tmp/alert-batch.schema.json
+          jq -S . /tmp/alert-batch.schema.json > /tmp/alert-batch.schema.sorted.json
+          jq -S . docs/alert-batch.schema.json > /tmp/alert-batch.committed.sorted.json
+          diff -u /tmp/alert-batch.committed.sorted.json /tmp/alert-batch.schema.sorted.json
+
+  # NOTE: like config-schema, this job should be a required status check.
+  payload-schema:
+    name: Payload schema is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate and compare payload schema
+        run: |
+          cargo run --quiet -p txwatch -- schema --payload > /tmp/txwatch-payload.schema.json
+          jq -S . /tmp/txwatch-payload.schema.json > /tmp/txwatch-payload.schema.sorted.json
+          jq -S . docs/alert-payload.schema.json > /tmp/txwatch-payload.committed.sorted.json
+          diff -u /tmp/txwatch-payload.committed.sorted.json /tmp/txwatch-payload.schema.sorted.json
 
   # ── Workflow lint ───────────────────────────────────────────────────────────
   actionlint:
@@ -54,6 +76,40 @@ jobs:
       - uses: azure/setup-helm@v5
       - run: helm lint deploy/helm/txwatch
       - run: helm template txwatch deploy/helm/txwatch --set metrics.serviceMonitor.enabled=true --set metrics.prometheusRule.enabled=true > /dev/null
+
+  # Renders the chart with its default values and feeds the resulting config to
+  # the real binary, so a config that crash-loops on install fails CI.
+  helm-validate:
+    name: Helm chart config validates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: azure/setup-helm@v5
+      - name: Install yq
+        uses: mikefarah/yq@v4
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-helm-validate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-helm-validate-
+      - name: Build txwatch
+        run: cargo build -p txwatch --features metrics
+      - name: Render chart and validate the config
+        run: |
+          helm template txwatch deploy/helm/txwatch > /tmp/rendered.yaml
+          yq -r 'select(.kind == "ConfigMap") | .data["txwatch.toml"]' \
+            /tmp/rendered.yaml > /tmp/txwatch.toml
+          if [ ! -s /tmp/txwatch.toml ]; then
+            echo "::error::no txwatch.toml found in the rendered ConfigMap"
+            exit 1
+          fi
+          TXWATCH_CONFIG=/tmp/txwatch.toml target/debug/txwatch validate
 
   # ── Fuzz smoke test ─────────────────────────────────────────────────────────
   fuzz:

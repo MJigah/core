@@ -264,6 +264,19 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     }
 }
 
+// ── Batched webhook body (issue #482) ─────────────────────────────────────────
+
+/// The body of a batched webhook delivery, sent when a receiver enables
+/// `batch_alerts`: `{"alerts": [AlertPayload, …]}`.
+///
+/// The JSON Schema for this type is published as `docs/alert-batch.schema.json`
+/// and can be printed with `txwatch schema --batch`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertBatch {
+    /// The alerts delivered together in this webhook call, in evaluation order.
+    pub alerts: Vec<AlertPayload>,
+}
+
 // ── ScVal decoding (issue #266) ───────────────────────────────────────────────
 
 /// Decode a Soroban `ScVal` (in its JSON form) into a plain string for

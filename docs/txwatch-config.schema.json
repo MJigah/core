@@ -21,6 +21,15 @@
     "min_severity": { "$ref": "#/$defs/Severity", "description": "Minimum severity an alert must have to be delivered. Alerts below this level are dropped before dispatch. Default: \"info\"." },
     "rule_types": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Allowlist of rule type names (e.g. \"LargeTransfer\", \"EventEmitted\"). When set, only rules whose type appears in this list are evaluated; all others are skipped." },
     "contracts": { "type": "array", "items": { "$ref": "#/$defs/WatchedContract" }, "minItems": 1, "description": "Watched contracts. Each entry defines a contract, its network, and the rules evaluated against its transactions and events." }
+    "concurrency": { "type": ["integer", "null"], "minimum": 1, "maximum": 256, "description": "Maximum number of contracts polled concurrently in one cycle (used by watch and watch --once). Default: 10." },
+    "state_file": { "type": ["string", "null"], "description": "Path to the persisted watcher state file. Defaults to the platform state directory." },
+    "readiness_policy": { "$ref": "#/$defs/ReadinessPolicy" },
+    "include": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Glob patterns of additional config files to merge into this one." },
+    "cooldown_summary": { "type": ["boolean", "null"], "description": "Emit a summary alert when a rule is suppressed by its cooldown. Default: false." },
+    "min_severity": { "$ref": "#/$defs/Severity" },
+    "rule_types": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Restrict alerting to these rule types; unset means all types." },
+    "template_file": { "type": ["string", "null"], "description": "Path to a custom alert message template file." },
+    "contracts": { "type": "array", "items": { "$ref": "#/$defs/WatchedContract" }, "minItems": 1 }
   },
   "$defs": {
     "WatchedContract": {
@@ -55,6 +64,22 @@
       }
     },
     "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty", "teams"], "default": "txwatch" },
+    "Severity": { "enum": ["info", "warning", "critical"], "default": "info", "description": "Minimum severity an alert must have to be delivered." },
+    "ReadinessPolicy": {
+      "oneOf": [
+        { "enum": ["strict", "lenient", "disabled"] },
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "require_horizon": { "type": "boolean", "default": true },
+            "require_rpc": { "type": "boolean", "default": false },
+            "require_webhooks": { "type": "boolean", "default": false },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 30 }
+          }
+        }
+      ],
+      "description": "Controls which dependencies must be reachable before the watcher starts. Default: \"strict\"."
+    },
     "WebhookHeaders": {
       "type": "object",
       "description": "Extra HTTP headers; values support ${ENV_VAR}. Content-Type, Content-Length and X-TxWatch-* are reserved.",
@@ -90,6 +115,15 @@
         { "type": "object", "required": ["type", "asset_code"], "properties": { "type": { "const": "AssetTransfer" }, "asset_code": { "type": "string", "pattern": "^[A-Z0-9]{1,12}$", "description": "Asset code to match (e.g. \"USDC\")." }, "issuer": { "type": ["string", "null"], "description": "Asset issuer account; when set, only transfers of this issuer's asset match." }, "min_amount": { "type": ["integer", "null"], "minimum": 0, "description": "Minimum transfer amount in the asset's smallest unit." } } },
         { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionArgumentMatched" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$", "description": "Contract function name to match." }, "argument_index": { "type": "integer", "minimum": 0, "description": "Zero-based position of the argument to inspect." }, "argument_value": { "type": "string", "description": "Expected argument value (address, symbol, integer, or string)." } } },
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractEvent" }, "topic": { "type": ["string", "null"], "description": "Optional topic filter; when set, only events whose first topic matches are considered." } } },
+        { "type": "object", "required": ["type", "threshold_xlm"], "properties": { "type": { "const": "LargeTransfer" }, "threshold_xlm": { "type": "integer", "minimum": 1 }, "direction": { "$ref": "#/$defs/TransferDirection" } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionCalled" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" }, "args": { "type": "array", "items": { "$ref": "#/$defs/FunctionArg" }, "description": "Match invocation parameters by position; all entries must match." } } },
+        { "type": "object", "required": ["type", "function_names"], "properties": { "type": { "const": "AdminFunctionCalled" }, "function_names": { "type": "array", "items": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" } } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "HighFee" }, "threshold_stroops": { "type": "integer" }, "threshold_xlm": { "type": ["integer", "null"] } } },
+        { "type": "object", "required": ["type", "rule", "count", "window_seconds"], "properties": { "type": { "const": "Rate" }, "rule": { "$ref": "#/$defs/AlertRule" }, "count": { "type": "integer", "minimum": 1, "maximum": 1000000 }, "window_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 } }, "description": "Fires once per breach when the nested rule matches at least `count` times within a sliding `window_seconds` window." },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "Memo" }, "memo_type": { "enum": ["none", "text", "id", "hash", "return"] }, "equals": { "type": "string", "minLength": 1 }, "prefix": { "type": "string", "minLength": 1 } }, "oneOf": [ { "required": ["equals"] }, { "required": ["prefix"] } ], "description": "Matches the transaction memo; exactly one of `equals` or `prefix` is required." },
+        { "type": "object", "required": ["type", "asset_code"], "properties": { "type": { "const": "AssetTransfer" }, "asset_code": { "type": "string", "pattern": "^[A-Z0-9]{1,12}$" }, "issuer": { "type": ["string", "null"] }, "min_amount": { "type": ["integer", "null"], "minimum": 0 } } },
+        { "type": "object", "required": ["type", "function_name"], "properties": { "type": { "const": "FunctionArgumentMatched" }, "function_name": { "type": "string", "pattern": "^[a-zA-Z0-9_]{1,32}$" }, "argument_index": { "type": "integer", "minimum": 0 }, "argument_value": { "type": "string" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractEvent" }, "topic": { "type": ["string", "null"] } } },
         { "type": "object", "required": ["type"], "properties": { "type": { "const": "ContractUpgraded" } } },
         {
           "type": "object", "required": ["type", "topic"],
