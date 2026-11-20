@@ -630,20 +630,14 @@ enum AlertRuleRepr {
     TransactionFailed {},
     #[serde(rename = "LargeTransfer", alias = "large_transfer")]
     LargeTransfer {
-        threshold_xlm: u64,
-        #[serde(default = "default_transfer_direction")]
-        direction: String,
-    },
-    #[serde(rename = "FunctionCalled", alias = "function_called")]
-    FunctionCalled { function_name: String },
-    #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
-    AdminFunctionCalled { function_names: Vec<String> },
-    #[serde(rename = "HighFee", alias = "high_fee")]
         #[serde(default)]
         threshold_xlm: Option<u64>,
         #[serde(default)]
         threshold_stroops: Option<u64>,
+        #[serde(default = "default_transfer_direction")]
+        direction: String,
     },
+    #[serde(rename = "FunctionCalled", alias = "function_called")]
     FunctionCalled {
         function_name: String,
         #[serde(default)]
@@ -651,9 +645,9 @@ enum AlertRuleRepr {
         #[serde(default)]
         args: Vec<ArgMatcher>,
     },
-    AdminFunctionCalled {
-        function_names: Vec<String>,
-    },
+    #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
+    AdminFunctionCalled { function_names: Vec<String> },
+    #[serde(rename = "HighFee", alias = "high_fee")]
     HighFee {
         #[serde(default)]
         threshold_stroops: u64,
@@ -716,13 +710,8 @@ impl<'de> Deserialize<'de> for AlertRule {
             AlertRuleRepr::TransactionFailed {} => AlertRule::TransactionFailed,
             AlertRuleRepr::LargeTransfer {
                 threshold_xlm,
-                direction,
-            } => AlertRule::LargeTransfer {
-                threshold_xlm,
-                direction,
-                // Filled in by `validate`.
-                threshold_stroops: 0,
                 threshold_stroops,
+                direction,
             } => {
                 // #240: Accept either threshold_xlm or threshold_stroops
                 let (xlm, stroops) = match (threshold_xlm, threshold_stroops) {
@@ -741,9 +730,10 @@ impl<'de> Deserialize<'de> for AlertRule {
                 };
                 AlertRule::LargeTransfer {
                     threshold_xlm: xlm,
+                    direction,
                     threshold_stroops: stroops,
                 }
-            },
+            }
             AlertRuleRepr::FunctionCalled {
                 function_name,
                 match_mode,
@@ -1270,6 +1260,7 @@ impl AlertRule {
             }
             AlertRule::SourceAccount {
                 mode,
+                field,
                 accounts,
                 alert_unless,
                 allow,
@@ -1324,7 +1315,6 @@ impl AlertRule {
             AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
             AlertRule::EventEmitted { topic, topics, .. } => event_emitted_label(topic, topics),
             AlertRule::ContractUpgraded => "ContractUpgraded".into(),
-            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
             AlertRule::Rate {
                 rule,
                 count,
@@ -2603,6 +2593,8 @@ impl Default for AppConfig {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            concurrency: None,
+            state_file: None,
             include: Vec::new(),
             loaded_files: Vec::new(),
             contract_files: std::collections::HashMap::new(),
@@ -2691,8 +2683,6 @@ fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let deserializer =
-        toml::Deserializer::parse(raw).map_err(|e| anyhow!("{} (in {})", e, path.display()))?;
     // serde_path_to_error::deserialize owns the Track that Deserializer::new
     // otherwise requires, so the field path survives into the error message.
     let deserializer = toml::Deserializer::parse(raw)
@@ -2785,6 +2775,29 @@ fn resolve_env_interpolation(value: &str) -> Result<String> {
 /// Interpolates `value` in place, naming `field` (never the value) in errors.
 fn resolve_field(value: &mut String, field: &str) -> Result<()> {
     *value = resolve_env_interpolation(value).with_context(|| field.to_owned())?;
+    Ok(())
+}
+
+/// Interpolates a nested rule entry's webhook fields, recursing into
+/// composite rules.
+fn resolve_rule_entry(entry: &mut RuleEntry, path: &str) -> Result<()> {
+    if let Some(url) = &mut entry.webhook_url {
+        resolve_field(url, &format!("{}.webhook_url", path))?;
+    }
+    if let Some(secret) = &mut entry.webhook_secret {
+        resolve_field(secret, &format!("{}.webhook_secret", path))?;
+    }
+    match &mut entry.rule {
+        AlertRule::All { rules } | AlertRule::Any { rules } => {
+            for (k, nested) in rules.iter_mut().enumerate() {
+                resolve_rule_entry(nested, &format!("{}.rules[{}]", path, k))?;
+            }
+        }
+        AlertRule::Not { rule } => {
+            resolve_rule_entry(rule, &format!("{}.rule", path))?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -3314,6 +3327,10 @@ mod tests {
             rule: r,
             cooldown_seconds: None,
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }
     }
 
@@ -4455,6 +4472,10 @@ mod tests {
             },
             cooldown_seconds: None,
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }
     }
 
@@ -4562,6 +4583,10 @@ mod tests {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: Some(MAX_COOLDOWN_SECONDS + 1),
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("cooldown_seconds"), "got: {}", err);
@@ -5819,6 +5844,7 @@ mod tests {
         let event_rule = AlertRule::EventEmitted {
             topic: "mint".into(),
             topics: vec!["*".into()],
+            data: Vec::new(),
         };
         let not_event = AlertRule::Not {
             rule: Box::new(RuleEntry {
@@ -5876,6 +5902,7 @@ mod tests {
                 rule: AlertRule::EventEmitted {
                     topic: "mint".into(),
                     topics: vec!["*".into()],
+                    data: Vec::new(),
                 },
                 enabled: true,
                 webhook_url: None,
@@ -5888,5 +5915,144 @@ mod tests {
             err.contains("EventEmitted rules need a Soroban RPC endpoint"),
             "got: {err}"
         );
+    }
+
+    // ── Rule type aliases and labels (#367, #368) ───────────────────────────
+
+    /// `(PascalCase, snake_case, extra TOML body)` for every `AlertRule` variant.
+    const RULE_SPELLINGS: &[(&str, Option<&str>, &str)] = &[
+        ("AnyTransaction", Some("any_transaction"), ""),
+        ("TransactionFailed", Some("transaction_failed"), ""),
+        (
+            "LargeTransfer",
+            Some("large_transfer"),
+            "threshold_xlm = 5\ndirection = \"in\"",
+        ),
+        (
+            "FunctionCalled",
+            Some("function_called"),
+            "function_name = \"withdraw\"\nmatch_mode = \"prefix\"\nargs = [{ index = 0, eq = \"a\" }]",
+        ),
+        (
+            "AdminFunctionCalled",
+            Some("admin_function_called"),
+            "function_names = [\"upgrade\"]",
+        ),
+        ("HighFee", Some("high_fee"), "threshold_stroops = 100"),
+        (
+            "SourceAccount",
+            Some("source_account"),
+            "mode = \"not_in\"\nfield = \"fee_account\"\naccounts = [\"GABC\"]",
+        ),
+        ("All", Some("all"), "rules = [{ type = \"AnyTransaction\" }]"),
+        ("Any", Some("any"), "rules = [{ type = \"AnyTransaction\" }]"),
+        ("Not", Some("not"), "rule = { type = \"AnyTransaction\" }"),
+        ("NoActivity", Some("no_activity"), "minutes = 10"),
+        (
+            "EventEmitted",
+            Some("event_emitted"),
+            "topic = \"transfer\"\ntopics = [\"*\"]",
+        ),
+        ("ContractUpgraded", Some("contract_upgraded"), ""),
+        (
+            "Rate",
+            None,
+            "rule = { type = \"AnyTransaction\" }\ncount = 3\nwindow_seconds = 60",
+        ),
+        ("Memo", None, "memo_type = \"text\"\nprefix = \"inv-\""),
+    ];
+
+    fn parse_alert_rule(type_name: &str, body: &str) -> AlertRule {
+        toml::from_str(&format!("type = \"{}\"\n{}", type_name, body))
+            .unwrap_or_else(|e| panic!("failed to parse {}: {}", type_name, e))
+    }
+
+    #[test]
+    fn every_rule_alias_spelling_round_trips() {
+        for (pascal, snake, body) in RULE_SPELLINGS {
+            let canonical = parse_alert_rule(pascal, body);
+            if let Some(snake) = snake {
+                assert_eq!(
+                    parse_alert_rule(snake, body),
+                    canonical,
+                    "alias {} should parse like {}",
+                    snake,
+                    pascal
+                );
+            }
+            let json = serde_json::to_string(&canonical).unwrap();
+            let back: AlertRule = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to re-parse {}: {}", json, e));
+            assert_eq!(back, canonical, "round trip of {}", pascal);
+        }
+    }
+
+    #[test]
+    fn large_transfer_accepts_threshold_stroops() {
+        let rule = parse_alert_rule("large_transfer", "threshold_stroops = 50000000");
+        assert_eq!(
+            rule,
+            AlertRule::LargeTransfer {
+                threshold_xlm: 5,
+                direction: "any".into(),
+                threshold_stroops: 50_000_000,
+            }
+        );
+        assert!(toml::from_str::<AlertRule>(
+            "type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshold_stroops = 50000000"
+        )
+        .is_err());
+        assert!(toml::from_str::<AlertRule>("type = \"LargeTransfer\"").is_err());
+    }
+
+    #[test]
+    fn function_called_alias_keeps_match_mode_and_args() {
+        let rule = parse_alert_rule(
+            "function_called",
+            "function_name = \"withdraw\"\nmatch_mode = \"glob\"\nargs = [{ index = 1, eq = \"x\" }]",
+        );
+        assert_eq!(
+            rule,
+            AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::Glob,
+                args: vec![ArgMatcher {
+                    index: 1,
+                    eq: "x".into()
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn label_snapshot_covers_every_rule_variant() {
+        let expected = [
+            "AnyTransaction",
+            "TransactionFailed",
+            "LargeTransfer(>=5XLM)",
+            "FunctionCalled(prefix:withdraw)([0]=a)",
+            "AdminFunctionCalled([upgrade])",
+            "HighFee(>=100 stroops)",
+            "SourceAccount(field=fee_account, not_in: [GABC])",
+            "All(AnyTransaction)",
+            "Any(AnyTransaction)",
+            "Not(AnyTransaction)",
+            "NoActivity(10min)",
+            "EventEmitted(transfer, *)",
+            "ContractUpgraded",
+            "Rate(3x AnyTransaction in 60s)",
+            "Memo(text:^inv-)",
+        ];
+        assert_eq!(RULE_SPELLINGS.len(), expected.len());
+        for ((pascal, _, body), want) in RULE_SPELLINGS.iter().zip(expected) {
+            assert_eq!(parse_alert_rule(pascal, body).label(), want);
+        }
+    }
+
+    #[test]
+    fn app_config_default_initialises_every_field() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.concurrency, None);
+        assert_eq!(cfg.state_file, None);
     }
 }
