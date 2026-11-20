@@ -5,6 +5,18 @@ poll_interval_seconds = 10
 # Optional: maximum number of contracts polled concurrently in a single
 # `watch --once` run. Defaults to 10. Lower it if Horizon rate-limits you.
 # concurrency = 10
+# Optional: also fail `/readyz` when every webhook destination has been
+# persistently failing delivery. Default: false (readiness only tracks Horizon).
+# readiness_include_webhooks = true
+
+# Optional: mTLS client certificate for webhook delivery. `client_cert` and
+# `client_key` must be set together; `ca_cert` overrides the system trust store.
+# Paths are validated (PEM parsed) at config load. Keep the key file private
+# (not group- or world-readable).
+# [webhooks]
+# client_cert = "/etc/txwatch/client.crt"
+# client_key  = "/etc/txwatch/client.key"
+# ca_cert     = "/etc/txwatch/ca.crt"
 
 [[contracts]]
 label       = "My Escrow Contract"

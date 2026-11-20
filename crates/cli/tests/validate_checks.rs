@@ -866,3 +866,253 @@ async fn check_horizon_skips_passphrase_check_when_not_configured() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── #457: mTLS certificate path validation ───────────────────────────────────
+
+/// Writes a config with a webhook that has mTLS client cert/key paths.
+fn write_config_with_mtls(
+    name: &str,
+    webhook_url: &str,
+    client_cert: &str,
+    client_key: &str,
+) -> PathBuf {
+    let cfg = env::temp_dir().join(format!("txwatch_valcheck_{name}.toml"));
+    fs::write(
+        &cfg,
+        format!(
+            r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "MtlsCheck"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = {{ horizon_url = "http://127.0.0.1:1" }}
+webhook_url = "{webhook_url}"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+
+[webhooks]
+client_cert = "{client_cert}"
+client_key  = "{client_key}"
+"#
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+/// A minimal, syntactically valid self-signed cert/key pair is not required for
+/// these tests — we only need to exercise the file-reading and PEM-parsing
+/// paths. We use well-known PEM markers so the parser can distinguish
+/// "malformed" from "missing".
+const VALID_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+const VALID_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n";
+
+fn write_temp_file(name: &str, contents: &str) -> PathBuf {
+    let p = env::temp_dir().join(format!("txwatch_valcheck_{name}"));
+    fs::write(&p, contents).unwrap();
+    p
+}
+
+#[tokio::test]
+async fn check_webhooks_fails_on_typo_client_cert_path() {
+    let key = write_temp_file("mtls_typo_key.pem", VALID_KEY_PEM);
+    let missing_cert = env::temp_dir().join("txwatch_valcheck_does_not_exist_cert.pem");
+    let _ = fs::remove_file(&missing_cert);
+
+    let config = write_config_with_mtls(
+        "mtls_typo_cert",
+        "https://hooks.example.com/unused",
+        missing_cert.to_str().unwrap(),
+        key.to_str().unwrap(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing client_cert must fail; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("webhooks[0].client_cert"),
+        "expected indexed field path 'webhooks[0].client_cert' in: {combined}"
+    );
+    // Must not leak file contents.
+    assert!(
+        !combined.contains("BEGIN PRIVATE KEY"),
+        "must not print file contents: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn check_webhooks_fails_on_unreadable_client_key() {
+    let cert = write_temp_file("mtls_unreadable_cert.pem", VALID_CERT_PEM);
+    // Create a key file then remove read permissions.
+    let key = write_temp_file("mtls_unreadable_key.pem", VALID_KEY_PEM);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&key).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&key, perms).unwrap();
+    }
+
+    let config = write_config_with_mtls(
+        "mtls_unreadable_key",
+        "https://hooks.example.com/unused",
+        cert.to_str().unwrap(),
+        key.to_str().unwrap(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    // Restore permissions so cleanup works.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&key).unwrap().permissions();
+        perms.set_mode(0o600);
+        let _ = fs::set_permissions(&key, perms);
+    }
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unreadable client_key must fail; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("webhooks[0].client_key"),
+        "expected indexed field path 'webhooks[0].client_key' in: {combined}"
+    );
+    assert!(
+        !combined.contains("BEGIN PRIVATE KEY"),
+        "must not print file contents: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn check_webhooks_fails_on_malformed_pem() {
+    let cert = write_temp_file("mtls_malformed_cert.pem", "not a pem file\n");
+    let key = write_temp_file("mtls_malformed_key.pem", VALID_KEY_PEM);
+
+    let config = write_config_with_mtls(
+        "mtls_malformed_pem",
+        "https://hooks.example.com/unused",
+        cert.to_str().unwrap(),
+        key.to_str().unwrap(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed client_cert PEM must fail; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("webhooks[0].client_cert"),
+        "expected indexed field path 'webhooks[0].client_cert' in: {combined}"
+    );
+    assert!(
+        !combined.contains("not a pem file"),
+        "must not print file contents: {combined}"
+    );
+}
+
+#[tokio::test]
+async fn check_webhooks_warns_on_group_or_world_readable_key() {
+    let cert = write_temp_file("mtls_perm_cert.pem", VALID_CERT_PEM);
+    let key = write_temp_file("mtls_perm_key.pem", VALID_KEY_PEM);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&key).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&key, perms).unwrap();
+    }
+
+    let config = write_config_with_mtls(
+        "mtls_perm_warn",
+        "https://hooks.example.com/unused",
+        cert.to_str().unwrap(),
+        key.to_str().unwrap(),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "validate",
+            "--check-webhooks",
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("webhooks[0].client_key"),
+        "expected indexed field path 'webhooks[0].client_key' in: {combined}"
+    );
+    assert!(
+        combined.to_lowercase().contains("warn")
+            || combined.to_lowercase().contains("readable")
+            || combined.to_lowercase().contains("permission"),
+        "expected a permission warning in: {combined}"
+    );
+    assert!(
+        !combined.contains("BEGIN PRIVATE KEY"),
+        "must not print file contents: {combined}"
+    );
+}

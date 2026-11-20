@@ -35,6 +35,28 @@ The schema is also available from the CLI with `txwatch schema`. CI verifies tha
 | `max_pages_per_cycle`         | usize           | no       | `10`    | Maximum Horizon pages (200 transactions each) fetched per contract in one poll cycle. Must be 1–1000. Pages are processed as they arrive; when the cap is hit a warning is logged and the next cycle continues from the saved cursor. |
 | `max_contracts`               | usize           | no       | `100`   | Maximum number of `[[contracts]]` entries. Must be 1–10000. Raise it only when your Horizon instance (typically your own) can take the extra polling load. |
 | `summary_interval_seconds`    | u64             | no       | `60`    | How often the poller logs a periodic summary line (seconds). Set to `0` to disable the periodic summary entirely. |
+| `readiness_include_webhooks`  | bool            | no       | `false` | Opt-in. When `true`, `/readyz` also reports unhealthy while any webhook destination is persistently failing, not just when Horizon polls fail. See [Readiness and webhook health](#readiness-and-webhook-health). |
+
+Unknown top-level keys are rejected.
+
+### Readiness and webhook health
+
+By default `/readyz` only reflects Horizon polling: if every webhook destination has been down for an
+extended period, `/readyz` stays green while alerts are silently dropped. Set
+`readiness_include_webhooks = true` to make readiness also depend on webhook delivery health. When
+enabled, `/readyz` reports unhealthy while any destination is in a persistent failure state (the same
+condition tracked internally as `webhook_unhealthy`).
+
+The per-destination state is always exposed as a Prometheus gauge, regardless of this setting:
+
+```
+txwatch_webhook_destination_unhealthy{contract="<label>",destination="<url>"} 0|1
+```
+
+`1` means the destination is currently considered unhealthy (repeated delivery failures); `0` means it
+is healthy. `contract` is the contract label and `destination` is the destination URL (with any
+credentials redacted). Use this metric to alert on failing receivers even when
+`readiness_include_webhooks` is left at its default.
 | `cooldown_summary`            | bool            | no       | `false` | When `true`, the periodic summary line includes, per contract, the rules currently in cooldown and the seconds remaining. Has no effect when `summary_interval_seconds = 0`. |
 | `readiness_policy`            | string          | no       | `"any"` | How `txwatch watch` decides it is ready for its readiness probe: `"any"` (ready as soon as the process is up), `"first_poll"` (ready after every contract has completed one poll cycle) or `"all_healthy"` (ready only when no contract is in a failing streak). |
 | `include`                     | array of strings | no      | unset   | Paths of additional TOML files to merge into this configuration, relative to the including file. Each file is parsed as a partial config; `contracts` are appended and scalar fields in the including file win. Includes are resolved recursively with a depth limit of 8 and cycles are rejected. |
@@ -223,7 +245,15 @@ PagerDuty only for critical alerts while Slack gets everything:
 
 Destinations that require client certificates set `client_cert` and `client_key` (PEM file paths,
 set together) and, for a private CA, `ca_cert`. The URL must be `https`. Each such destination gets
-its own HTTP client; the paths support `${ENV_VAR}` interpolation.
+its own HTTP client, built once at startup (and again on `SIGHUP` reload) and reused for every
+delivery, so a burst of alerts does not pay a TLS handshake per alert. The paths support
+`${ENV_VAR}` interpolation.
+
+The certificate files are read and parsed during config validation, so a typo'd path, an unreadable
+key or a malformed PEM is reported by `txwatch validate` (and at startup) instead of at the first
+delivery. Errors name the field (e.g. `webhooks[0].client_key`) and never print file contents.
+TxWatch also warns when the private key file is group- or world-readable (mode `0640` or looser);
+restrict it to the owner (e.g. `chmod 600`).
 
 ```toml
   [[contracts.webhooks]]
@@ -320,10 +350,19 @@ The exact bodies are pinned by snapshot tests in `crates/notifier/src/format.rs`
 
 `format = "template"` covers receivers without a built-in format (Opsgenie, Telegram, Mattermost,
 internal APIs). Set exactly one of `template` (inline) or `template_file` (a path read at config
-load). Templates are checked for syntax errors when the config is loaded.
+load). Templates are checked for syntax errors when the config is loaded, and are also rendered
+against a synthetic payload for every rule type, so a template that references a field which is
+absent for some alerts (e.g. `source_account` on a `NoActivity` alert) is reported at load time
+rather than failing at delivery.
 
 Every field of the [webhook payload](#webhook-payload) is available as a variable (`label`,
 `contract_id`, `network`, `rule_type`, `rule_triggered`, `severity`, `transaction_hash`,
+`amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Values are
+JSON-escaped and quoted automatically, so write `{{ label }}`, not `"{{ label }}"`. Optional
+fields that are omitted from a given payload are present as `null` when rendering, so a template
+can test them with `{% if source_account %}` or supply a fallback with `{{ severity | default("info") }}`.
+Referencing an unknown variable fails the delivery. The engine is sandboxed: templates cannot read
+files or make network requests.
 `amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Referencing an
 unknown variable fails the delivery. The engine is sandboxed: templates cannot read files or make
 network requests.

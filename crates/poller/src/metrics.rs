@@ -13,6 +13,9 @@
 //! - `txwatch_webhook_deliveries_total{contract,format,destination,outcome}` — webhook deliveries;
 //!   `destination` is the destination's index in the contract's list, never its URL
 //! - `txwatch_webhook_delivery_duration_seconds{format,outcome}` — webhook delivery latency (incl. retries)
+//! - `txwatch_webhook_destination_unhealthy{contract,destination}` — 1 when a webhook
+//!   destination is persistently failing, 0 otherwise; `destination` is the
+//!   destination's index in the contract's list, never its URL
 //! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
 //! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
 //! - `txwatch_ledger_lag{contract,network}`              — ledgers between Horizon's latest ledger
@@ -206,6 +209,18 @@ fn webhook_delivery_duration() -> &'static HistogramVec {
     })
 }
 
+fn webhook_destination_unhealthy() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_webhook_destination_unhealthy",
+            "Whether a webhook destination is persistently failing (1) or not (0), per contract and destination index",
+            &["contract", "destination"]
+        )
+        .expect("register txwatch_webhook_destination_unhealthy")
+    })
+}
+
 fn last_successful_poll() -> &'static IntGaugeVec {
     static G: OnceLock<IntGaugeVec> = OnceLock::new();
     G.get_or_init(|| {
@@ -348,6 +363,14 @@ pub fn record_webhook_delivery(
         .observe(seconds);
 }
 
+/// Set `txwatch_webhook_destination_unhealthy` for a contract's destination.
+/// `destination` is the destination's index, never its URL.
+pub fn set_webhook_destination_unhealthy(contract: &str, destination: &str, unhealthy: bool) {
+    webhook_destination_unhealthy()
+        .with_label_values(&[contract, destination])
+        .set(i64::from(unhealthy));
+}
+
 /// Set `txwatch_ledger_lag` for a contract.
 pub fn set_ledger_lag(contract: &str, network: &str, lag: u64) {
     ledger_lag()
@@ -364,6 +387,28 @@ pub fn remove_contract(contract: &str, network: &str) {
         ledger_lag(),
     ] {
         let _ = gauge.remove_label_values(&[contract, network]);
+    }
+    // The destination index is not known here, so drop every series of the
+    // contract by collecting and removing the matching label sets.
+    let gauge = webhook_destination_unhealthy();
+    let stale: Vec<_> = gauge
+        .collect()
+        .into_iter()
+        .flat_map(|family| family.into_metric())
+        .filter(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "contract" && l.value() == contract)
+        })
+        .filter_map(|m| {
+            m.get_label()
+                .iter()
+                .find(|l| l.name() == "destination")
+                .map(|l| l.value().to_owned())
+        })
+        .collect();
+    for destination in stale {
+        let _ = gauge.remove_label_values(&[contract, &destination]);
     }
     lock_readiness()
         .contracts
