@@ -186,6 +186,67 @@ include = ["a.toml"]
 }
 
 #[test]
+fn diamond_include_loads_shared_file_once() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-diamond-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file_a = dir.join("a.toml");
+    let file_b = dir.join("b.toml");
+    let file_c = dir.join("c.toml");
+    let shared = dir.join("shared.toml");
+
+    std::fs::write(
+        &file_a,
+        r#"
+poll_interval_seconds = 10
+include = ["b.toml", "c.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_b,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_c,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &shared,
+        r#"
+[[contracts]]
+label = "Shared"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network = "testnet"
+webhook_url = "https://example.com/shared"
+[[contracts.rules]]
+type = "AnyTransaction"
+"#,
+    )
+    .unwrap();
+
+    let cfg = AppConfig::from_file(&file_a)
+        .expect("diamond include should not be reported as circular");
+    assert_eq!(
+        cfg.contracts.len(),
+        1,
+        "shared file should be loaded exactly once"
+    );
+    assert_eq!(cfg.contracts[0].label, "Shared");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compute_config_hash_detects_changes_in_included_files() {
     let dir = std::env::temp_dir().join(format!("txwatch-test-hash-{}", std::process::id()));
     let contracts_d = dir.join("contracts.d");

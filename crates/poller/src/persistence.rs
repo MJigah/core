@@ -105,6 +105,28 @@ pub fn write_state_blocking(path: &Path, doc: &StateDocument) -> Result<()> {
     Ok(())
 }
 
+/// Merge a single [`StateUpdate`] into the state document already on disk and
+/// write the result atomically.
+///
+/// This is the synchronous counterpart of the background writer task: it lets
+/// callers (notably crash-survival tests) persist an update immediately without
+/// waiting for the writer task to drain its channel. The on-disk document is
+/// re-read first so unrelated keys are preserved.
+pub fn write_state_update_blocking(path: &Path, update: &StateUpdate) -> Result<()> {
+    let mut doc = if let Ok(content) = fs::read_to_string(path) {
+        serde_json::from_str::<StateDocument>(&content).unwrap_or_default()
+    } else {
+        StateDocument::default()
+    };
+    doc.cursors
+        .insert(update.cursor_key.clone(), update.cursor.clone());
+    doc.cooldowns
+        .insert(update.cursor_key.clone(), update.cooldowns.clone());
+    doc.no_activity
+        .insert(update.cursor_key.clone(), update.no_activity.clone());
+    write_state_blocking(path, &doc)
+}
+
 #[derive(Debug, Clone)]
 pub struct StateUpdate {
     pub cursor_key: String,

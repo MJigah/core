@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
@@ -2882,11 +2883,16 @@ impl AppConfig {
         let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
             .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
 
-        let mut visited = std::collections::HashSet::new();
+        // `loaded` holds every file already read (so diamond-shaped includes
+        // load a shared file once), while `stack` holds the chain of files
+        // currently being resolved (so only a real cycle is reported).
+        let mut loaded = std::collections::HashSet::new();
+        let mut stack = Vec::new();
         let canon = source
             .canonicalize()
             .unwrap_or_else(|_| source.to_path_buf());
-        visited.insert(canon);
+        loaded.insert(canon.clone());
+        stack.push(canon);
         cfg.loaded_files.push(source.to_path_buf());
 
         for c in &cfg.contracts {
@@ -2895,17 +2901,25 @@ impl AppConfig {
         }
 
         let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
-        cfg.resolve_includes(base_dir, &mut visited)?;
+        cfg.resolve_includes(base_dir, &mut loaded, &mut stack)?;
 
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Resolves `include` patterns relative to `base_dir`.
+    ///
+    /// `loaded` records every file already read so a file reached through two
+    /// different include paths (a diamond, e.g. `a` includes `b` and `c`, both
+    /// of which include `shared`) is loaded exactly once. `stack` records the
+    /// chain of files currently being resolved; only a file that is already on
+    /// that chain is a genuine circular include.
     fn resolve_includes(
         &mut self,
         base_dir: &Path,
-        visited: &mut std::collections::HashSet<PathBuf>,
+        loaded: &mut std::collections::HashSet<PathBuf>,
+        stack: &mut Vec<PathBuf>,
     ) -> Result<()> {
         if self.include.is_empty() {
             return Ok(());
@@ -2955,8 +2969,26 @@ impl AppConfig {
             let canonical = included_path
                 .canonicalize()
                 .unwrap_or_else(|_| included_path.clone());
-            if !visited.insert(canonical) {
-                bail!("circular include detected: '{}'", included_path.display());
+
+            // A file already on the current include chain is a real cycle.
+            if stack.contains(&canonical) {
+                let chain = stack
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .chain(std::iter::once(included_path.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                bail!(
+                    "circular include detected: '{}' (include chain: {})",
+                    included_path.display(),
+                    chain
+                );
+            }
+
+            // A file already loaded elsewhere in the tree (diamond include) is
+            // skipped: its contracts were already added once.
+            if !loaded.insert(canonical.clone()) {
+                continue;
             }
 
             let raw = fs::read_to_string(&included_path).with_context(|| {
@@ -2982,7 +3014,10 @@ impl AppConfig {
                     include: included.include,
                     ..Default::default()
                 };
-                sub_cfg.resolve_includes(sub_base, visited)?;
+                stack.push(canonical);
+                let result = sub_cfg.resolve_includes(sub_base, loaded, stack);
+                stack.pop();
+                result?;
                 self.loaded_files.extend(sub_cfg.loaded_files);
                 self.contract_files.extend(sub_cfg.contract_files);
                 self.contracts.extend(sub_cfg.contracts);
