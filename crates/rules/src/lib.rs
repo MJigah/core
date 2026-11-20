@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![warn(missing_docs)]
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
@@ -102,7 +103,12 @@ pub struct ContractEvent {
 /// comparison and `value` is the expected value as a string.
 pub use txwatch_config::DataMatcher;
 
-pub trait DataMatcherExt {
+/// Internal helper trait adding a `matches` method to [`DataMatcher`].
+///
+/// This exists only to attach the method to the re-exported config type, so
+/// it is deliberately private to this crate.
+trait DataMatcherExt {
+    /// Does `data` satisfy this matcher?
     fn matches(&self, data: &Value) -> bool;
 }
 
@@ -273,7 +279,11 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
 pub fn decode_scval(value: &Value) -> String {
     match value {
         Value::Object(map) if map.len() == 1 => {
-            let (key, inner) = map.iter().next().expect("map has one entry");
+            // `map.len() == 1` guarantees an entry, but avoid `expect` so this
+            // can never panic on untrusted chain data.
+            let Some((key, inner)) = map.iter().next() else {
+                return value.to_string();
+            };
             match (key.as_str(), inner) {
                 ("address", Value::String(s))
                 | ("symbol", Value::String(s))
@@ -1348,6 +1358,8 @@ pub enum NoActivityState {
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
     Alerting {
+        /// `alert_id` of the incident alert that opened this quiet window;
+        /// reused as the `alert_id` of the recovery alert.
         #[serde(default)]
         incident_alert_id: String,
     },
@@ -1568,6 +1580,7 @@ impl From<CooldownTracker> for Vec<((String, String), CooldownState)> {
 }
 
 impl CooldownTracker {
+    /// An empty tracker with no recorded cooldown state.
     pub fn new() -> Self {
         Self::default()
     }

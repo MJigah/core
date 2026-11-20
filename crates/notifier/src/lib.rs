@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![deny(clippy::expect_used)]
 
 //! txwatch-notifier delivers webhook payloads over HTTP with retry and backoff,
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
