@@ -2956,7 +2956,7 @@ impl AppConfig {
 
         for c in &cfg.contracts {
             cfg.contract_files
-                .insert(c.label.to_lowercase(), source.to_path_buf());
+                .insert(c.label.trim().to_lowercase(), source.to_path_buf());
         }
 
         let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
@@ -3063,7 +3063,7 @@ impl AppConfig {
 
             for c in &included.contracts {
                 self.contract_files
-                    .insert(c.label.to_lowercase(), included_path.clone());
+                    .insert(c.label.trim().to_lowercase(), included_path.clone());
             }
 
             // Recursive include support
