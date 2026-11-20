@@ -113,6 +113,58 @@ fn alert_payload_golden_file_matches_serialization() {
     );
 }
 
+/// Regression test for issue #400: a `LargeTransfer` payload must report the
+/// amount for the direction that fired the rule, not the sum of every in and
+/// out transfer of the watched contract.
+#[test]
+fn large_transfer_payload_reports_direction_amount() {
+    // Mixed-direction transaction: contract received 1,000 XLM and sent 900 XLM.
+    let amount_in_stroops: i64 = 10_000_000_000; // 1,000 XLM
+    let amount_out_stroops: i64 = 9_000_000_000; // 900 XLM
+
+    let mut payload = golden_payload();
+    payload.rule_type = "LargeTransfer".into();
+    payload.rule_triggered = "LargeTransfer(>=1000XLM)".into();
+    payload.amount_xlm = Some(1000);
+    // The inbound amount that triggered the rule — not 1900 XLM (sum) nor
+    // 100 XLM (net).
+    payload.amount_stroops = Some(amount_in_stroops);
+    payload.amount_xlm_decimal = Some("1000.0000000".into());
+    payload.amount_in_stroops = Some(amount_in_stroops);
+    payload.amount_out_stroops = Some(amount_out_stroops);
+
+    let serialized: Value =
+        serde_json::to_value(&payload).expect("AlertPayload should serialize to JSON");
+
+    assert_eq!(
+        serialized["amount_stroops"].as_i64(),
+        Some(amount_in_stroops),
+        "amount_stroops must reflect the inbound amount that fired the rule"
+    );
+    assert_eq!(
+        serialized["amount_in_stroops"].as_i64(),
+        Some(amount_in_stroops),
+        "amount_in_stroops must report the inbound total"
+    );
+    assert_eq!(
+        serialized["amount_out_stroops"].as_i64(),
+        Some(amount_out_stroops),
+        "amount_out_stroops must report the outbound total"
+    );
+    assert_eq!(
+        serialized["amount_xlm_decimal"].as_str(),
+        Some("1000.0000000"),
+        "amount_xlm_decimal must match the direction that fired"
+    );
+
+    // Round-trip must preserve the direction breakdown.
+    let round_tripped: AlertPayload =
+        serde_json::from_value(serialized).expect("payload should deserialize");
+    assert_eq!(round_tripped.amount_stroops, Some(amount_in_stroops));
+    assert_eq!(round_tripped.amount_in_stroops, Some(amount_in_stroops));
+    assert_eq!(round_tripped.amount_out_stroops, Some(amount_out_stroops));
+}
+
 /// Verify that the golden payload round-trips through deserialization without loss.
 #[test]
 fn alert_payload_golden_round_trips() {

@@ -146,3 +146,92 @@ pub fn tx_page_3(hash1: &str, hash2: &str, hash3: &str) -> serde_json::Value {
         }
     })
 }
+
+/// Build a `WatchedContract` fixture with an explicit contract id.
+///
+/// Used by the crash-restart harness, which needs several distinct contracts
+/// sharing one state file.
+pub fn contract_with_id(
+    contract_id: &str,
+    webhook_url: &str,
+    rules: Vec<AlertRule>,
+) -> WatchedContract {
+    let mut c = contract(webhook_url, rules);
+    c.contract_id = contract_id.to_string();
+    c
+}
+
+/// Build a multi-contract config that all share a single state file.
+///
+/// `contracts` is a list of `(contract_id, webhook_url, rules)` tuples. The
+/// returned config points every contract at the same `state_file`, which is
+/// what the crash-restart test needs in order to verify that cursors and
+/// tracker state survive a hard kill.
+pub fn multi_contract_config(
+    contracts: Vec<(&str, &str, Vec<AlertRule>)>,
+    state_file: &std::path::Path,
+) -> txwatch_config::Config {
+    let mut cfg = txwatch_config::Config::default();
+    cfg.contracts = contracts
+        .into_iter()
+        .map(|(id, url, rules)| contract_with_id(id, url, rules))
+        .collect();
+    cfg.state_file = Some(state_file.to_path_buf());
+    cfg
+}
+
+/// Spawn `run_with_reload` on a dedicated runtime and return the join handle.
+///
+/// The caller is expected to `abort()` the returned handle (or drop the
+/// runtime) to simulate a crash without a graceful shutdown signal.
+pub fn spawn_poller(
+    cfg: txwatch_config::Config,
+) -> (
+    tokio::runtime::Runtime,
+    tokio::task::JoinHandle<()>,
+) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build test runtime");
+    let handle = rt.spawn(async move {
+        // Errors are expected when the task is aborted mid-flight.
+        let _ = txwatch_poller::run_with_reload(cfg).await;
+    });
+    (rt, handle)
+}
+
+/// Abort a poller spawned by [`spawn_poller`] without any shutdown signal,
+/// then wait for the runtime to tear down so the state file is flushed as it
+/// would be on a crash.
+pub fn crash_poller(
+    rt: tokio::runtime::Runtime,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    handle.abort();
+    // Dropping the runtime blocks until all tasks are cancelled.
+    drop(rt);
+}
+
+/// A page of transactions with caller-supplied `(hash, paging_token)` pairs.
+///
+/// Lets a test assert that every transaction is delivered exactly once across
+/// a restart by collecting the hashes it observes.
+pub fn tx_page_hashes(entries: &[(&str, &str)]) -> serde_json::Value {
+    let records: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(hash, token)| {
+            serde_json::json!({
+                "hash":         hash,
+                "created_at":   "2024-06-01T10:00:00Z",
+                "successful":   true,
+                "paging_token": token,
+                "fee_charged":  "100",
+                "envelope_xdr": null,
+                "result_xdr":   null
+            })
+        })
+        .collect();
+    serde_json::json!({ "_embedded": { "records": records } })
+}

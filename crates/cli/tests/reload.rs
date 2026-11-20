@@ -460,6 +460,182 @@ fn watch_config_reloads_on_symlink_swapped_configmap() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Issue #401: reloading with fewer rules must prune stale tracker entries so
+/// the persisted state document shrinks instead of growing forever.
+#[test]
+fn watch_reload_prunes_state_for_removed_rules() {
+    let dir = env::temp_dir().join(format!("txwatch_prune_state_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("txwatch.toml");
+    let state_path = dir.join("state.json");
+
+    // Several contracts, each with its own rule, so the persisted state has
+    // entries for every label.
+    let many = format!(
+        "poll_interval_seconds = 10\nstate_file = \"{}\"\n{}{}{}",
+        state_path.display(),
+        contract("Alpha", ALPHA),
+        contract("Beta", BETA),
+        contract(
+            "Gamma",
+            "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"
+        ),
+    );
+    fs::write(&path, &many).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args(["--config", path.to_str().unwrap(), "watch", "--dry-run"])
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start txwatch");
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    wait_for(&lines, "TxWatch polling engine started");
+
+    // Reload with only one contract: the other labels no longer exist.
+    fs::write(
+        &path,
+        format!(
+            "poll_interval_seconds = 10\nstate_file = \"{}\"\n{}",
+            state_path.display(),
+            contract("Alpha", ALPHA)
+        ),
+    )
+    .unwrap();
+    sighup(&child);
+    let reloaded = wait_for(&lines, "configuration reloaded");
+    assert!(reloaded.contains("contracts=1"), "{}", reloaded);
+
+    // Give the watcher a moment to persist the pruned state.
+    thread::sleep(Duration::from_secs(1));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let persisted = fs::read_to_string(&state_path).unwrap_or_default();
+    assert!(
+        !persisted.contains("Beta") && !persisted.contains("Gamma"),
+        "stale tracker entries should be pruned from persisted state: {}",
+        persisted
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Issue #402: `NoActivity` state must be keyed by a stable rule identity so
+/// that inserting/reordering rules does not move the open incident onto a
+/// different rule.
+#[test]
+fn watch_restart_keeps_no_activity_state_on_same_rule() {
+    let dir = env::temp_dir().join(format!("txwatch_no_activity_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("txwatch.toml");
+    let state_path = dir.join("state.json");
+
+    // Two contracts; the second one carries the NoActivity rule.
+    let no_activity_rule = r#"
+  [[contracts.rules]]
+  type = "NoActivity"
+  max_idle_seconds = 3600
+"#;
+    let config_with = |extra_first: bool| {
+        let first = if extra_first {
+            format!(
+                "{}{}",
+                contract("Alpha", ALPHA),
+                // An extra contract inserted above the NoActivity one.
+                contract(
+                    "Inserted",
+                    "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ"
+                )
+            )
+        } else {
+            contract("Alpha", ALPHA)
+        };
+        format!(
+            "poll_interval_seconds = 10\nstate_file = \"{}\"\n{}{}{}",
+            state_path.display(),
+            first,
+            contract("Beta", BETA),
+            no_activity_rule
+        )
+    };
+
+    fs::write(&path, config_with(false)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args(["--config", path.to_str().unwrap(), "watch", "--dry-run"])
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start txwatch");
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    wait_for(&lines, "TxWatch polling engine started");
+    thread::sleep(Duration::from_secs(1));
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Insert a rule above the NoActivity rule and restart.
+    fs::write(&path, config_with(true)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_txwatch"))
+        .args(["--config", path.to_str().unwrap(), "watch", "--dry-run"])
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start txwatch");
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    wait_for(&lines, "TxWatch polling engine started");
+
+    // The NoActivity incident must still belong to Beta, not to the newly
+    // inserted contract that now occupies the old index.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match lines.recv_timeout(remaining) {
+            Ok(line) if line.contains("Inserted") && line.contains("NoActivity") => {
+                panic!("NoActivity state shifted onto the wrong rule: {}", line)
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn file_watcher_reloads_included_files() {
     let dir = env::temp_dir().join(format!("txwatch_include_reload_{}", std::process::id()));

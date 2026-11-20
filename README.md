@@ -108,13 +108,51 @@ docker build -t txwatch .
 Run with a config file (the image reads `TXWATCH_CONFIG=/config/txwatch.toml`):
 
 ```bash
-docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch watch
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch
 ```
 
-Or validate your config:
+The image has a default command, so no subcommand is needed: it runs
+`txwatch watch --metrics-addr 0.0.0.0:9090`. The metrics/health server is bound to
+`0.0.0.0:9090` so it is reachable from outside the container, and the image's
+`HEALTHCHECK` probes `http://127.0.0.1:9090/healthz` — the two go together. If you
+override the command, either keep `--metrics-addr 0.0.0.0:9090` or replace the
+health check (see below), otherwise the container will be reported unhealthy.
+
+To run another subcommand, pass it after the image name (it replaces the default
+`CMD`):
 
 ```bash
 docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch validate
+```
+
+To keep the default `watch` command but change the metrics address (or any other
+flag), pass the full command explicitly:
+
+```bash
+docker run -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch watch --metrics-addr 0.0.0.0:8080
+```
+
+If you build the image without the `metrics` feature, `--metrics-addr` doesn't exist
+and the default command fails to start. In that case override both the command and
+the health check:
+
+```bash
+docker run --health-cmd "txwatch validate" \
+  -v $(pwd)/txwatch.toml:/config/txwatch.toml txwatch watch
+```
+
+or, in a `docker-compose.yml`:
+
+```yaml
+services:
+  txwatch:
+    image: txwatch
+    command: ["watch"]
+    healthcheck:
+      test: ["CMD", "txwatch", "validate"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 ```
 
 To watch contracts on a local standalone network, `docker compose -f docker-compose.local.yml up`

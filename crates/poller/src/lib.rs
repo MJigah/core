@@ -717,21 +717,15 @@ async fn poll_contract_forever(
         mut cooldowns,
         mut health,
     } = runtime;
-    // Poll state and cooldowns live as long as this contract's task.
-    let mut state = ContractPollState::default();
     // Issue #281: restore this contract's NoActivity states from the persisted
     // document so a restart does not re-fire open incidents.
     if let Some(saved) = lock(&persist.no_activity).get(&key) {
         state.no_activity_states = saved.clone();
     }
-    // A single tracker for this contract's lifetime, so cooldowns survive
-    // across poll cycles rather than deduping only within one.
-    let mut cooldowns = CooldownTracker::new();
     // Issue #281: restore persisted cooldown windows for this contract.
     if let Some(saved) = lock(&persist.cooldowns).get(&key) {
         cooldowns = saved.clone();
     }
-    let mut health = PollHealth::default();
     let lag_threshold = ledger_lag_warn_threshold_from_env();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
@@ -741,6 +735,11 @@ async fn poll_contract_forever(
     let mut ticker = poll_ticker(interval, offset);
     loop {
         let cycle_started = std::time::Instant::now();
+        // Issue #403: a NoActivity incident fires in a cycle with no new
+        // transactions, so the cursor does not advance. Snapshot the alerting
+        // state before the poll so a change can be persisted even then.
+        let no_activity_before = state.no_activity_states.clone();
+        let cooldowns_before = cooldowns.clone();
         match poll_contract(
             &client,
             &HorizonSource::new(&client, poll_base_url(&contract)),
@@ -787,6 +786,10 @@ async fn poll_contract_forever(
                     metrics::record_poll_success(&contract.label, network);
                     metrics::mark_poll_success(&contract.label, network, interval.as_secs());
                 }
+                // Issue #403: an incident (or a cooldown window) may have
+                // changed even though the cursor did not, so persist on either.
+                let alerting_changed = state.no_activity_states != no_activity_before
+                    || cooldowns != cooldowns_before;
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
                 // Issue #278: hand the update to the coalescing writer task
@@ -794,7 +797,7 @@ async fn poll_contract_forever(
                 if persist.path.is_some() {
                     if let Some(latest) = cursors.get(&key) {
                         // Scope the lock so no guard is held across an await.
-                        let changed = {
+                        let cursor_changed = {
                             let mut guard = lock(&persist.cursors);
                             if guard.get(&key) == Some(latest) {
                                 false
@@ -803,7 +806,7 @@ async fn poll_contract_forever(
                                 true
                             }
                         };
-                        if changed {
+                        if cursor_changed || alerting_changed {
                             // Issue #281: snapshot cooldown and NoActivity state
                             // alongside the cursor so it survives a restart.
                             let cooldowns = lock(&persist.cooldowns)
@@ -1477,46 +1480,6 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
     let poll_base = poll_base_url(contract);
     let canonical_base = contract.network.horizon_base_url();
 
-    // Collect all pages of transactions.
-    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
-    let mut page_cursor = cursor.clone();
-
-    loop {
-        let page = match source.fetch_page(contract, &page_cursor).await? {
-            FetchOutcome::Page(page) => page,
-            FetchOutcome::Unsupported => {
-                warn!(
-                    contract = %contract.label,
-                    "no transaction source can serve this contract; see issue #4"
-                );
-                break;
-            }
-            FetchOutcome::RateLimited { retry_after } => {
-                // Issue #271: a 429 is not a successful empty poll. Surface it as
-                // an error so the failure streak, readiness and freshness metrics
-                // are not advanced and `NoActivity` cannot fire a false alert.
-                return Err(anyhow::anyhow!(
-                    "Horizon rate limited the poll (429); retry after {}s",
-                    retry_after.as_secs()
-                ));
-            }
-        };
-        if page.records.is_empty() {
-            break;
-        }
-        all_records.extend(page.records);
-        match page.next_cursor {
-            Some(next) => page_cursor = next,
-            None => break,
-        }
-    }
-
-    if !all_records.is_empty() {
-        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
-        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
-    }
-
     let mut tx_count = 0u64;
     let mut alert_count = 0u64;
     let mut webhook_failures = 0u64;
@@ -1577,6 +1540,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     error = %error,
                     "failed to fetch a later page; continuing from the saved cursor next cycle"
                 );
+                state.backlogged = true;
                 break;
             }
             Err(error) if pages_fetched == 0 => return Err(error),
@@ -1635,9 +1599,14 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                         error = %error,
                         "could not fetch operation details — evaluating rules without them"
                     );
+                    #[cfg(feature = "metrics")]
+                    metrics::inc_transactions_degraded(&contract.label, contract.network.as_str());
                     SorobanDetails::default()
                 }
             };
+            // Issue #400: the transaction-level amount is the sum of every
+            // contract leg; `LargeTransfer` payloads are re-derived from the
+            // rule's direction below.
             let amount_stroops = details
                 .contract_transfers
                 .iter()
@@ -1717,6 +1686,10 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 &enriched,
                 chrono::Utc::now(),
             ));
+            // Issue #400: a `LargeTransfer` payload must report the amount that
+            // actually triggered the rule (the configured direction), not the
+            // sum of every in and out leg. The breakdown is attached too.
+            apply_large_transfer_amounts(&contract.contract_id, &contract.rules, &mut payloads);
 
             if payloads.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash,
@@ -1928,7 +1901,7 @@ async fn deliver_payload(
     }
     let destinations: Vec<WebhookDestination> = destinations
         .into_iter()
-        .filter(|d| d.accepts(payload.severity.as_deref(), &payload.rule_type))
+        .filter(|d| d.accepts(payload.severity.as_ref(), &payload.rule_type))
         .collect();
 
     *webhook_failures += deliver_to_all(client, contract, &destinations, payload).await;
@@ -2060,11 +2033,73 @@ pub async fn replay_transaction(
         enriched = enriched.with_events(events);
     }
 
-    Ok(evaluate_contract(
+    let mut payloads = evaluate_contract(
         contract,
         contract.network.horizon_base_url(),
         &enriched,
-    ))
+    );
+    // Issue #400: keep replay payloads consistent with the live poll path.
+    apply_large_transfer_amounts(&contract.contract_id, &contract.rules, &mut payloads);
+    Ok(payloads)
+}
+
+/// Sum of the contract's transfers in `direction` (`"in"` or `"out"`).
+///
+/// Issue #400: `LargeTransfer` alerts are evaluated per direction, so the
+/// payload must report the amount that fired the rule rather than the sum of
+/// every in and out leg.
+pub fn contract_amount_stroops(
+    transfers: &[txwatch_rules::ContractTransfer],
+    contract_id: &str,
+    direction: &str,
+) -> u64 {
+    transfers
+        .iter()
+        .filter(|t| match direction {
+            "in" => t.to == contract_id,
+            "out" => t.from == contract_id,
+            _ => false,
+        })
+        .map(|t| t.amount_stroops)
+        .fold(0u64, |acc, amount| acc.saturating_add(amount))
+}
+
+/// Rewrites the amount fields of every `LargeTransfer` payload in `payloads`
+/// from the rule's configured direction, and fills in the in/out breakdown.
+///
+/// Shared by the live poll path and `txwatch replay` so both report the same
+/// numbers.
+pub fn apply_large_transfer_amounts(
+    contract_id: &str,
+    rules: &[txwatch_config::AlertRuleConfig],
+    payloads: &mut [txwatch_rules::AlertPayload],
+) {
+    for payload in payloads.iter_mut() {
+        if payload.rule_type != "LargeTransfer" {
+            continue;
+        }
+        let Some(rule) = rules
+            .iter()
+            .find(|r| r.name == payload.rule_triggered)
+            .map(|r| &r.rule)
+        else {
+            continue;
+        };
+        let txwatch_config::AlertRule::LargeTransfer {
+            direction,
+            threshold_xlm: _,
+        } = rule
+        else {
+            continue;
+        };
+        let transfers = payload.contract_transfers.as_deref().unwrap_or(&[]);
+        let amount_in = contract_amount_stroops(transfers, contract_id, "in");
+        let amount_out = contract_amount_stroops(transfers, contract_id, "out");
+        let direction = direction.as_str();
+        payload.amount_stroops = Some(contract_amount_stroops(transfers, contract_id, direction));
+        payload.amount_in_stroops = Some(amount_in);
+        payload.amount_out_stroops = Some(amount_out);
+    }
 }
 
 /// Runs the contract's rules against `tx`, linking to `horizon_base`.
@@ -4482,6 +4517,27 @@ mod amount_and_cursor_tests {
             ]
         );
         assert_eq!(total(&details), Some(50_000_000));
+    }
+
+    /// Issue #400: a `LargeTransfer` alert reports the amount in the rule's
+    /// direction, not the sum of every in and out leg.
+    #[test]
+    fn large_transfer_amount_follows_the_rule_direction() {
+        let transfers = vec![
+            txwatch_rules::ContractTransfer {
+                from: String::new(),
+                to: ID.to_string(),
+                amount_stroops: 10_000_000_000,
+            },
+            txwatch_rules::ContractTransfer {
+                from: ID.to_string(),
+                to: String::new(),
+                amount_stroops: 9_000_000_000,
+            },
+        ];
+        assert_eq!(contract_amount_stroops(&transfers, ID, "in"), 10_000_000_000);
+        assert_eq!(contract_amount_stroops(&transfers, ID, "out"), 9_000_000_000);
+        assert_eq!(contract_amount_stroops(&transfers, ID, "both"), 0);
     }
 
     /// Issue #265: an upgrade through `update_current_contract_wasm` is

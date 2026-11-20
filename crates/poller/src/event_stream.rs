@@ -10,7 +10,70 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Reason an event fetch failed, used to label
+/// `txwatch_event_fetch_failures_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFailureReason {
+    /// Generic RPC/transport failure (endpoint down, malformed response, ...).
+    Rpc,
+    /// The requested ledger range is no longer available (outside retention).
+    Retention,
+}
+
+impl FetchFailureReason {
+    /// Metric label value for this reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FetchFailureReason::Rpc => "rpc",
+            FetchFailureReason::Retention => "retention",
+        }
+    }
+}
+
+/// Error returned by [`SorobanEventStreamer::fetch_events`].
+///
+/// Carries the [`FetchFailureReason`] so callers can increment
+/// `txwatch_event_fetch_failures_total` with the appropriate label while the
+/// `Display` output keeps the previous message format.
+#[derive(Debug)]
+pub struct FetchEventsError {
+    reason: FetchFailureReason,
+    source: anyhow::Error,
+}
+
+impl FetchEventsError {
+    /// The reason classification for this failure.
+    pub fn reason(&self) -> FetchFailureReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for FetchEventsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for FetchEventsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+/// RPC error codes that indicate the requested ledger range is outside the
+/// node's retention window.
+const RETENTION_ERROR_CODES: &[i64] = &[-32001, -32002];
+
+fn is_retention_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<JsonRpcError>()
+            .map(|rpc| RETENTION_ERROR_CODES.contains(&rpc.code))
+            .unwrap_or(false)
+    })
+}
 
 /// Delivery mode for a contract's event feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -85,6 +148,14 @@ struct JsonRpcError {
     code: i64,
     message: String,
 }
+
+impl std::fmt::Display for JsonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RPC error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for JsonRpcError {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -227,9 +298,12 @@ impl SorobanEventStreamer {
     /// rejects requests that combine the two. After a page is returned, the
     /// ledger position advances only past the last event actually delivered so
     /// unread events between the page and the tip are not skipped.
-    pub(crate) async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>> {
+    pub(crate) async fn fetch_events(&mut self) -> Result<Vec<SorobanEvent>, FetchEventsError> {
         if self.rpc_urls.is_empty() {
-            return Err(anyhow!("no Horizon/RPC endpoints configured"));
+            return Err(FetchEventsError {
+                reason: FetchFailureReason::Rpc,
+                source: anyhow!("no Horizon/RPC endpoints configured"),
+            });
         }
 
         let filter = EventFilter {
@@ -299,7 +373,13 @@ impl SorobanEventStreamer {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed")))
+        let source = last_error.unwrap_or_else(|| anyhow!("all RPC endpoints failed"));
+        let reason = if is_retention_error(&source) {
+            FetchFailureReason::Retention
+        } else {
+            FetchFailureReason::Rpc
+        };
+        Err(FetchEventsError { reason, source })
     }
 
     async fn try_fetch(
@@ -328,7 +408,7 @@ impl SorobanEventStreamer {
             .with_context(|| format!("decoding getEvents response from {url}"))?;
 
         if let Some(err) = body.error {
-            return Err(anyhow!("RPC error {}: {}", err.code, err.message));
+            return Err(anyhow::Error::new(err));
         }
 
         body.result
@@ -444,6 +524,41 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(streamer.last_cursor(), Some("cursor-b"));
         assert_eq!(streamer.current_ledger, 13);
+    }
+
+    #[tokio::test]
+    async fn all_endpoints_failing_reports_rpc_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
+        let err = streamer.fetch_events().await.unwrap_err();
+        assert_eq!(err.reason(), FetchFailureReason::Rpc);
+        assert_eq!(err.reason().as_str(), "rpc");
+    }
+
+    #[tokio::test]
+    async fn retention_rpc_error_reports_retention_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32001, "message": "startLedger out of retention" }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut streamer = SorobanEventStreamer::new(server.uri(), vec!["CABC".into()], 10);
+        let err = streamer.fetch_events().await.unwrap_err();
+        assert_eq!(err.reason(), FetchFailureReason::Retention);
+        assert_eq!(err.reason().as_str(), "retention");
+        assert!(err.to_string().contains("startLedger out of retention"));
     }
 
     #[test]
