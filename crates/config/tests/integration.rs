@@ -186,6 +186,67 @@ include = ["a.toml"]
 }
 
 #[test]
+fn diamond_include_loads_shared_file_once() {
+    let dir = std::env::temp_dir().join(format!("txwatch-test-diamond-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let file_a = dir.join("a.toml");
+    let file_b = dir.join("b.toml");
+    let file_c = dir.join("c.toml");
+    let shared = dir.join("shared.toml");
+
+    std::fs::write(
+        &file_a,
+        r#"
+poll_interval_seconds = 10
+include = ["b.toml", "c.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_b,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &file_c,
+        r#"
+include = ["shared.toml"]
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        &shared,
+        r#"
+[[contracts]]
+label = "Shared"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network = "testnet"
+webhook_url = "https://example.com/shared"
+[[contracts.rules]]
+type = "AnyTransaction"
+"#,
+    )
+    .unwrap();
+
+    let cfg = AppConfig::from_file(&file_a)
+        .expect("diamond include should not be reported as circular");
+    assert_eq!(
+        cfg.contracts.len(),
+        1,
+        "shared file should be loaded exactly once"
+    );
+    assert_eq!(cfg.contracts[0].label, "Shared");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn compute_config_hash_detects_changes_in_included_files() {
     let dir = std::env::temp_dir().join(format!("txwatch-test-hash-{}", std::process::id()));
     let contracts_d = dir.join("contracts.d");
@@ -363,4 +424,82 @@ type = "contract_upgraded"
     );
     let path = write_temp_config("contract-upgraded", &toml);
     AppConfig::from_file(&path).expect("contract_upgraded rule should parse");
+}
+
+#[test]
+fn high_fee_validate_is_idempotent() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "high_fee"
+threshold_xlm = 1
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("high-fee-idempotent", &toml);
+    let mut cfg = AppConfig::from_file(&path).expect("high_fee config should parse and validate");
+
+    // Validating an already-validated rule must succeed.
+    cfg.validate()
+        .expect("re-validating a validated high_fee rule should succeed");
+    cfg.validate()
+        .expect("validating a high_fee rule twice should succeed");
+}
+
+#[test]
+fn high_fee_survives_serialise_and_reparse() {
+    let toml = format!(
+        r#"{header}
+[[contracts.rules]]
+type = "high_fee"
+threshold_xlm = 1
+"#,
+        header = CONTRACT_HEADER
+    );
+    let path = write_temp_config("high-fee-roundtrip", &toml);
+    let cfg = AppConfig::from_file(&path).expect("high_fee config should parse and validate");
+
+    let serialised = toml::to_string(&cfg).expect("serialising a validated config should succeed");
+    let reparsed: AppConfig =
+        toml::from_str(&serialised).expect("re-parsing a serialised config should succeed");
+    reparsed
+        .validate()
+        .expect("re-parsed config should validate successfully");
+}
+
+#[test]
+fn muxed_addresses_from_stellar_docs_are_accepted() {
+    // Real muxed (M...) addresses from the Stellar documentation.
+    let valid = [
+        "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+        "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+    ];
+    for addr in valid {
+        assert_eq!(addr.len(), 69, "muxed address should be 69 chars: {}", addr);
+        txwatch_config::validate_stellar_address(addr)
+            .unwrap_or_else(|e| panic!("valid muxed address {} rejected: {}", addr, e));
+    }
+}
+
+#[test]
+fn muxed_address_wrong_length_is_rejected() {
+    // A valid 69-char muxed address padded to 72 chars must be rejected.
+    let padded = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLKAAA";
+    assert_eq!(padded.len(), 72);
+    txwatch_config::validate_stellar_address(padded)
+        .expect_err("wrong-length muxed address should be rejected");
+
+    let short = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJL";
+    assert_eq!(short.len(), 68);
+    txwatch_config::validate_stellar_address(short)
+        .expect_err("short muxed address should be rejected");
+}
+
+#[test]
+fn muxed_address_bad_checksum_is_rejected() {
+    // Flip the final character of a valid muxed address to break the CRC16 checksum.
+    let bad = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLL";
+    assert_eq!(bad.len(), 69);
+    txwatch_config::validate_stellar_address(bad)
+        .expect_err("muxed address with bad checksum should be rejected");
 }

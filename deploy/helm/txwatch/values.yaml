@@ -26,7 +26,10 @@ config: |
   contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
   network     = "testnet"
   webhook_url = "https://hooks.example.com/my-webhook"
-  webhook_secret = "${WEBHOOK_SECRET}"
+  # `${VAR:-}` resolves to an empty string when VAR is unset, so the default
+  # chart installs cleanly. Set WEBHOOK_SECRET (see `secret` below) to enable
+  # webhook signature verification.
+  webhook_secret = "${WEBHOOK_SECRET:-}"
 
     [[contracts.rules]]
     type = "AnyTransaction"
@@ -36,6 +39,10 @@ secret:
   create: true
   # Or reference an existing Secret instead (create: false).
   existingSecret: ""
+  # Empty by default: the config above uses `${WEBHOOK_SECRET:-}`, so an
+  # unset secret is allowed. Supply it with
+  # `--set secret.values.WEBHOOK_SECRET=...` (or point `existingSecret` at a
+  # Secret you manage) to enable webhook signature verification.
   values: {}
     # WEBHOOK_SECRET: change-me
     # SLACK_TOKEN: xoxb-...

@@ -24,8 +24,7 @@ schemars       = { workspace = true }
 anyhow         = { workspace = true }
 chrono         = { workspace = true }
 tracing        = { workspace = true }
-# Used by production code for commitment hashing and alert-id derivation, not
-# only by tests.
+# Used by production code for alert-id derivation, not only by tests.
 sha2           = { workspace = true }
 hex            = { workspace = true }
 

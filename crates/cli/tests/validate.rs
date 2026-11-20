@@ -698,6 +698,154 @@ fn validate_json_with_check_horizon_produces_valid_json() {
     );
 }
 
+/// #399: a disabled nested rule must still be validated, so an invalid
+/// `LargeTransfer { threshold_xlm = 0 }` inside a disabled `All` rule fails
+/// `txwatch validate` instead of silently passing.
+#[test]
+fn validate_rejects_invalid_disabled_nested_rule() {
+    const DISABLED_NESTED_CONFIG: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type    = "All"
+  enabled = false
+
+    [[contracts.rules.rules]]
+    type          = "LargeTransfer"
+    threshold_xlm = 0
+"#;
+
+    let path = env::temp_dir().join("txwatch_validate_disabled_nested_test.toml");
+    fs::write(&path, DISABLED_NESTED_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 for invalid disabled nested rule"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LargeTransfer threshold_xlm must be > 0"),
+        "expected nested LargeTransfer threshold error in:\n{}",
+        stderr
+    );
+/// #481: `validate --format json` must expose every rule-level setting and all
+/// effective top-level settings so the output can be used to audit what will
+/// actually run. Secrets are reported as `*_set` booleans.
+#[test]
+fn validate_json_includes_rule_overrides_and_top_level_settings() {
+    const FULL_CONFIG: &str = r#"
+poll_interval_seconds  = 10
+state_file             = "custom-state.json"
+max_contracts          = 25
+max_pages_per_cycle    = 7
+concurrency            = 3
+readiness_policy       = "strict"
+include                = ["extra-contracts.toml"]
+
+[[contracts]]
+label          = "Full Contract"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network        = "testnet"
+webhook_url    = "https://hooks.example.com/test"
+webhook_secret = "super-secret-value"
+
+  [[contracts.rules]]
+  type             = "AnyTransaction"
+  enabled          = false
+  severity         = "warning"
+  cooldown_seconds = 30
+  webhook_url      = "https://hooks.example.com/rule"
+  webhook_secret   = "rule-secret-value"
+"#;
+
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_json_full_test.toml");
+    fs::write(&path, FULL_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(
+        output.status.success(),
+        "expected exit code 0 for valid config:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("super-secret-value") && !stdout.contains("rule-secret-value"),
+        "webhook secrets must be redacted:\n{}",
+        stdout
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be a JSON object");
+
+    // Top-level effective settings.
+    assert_eq!(json["valid"], true);
+    assert_eq!(json["poll_interval_seconds"], 10);
+    assert_eq!(json["state_file"], "custom-state.json");
+    assert_eq!(json["max_contracts"], 25);
+    assert_eq!(json["max_pages_per_cycle"], 7);
+    assert_eq!(json["concurrency"], 3);
+    assert_eq!(json["readiness_policy"], "strict");
+
+    // Include list and the files actually loaded.
+    let include = json["include"]
+        .as_array()
+        .expect("expected include array in JSON output");
+    assert_eq!(include.len(), 1);
+    assert_eq!(include[0], "extra-contracts.toml");
+    let loaded_files = json["loaded_files"]
+        .as_array()
+        .expect("expected loaded_files array in JSON output");
+    assert!(
+        loaded_files
+            .iter()
+            .any(|f| f.as_str() == Some(path.to_str().unwrap())),
+        "expected main config path in loaded_files: {:?}",
+        loaded_files
+    );
+
+    // Rule-level settings.
+    let rules = json["contracts"][0]["rules"]
+        .as_array()
+        .expect("expected rules array");
+    assert_eq!(rules.len(), 1);
+    let rule = &rules[0];
+    assert_eq!(rule["type"], "AnyTransaction");
+    assert_eq!(rule["enabled"], false);
+    assert_eq!(rule["severity"], "warning");
+    assert_eq!(rule["cooldown_seconds"], 30);
+    assert!(
+        rule.get("cooldown_summary").is_some(),
+        "expected cooldown_summary in rule JSON: {}",
+        rule
+    );
+    assert_eq!(rule["webhook_url_set"], true);
+    assert_eq!(rule["webhook_secret_set"], true);
+}
+
 /// Verify that clap no longer treats --format json + --check-webhooks as conflicting.
 /// This is a regression test for issue #226.
 #[test]
@@ -731,4 +879,59 @@ fn validate_json_format_does_not_conflict_with_check_flags() {
     assert!(json.get("valid").is_some());
     assert!(json.get("webhook_checks").is_some());
     assert!(json.get("horizon_checks").is_some());
+}
+
+/// #476: horizon check output must identify which contract each result is about.
+#[test]
+fn validate_horizon_check_output_includes_contract_attribution() {
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_validate_horizon_attribution_test.toml");
+    fs::write(&path, VALID_CONFIG).unwrap();
+
+    // Text output: the contract label must be printed alongside the check.
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--check-horizon",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Test Contract"),
+        "expected contract label in horizon check output:\n{}",
+        stdout
+    );
+
+    // JSON output: each horizon_checks entry must carry contract and contract_id.
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            path.to_str().unwrap(),
+            "validate",
+            "--format",
+            "json",
+            "--check-horizon",
+        ])
+        .output()
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .expect("stdout must be valid JSON when --format json is used with --check-horizon");
+    let checks = json["horizon_checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 1, "one contract → one horizon check entry");
+    assert_eq!(
+        checks[0]["contract"], "Test Contract",
+        "each check must carry the contract label:\n{}",
+        stdout
+    );
+    assert_eq!(
+        checks[0]["contract_id"], "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        "each check must carry the contract_id:\n{}",
+        stdout
+    );
 }

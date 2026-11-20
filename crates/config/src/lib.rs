@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
@@ -286,16 +287,17 @@ impl fmt::Display for Severity {
     }
 }
 
-/// A validated Stellar G-address (56 chars, starts with 'G').
+/// A validated Stellar G-address (56 chars, starts with 'G') or muxed
+/// M-address (69 chars, starts with 'M').
 fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Result<()> {
     // Accept muxed accounts (M...) and extract underlying account, or validate account directly (#238)
     let account = if addr.starts_with('M') {
-        // Muxed account: M... wraps a G... account with ID
-        // For validation purposes, we only need to verify the format is present
-        if addr.len() < 72 || addr.len() > 76 {
+        // Muxed account StrKey: 1 version byte + 32 key bytes + 8 ID bytes +
+        // 2 checksum bytes = 43 bytes, which is exactly 69 base32 characters.
+        if addr.len() != 69 {
             bail!(
                 "contract '{}': {} '{}' is not a valid Stellar muxed account \
-                 (M-prefixed addresses must be 72-76 characters)",
+                 (M-prefixed addresses must be exactly 69 characters)",
                 contract_label,
                 field,
                 addr
@@ -329,6 +331,54 @@ fn validate_stellar_address(addr: &str, field: &str, contract_label: &str) -> Re
             field,
             addr
         );
+    }
+
+    if account.starts_with('M') {
+        // Decode the StrKey payload and verify the version byte and CRC16
+        // checksum, mirroring `validate_contract_id` for `C…` addresses.
+        let decoded = decode_base32(account).ok_or_else(|| {
+            anyhow!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (invalid base32 encoding)",
+                contract_label,
+                field,
+                addr
+            )
+        })?;
+        if decoded.len() != 43 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (decoded length {} instead of 43)",
+                contract_label,
+                field,
+                addr,
+                decoded.len()
+            );
+        }
+        let version = decoded[0];
+        if version != 12 << 3 {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (wrong version byte {}, expected {})",
+                contract_label,
+                field,
+                addr,
+                version,
+                12 << 3
+            );
+        }
+        let (payload, checksum) = decoded.split_at(decoded.len() - 2);
+        let expected = crc16_xmodem(payload);
+        let actual = u16::from_le_bytes([checksum[0], checksum[1]]);
+        if expected != actual {
+            bail!(
+                "contract '{}': {} '{}' is not a valid Stellar muxed account \
+                 (checksum mismatch)",
+                contract_label,
+                field,
+                addr
+            );
+        }
     }
 
     Ok(())
@@ -460,6 +510,11 @@ pub enum AlertRule {
         threshold_stroops: u64,
         #[serde(default)]
         threshold_xlm: Option<u64>,
+        /// Pre-computed stroops value set during validation (`threshold_xlm * 10_000_000`).
+        /// Skipped in serialisation so it does not appear in TOML or JSON config output.
+        #[serde(skip)]
+        #[schemars(skip)]
+        computed_threshold_stroops: u64,
     },
     /// Fires when the transaction source account is in (or not in) a list of G-addresses.
     #[serde(rename = "SourceAccount", alias = "source_account")]
@@ -575,20 +630,14 @@ enum AlertRuleRepr {
     TransactionFailed {},
     #[serde(rename = "LargeTransfer", alias = "large_transfer")]
     LargeTransfer {
-        threshold_xlm: u64,
-        #[serde(default = "default_transfer_direction")]
-        direction: String,
-    },
-    #[serde(rename = "FunctionCalled", alias = "function_called")]
-    FunctionCalled { function_name: String },
-    #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
-    AdminFunctionCalled { function_names: Vec<String> },
-    #[serde(rename = "HighFee", alias = "high_fee")]
         #[serde(default)]
         threshold_xlm: Option<u64>,
         #[serde(default)]
         threshold_stroops: Option<u64>,
+        #[serde(default = "default_transfer_direction")]
+        direction: String,
     },
+    #[serde(rename = "FunctionCalled", alias = "function_called")]
     FunctionCalled {
         function_name: String,
         #[serde(default)]
@@ -596,9 +645,9 @@ enum AlertRuleRepr {
         #[serde(default)]
         args: Vec<ArgMatcher>,
     },
-    AdminFunctionCalled {
-        function_names: Vec<String>,
-    },
+    #[serde(rename = "AdminFunctionCalled", alias = "admin_function_called")]
+    AdminFunctionCalled { function_names: Vec<String> },
+    #[serde(rename = "HighFee", alias = "high_fee")]
     HighFee {
         #[serde(default)]
         threshold_stroops: u64,
@@ -661,13 +710,8 @@ impl<'de> Deserialize<'de> for AlertRule {
             AlertRuleRepr::TransactionFailed {} => AlertRule::TransactionFailed,
             AlertRuleRepr::LargeTransfer {
                 threshold_xlm,
-                direction,
-            } => AlertRule::LargeTransfer {
-                threshold_xlm,
-                direction,
-                // Filled in by `validate`.
-                threshold_stroops: 0,
                 threshold_stroops,
+                direction,
             } => {
                 // #240: Accept either threshold_xlm or threshold_stroops
                 let (xlm, stroops) = match (threshold_xlm, threshold_stroops) {
@@ -686,9 +730,10 @@ impl<'de> Deserialize<'de> for AlertRule {
                 };
                 AlertRule::LargeTransfer {
                     threshold_xlm: xlm,
+                    direction,
                     threshold_stroops: stroops,
                 }
-            },
+            }
             AlertRuleRepr::FunctionCalled {
                 function_name,
                 match_mode,
@@ -707,6 +752,8 @@ impl<'de> Deserialize<'de> for AlertRule {
             } => AlertRule::HighFee {
                 threshold_stroops,
                 threshold_xlm,
+                // Filled in by `validate`.
+                computed_threshold_stroops: 0,
             },
             AlertRuleRepr::SourceAccount {
                 mode,
@@ -917,6 +964,7 @@ impl AlertRule {
             AlertRule::HighFee {
                 threshold_stroops,
                 threshold_xlm,
+                computed_threshold_stroops,
             } => match (*threshold_xlm, *threshold_stroops) {
                 (Some(_), s) if s > 0 => bail!(
                     "contract '{}': HighFee: specify either threshold_stroops or \
@@ -932,12 +980,16 @@ impl AlertRule {
                     contract_label
                 ),
                 (Some(xlm), 0) => {
-                    *threshold_stroops = xlm.checked_mul(10_000_000).with_context(|| {
-                        format!(
-                            "contract '{}': HighFee threshold_xlm overflow",
-                            contract_label
-                        )
-                    })?;
+                    // Store the computed value in the skipped field so a second
+                    // `validate()` (or a serialise-then-parse round-trip) does
+                    // not trip the "not both" check above (#395).
+                    *computed_threshold_stroops =
+                        xlm.checked_mul(10_000_000).with_context(|| {
+                            format!(
+                                "contract '{}': HighFee threshold_xlm overflow",
+                                contract_label
+                            )
+                        })?;
                 }
                 _ => {}
             },
@@ -1208,6 +1260,7 @@ impl AlertRule {
             }
             AlertRule::SourceAccount {
                 mode,
+                field,
                 accounts,
                 alert_unless,
                 allow,
@@ -1262,7 +1315,6 @@ impl AlertRule {
             AlertRule::NoActivity { minutes } => format!("NoActivity({}min)", minutes),
             AlertRule::EventEmitted { topic, topics, .. } => event_emitted_label(topic, topics),
             AlertRule::ContractUpgraded => "ContractUpgraded".into(),
-            AlertRule::EventEmitted { topic, topics } => event_emitted_label(topic, topics),
             AlertRule::Rate {
                 rule,
                 count,
@@ -1340,9 +1392,11 @@ impl RuleEntry {
                 );
             }
         }
-        if self.enabled {
-            self.rule.validate_at_depth(contract_label, depth)?;
-        }
+        // Validate the rule itself regardless of `enabled`: a disabled rule that
+        // is invalid would otherwise only fail when someone flips `enabled = true`
+        // during an incident (and `LargeTransfer` would run with a zero threshold
+        // because the stroop pre-computation never ran).
+        self.rule.validate_at_depth(contract_label, depth)?;
         Ok(())
     }
 }
@@ -1423,6 +1477,54 @@ impl From<AlertRule> for RuleConfig {
     }
 }
 
+/// Templates compiled once per config generation, keyed by destination index
+/// (the position of the destination in the contract's `destinations()` list).
+/// Rendering an alert reuses the compiled environment instead of parsing the
+/// template again for every delivery.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledTemplates {
+    environments: BTreeMap<usize, minijinja::Environment<'static>>,
+}
+
+impl CompiledTemplates {
+    /// Compiles every template destination in `destinations`, recording any
+    /// template that fails to compile. Returns the cache and the errors.
+    pub fn compile(destinations: &[WebhookDestination]) -> (Self, Vec<String>) {
+        let mut environments = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (index, destination) in destinations.iter().enumerate() {
+            if destination.format != WebhookFormat::Template {
+                continue;
+            }
+            let Some(source) = destination.template.as_deref() else {
+                continue;
+            };
+            let mut env = minijinja::Environment::new();
+            match env.add_template_owned("body", source.to_owned()) {
+                Ok(()) => {
+                    environments.insert(index, env);
+                }
+                Err(e) => errors.push(format!("webhooks[{}].template is invalid: {}", index, e)),
+            }
+        }
+        (Self { environments }, errors)
+    }
+
+    /// The compiled environment for the destination at `index`, if it has one.
+    pub fn get(&self, index: usize) -> Option<&minijinja::Environment<'static>> {
+        self.environments.get(&index)
+    }
+
+    /// Number of cached templates.
+    pub fn len(&self) -> usize {
+        self.environments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.environments.is_empty()
+    }
+}
+
 impl AsRef<AlertRule> for AlertRule {
     fn as_ref(&self) -> &AlertRule {
         self
@@ -1448,6 +1550,7 @@ pub const REDACTED: &str = "<redacted>";
 
 /// Body shape sent to a webhook destination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookFormat {
     /// TxWatch's own alert JSON.
@@ -1475,6 +1578,36 @@ impl WebhookFormat {
             WebhookFormat::Teams => "teams",
             WebhookFormat::Template => "template",
         }
+    }
+
+    /// Every format, in declaration order. Used to build CLI help text and
+    /// error messages so new variants are never left out.
+    pub const ALL: &'static [WebhookFormat] = &[
+        WebhookFormat::Txwatch,
+        WebhookFormat::Slack,
+        WebhookFormat::Discord,
+        WebhookFormat::Pagerduty,
+        WebhookFormat::Teams,
+        WebhookFormat::Template,
+    ];
+
+    /// `txwatch, slack, discord, pagerduty, teams, template` — the accepted
+    /// `--format` values, generated from [`WebhookFormat::ALL`].
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|format| format.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parses a format name (case-insensitive), returning `None` when unknown.
+    pub fn from_name(name: &str) -> Option<WebhookFormat> {
+        let name = name.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.as_str().eq_ignore_ascii_case(name))
     }
 }
 
@@ -1527,6 +1660,45 @@ fn is_reserved_header(name: &str) -> bool {
     ) || name.starts_with("x-txwatch-")
 }
 
+/// Checks that `value` is a syntactically valid media type such as
+/// `application/json` or `text/plain; charset=utf-8`; returns a description of
+/// the problem otherwise.
+pub fn check_media_type(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return Some("must not be blank".to_owned());
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Some("must not contain control characters".to_owned());
+    }
+    let essence = value.split(';').next().unwrap_or("").trim();
+    let (type_, subtype) = match essence.split_once('/') {
+        Some((t, s)) => (t.trim(), s.trim()),
+        None => {
+            return Some(format!(
+                "{:?} is not a valid media type (expected type/subtype, e.g. application/json)",
+                value
+            ))
+        }
+    };
+    if type_.is_empty() || subtype.is_empty() {
+        return Some(format!(
+            "{:?} is not a valid media type (expected type/subtype, e.g. application/json)",
+            value
+        ));
+    }
+    if !type_.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        || !subtype
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    {
+        return Some(format!(
+            "{:?} is not a valid media type (type and subtype must be RFC 9110 tokens)",
+            value
+        ));
+    }
+    None
+}
+
 /// RFC 9110 token: the characters allowed in a header name.
 fn is_header_name(name: &str) -> bool {
     !name.is_empty()
@@ -1570,6 +1742,11 @@ pub struct WebhookDestination {
     /// Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_file: Option<String>,
+    /// `Content-Type` sent with the body for `format = "template"`, e.g.
+    /// `application/x-www-form-urlencoded`, `text/plain` or `application/xml`.
+    /// Defaults to `application/json`. Only valid with `format = "template"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// PEM client certificate for mutual TLS; requires `client_key`.
     /// Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1591,6 +1768,46 @@ pub struct WebhookDestination {
     pub rule_types: Vec<String>,
 }
 
+/// Reads and parses a PEM file, returning a short description of the problem
+/// (never the file contents) when it cannot be read or parsed.
+fn check_pem_file(path: &str, kind: &str) -> Option<String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(format!("cannot be read: {}", e)),
+    };
+    if bytes.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return Some("is not valid UTF-8 PEM text".to_owned()),
+    };
+    let begin = format!("-----BEGIN {}-----", kind);
+    let end = format!("-----END {}-----", kind);
+    if !text.contains(&begin) || !text.contains(&end) {
+        return Some(format!("does not contain a {} PEM block", kind));
+    }
+    None
+}
+
+/// Warns (on Unix) when a private key file is readable by group or others.
+fn key_permission_warning(path: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "is accessible by group or others (mode {:04o}); consider chmod 600",
+                mode & 0o777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
+}
+
 impl fmt::Debug for WebhookDestination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebhookDestination")
@@ -1601,6 +1818,7 @@ impl fmt::Debug for WebhookDestination {
             .field("routing_key", &self.routing_key.as_ref().map(|_| REDACTED))
             .field("template", &self.template)
             .field("template_file", &self.template_file)
+            .field("content_type", &self.content_type)
             .field("client_cert", &self.client_cert)
             .field("client_key", &self.client_key)
             .field("ca_cert", &self.ca_cert)
@@ -1613,16 +1831,11 @@ impl fmt::Debug for WebhookDestination {
 impl WebhookDestination {
     /// Whether an alert with this severity and rule type passes the
     /// destination's `min_severity` and `rule_types` filters.
-    pub fn accepts(&self, severity: Option<&str>, rule_type: &str) -> bool {
+    pub fn accepts(&self, severity: Option<&Severity>, rule_type: &str) -> bool {
         if let Some(min) = &self.min_severity {
-            let severity = match severity {
-                Some("info") => Severity::Info,
-                Some("warning") => Severity::Warning,
-                Some("critical") => Severity::Critical,
+            match severity {
+                Some(sev) if sev >= min => {}
                 _ => return false,
-            };
-            if severity < *min {
-                return false;
             }
         }
         self.rule_types.is_empty() || self.rule_types.iter().any(|t| t == rule_type)
@@ -1631,6 +1844,23 @@ impl WebhookDestination {
     /// Whether this destination needs its own TLS client.
     pub fn has_tls_config(&self) -> bool {
         self.client_cert.is_some() || self.client_key.is_some() || self.ca_cert.is_some()
+    }
+
+    /// `Content-Type` sent with the body: the configured `content_type` for
+    /// `format = "template"`, otherwise `application/json`.
+    pub fn content_type(&self) -> &str {
+        match (self.format, self.content_type.as_deref()) {
+            (WebhookFormat::Template, Some(content_type)) => content_type,
+            _ => "application/json",
+        }
+    }
+
+    /// Whether the template body should be rendered with JSON auto-escaping,
+    /// i.e. the destination sends `application/json`.
+    pub fn template_json_escape(&self) -> bool {
+        let essence = self.content_type().split(';').next().unwrap_or("").trim();
+        essence.eq_ignore_ascii_case("application/json")
+            || essence.to_ascii_lowercase().ends_with("+json")
     }
 
     /// Validates a stand-alone destination (e.g. one built from CLI flags).
@@ -1708,8 +1938,15 @@ impl WebhookDestination {
             )),
             (WebhookFormat::Template, Some(template)) => {
                 let mut env = minijinja::Environment::new();
-                if let Err(e) = env.add_template("body", template) {
-                    problems.push(format!("{} is invalid: {}", field("template"), e));
+                match env.add_template("body", template) {
+                    Err(e) => {
+                        problems.push(format!("{} is invalid: {}", field("template"), e));
+                    }
+                    Ok(_) => {
+                        if let Err(e) = check_template_renders(template) {
+                            problems.push(format!("{} {}", field("template"), e));
+                        }
+                    }
                 }
             }
             (_, Some(_)) => problems.push(format!(
@@ -1718,12 +1955,41 @@ impl WebhookDestination {
             )),
             _ => {}
         }
+        match (self.format, &self.content_type) {
+            (WebhookFormat::Template, Some(content_type)) => {
+                if let Some(problem) = check_media_type(content_type) {
+                    problems.push(format!("{} {}", field("content_type"), problem));
+                }
+            }
+            (WebhookFormat::Template, None) => {}
+            (_, Some(_)) => problems.push(format!(
+                "{} is only used when format is \"template\"",
+                field("content_type")
+            )),
+        }
         if self.client_cert.is_some() != self.client_key.is_some() {
             problems.push(format!(
                 "{} and {} must be set together",
                 field("client_cert"),
                 field("client_key")
             ));
+        }
+        if let Some(cert) = &self.client_cert {
+            if let Some(problem) = check_pem_file(cert, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("client_cert"), problem));
+            }
+        }
+        if let Some(key) = &self.client_key {
+            if let Some(problem) = check_pem_file(key, "PRIVATE KEY") {
+                problems.push(format!("{} {}", field("client_key"), problem));
+            } else if let Some(warning) = key_permission_warning(key) {
+                problems.push(format!("{} {}", field("client_key"), warning));
+            }
+        }
+        if let Some(ca) = &self.ca_cert {
+            if let Some(problem) = check_pem_file(ca, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("ca_cert"), problem));
+            }
         }
         if self.has_tls_config() && !self.url.starts_with("https://") {
             problems.push(format!(
@@ -1827,6 +2093,72 @@ impl fmt::Display for ValidationErrors {
 }
 
 impl std::error::Error for ValidationErrors {}
+
+/// Renders `template` against a synthetic payload for every rule type, so a
+/// template that references an optional field (absent for e.g. `NoActivity`)
+/// fails at config load instead of at delivery time.
+fn check_template_renders(template: &str) -> std::result::Result<(), String> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template("body", template)
+        .map_err(|e| format!("is invalid: {}", e))?;
+    let tmpl = env
+        .get_template("body")
+        .map_err(|e| format!("is invalid: {}", e))?;
+    for rule_type in SYNTHETIC_RULE_TYPES {
+        let payload = synthetic_payload(rule_type);
+        tmpl.render(&payload)
+            .map_err(|e| format!("fails to render for {} alerts: {}", rule_type, e))?;
+    }
+    Ok(())
+}
+
+/// Rule types a synthetic payload is rendered for.
+const SYNTHETIC_RULE_TYPES: &[&str] = &[
+    "AnyTransaction",
+    "TransactionFailed",
+    "LargeTransfer",
+    "FunctionCalled",
+    "AdminFunctionCalled",
+    "HighFee",
+    "SourceAccount",
+    "All",
+    "Any",
+    "Not",
+    "NoActivity",
+    "EventEmitted",
+    "ContractUpgraded",
+    "Rate",
+    "Memo",
+];
+
+/// A payload with every optional field present (as `null` where the real
+/// payload would omit it), so templates referencing them still render.
+fn synthetic_payload(rule_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "rule_type": rule_type,
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "label": "synthetic",
+        "network": "testnet",
+        "tx_hash": "0".repeat(64),
+        "source_account": null,
+        "severity": null,
+        "memo": null,
+        "ledger": null,
+        "fee_account": null,
+        "old_wasm_hash": null,
+        "new_wasm_hash": null,
+        "function_name": null,
+        "amount": null,
+        "asset": null,
+        "topic": null,
+        "topics": [],
+        "data": null,
+        "suppressed_count": 0,
+        "timestamp": "1970-01-01T00:00:00Z",
+        "explorer_url": null,
+    })
+}
 
 /// Checks that `value` is an http(s) URL with a host; returns a description
 /// of the problem otherwise.
@@ -2261,6 +2593,8 @@ impl Default for AppConfig {
             http_connection_verbose: None,
             max_contracts: None,
             max_pages_per_cycle: None,
+            concurrency: None,
+            state_file: None,
             include: Vec::new(),
             loaded_files: Vec::new(),
             contract_files: std::collections::HashMap::new(),
@@ -2343,10 +2677,6 @@ fn default_http_pool_max_idle_per_host() -> usize {
 
 fn default_http_tcp_keepalive_secs() -> u64 {
     DEFAULT_HTTP_TCP_KEEPALIVE_SECS
-}
-
-fn default_summary_interval_seconds() -> u64 {
-    60
 }
 
 fn deserialize_toml_with_field_context<T>(raw: &str, path: &Path) -> Result<T>
@@ -2445,6 +2775,29 @@ fn resolve_env_interpolation(value: &str) -> Result<String> {
 /// Interpolates `value` in place, naming `field` (never the value) in errors.
 fn resolve_field(value: &mut String, field: &str) -> Result<()> {
     *value = resolve_env_interpolation(value).with_context(|| field.to_owned())?;
+    Ok(())
+}
+
+/// Interpolates a nested rule entry's webhook fields, recursing into
+/// composite rules.
+fn resolve_rule_entry(entry: &mut RuleEntry, path: &str) -> Result<()> {
+    if let Some(url) = &mut entry.webhook_url {
+        resolve_field(url, &format!("{}.webhook_url", path))?;
+    }
+    if let Some(secret) = &mut entry.webhook_secret {
+        resolve_field(secret, &format!("{}.webhook_secret", path))?;
+    }
+    match &mut entry.rule {
+        AlertRule::All { rules } | AlertRule::Any { rules } => {
+            for (k, nested) in rules.iter_mut().enumerate() {
+                resolve_rule_entry(nested, &format!("{}.rules[{}]", path, k))?;
+            }
+        }
+        AlertRule::Not { rule } => {
+            resolve_rule_entry(rule, &format!("{}.rule", path))?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -2597,30 +2950,43 @@ impl AppConfig {
         let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
             .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
 
-        let mut visited = std::collections::HashSet::new();
+        // `loaded` holds every file already read (so diamond-shaped includes
+        // load a shared file once), while `stack` holds the chain of files
+        // currently being resolved (so only a real cycle is reported).
+        let mut loaded = std::collections::HashSet::new();
+        let mut stack = Vec::new();
         let canon = source
             .canonicalize()
             .unwrap_or_else(|_| source.to_path_buf());
-        visited.insert(canon);
+        loaded.insert(canon.clone());
+        stack.push(canon);
         cfg.loaded_files.push(source.to_path_buf());
 
         for c in &cfg.contracts {
             cfg.contract_files
-                .insert(c.label.to_lowercase(), source.to_path_buf());
+                .insert(c.label.trim().to_lowercase(), source.to_path_buf());
         }
 
         let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
-        cfg.resolve_includes(base_dir, &mut visited)?;
+        cfg.resolve_includes(base_dir, &mut loaded, &mut stack)?;
 
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Resolves `include` patterns relative to `base_dir`.
+    ///
+    /// `loaded` records every file already read so a file reached through two
+    /// different include paths (a diamond, e.g. `a` includes `b` and `c`, both
+    /// of which include `shared`) is loaded exactly once. `stack` records the
+    /// chain of files currently being resolved; only a file that is already on
+    /// that chain is a genuine circular include.
     fn resolve_includes(
         &mut self,
         base_dir: &Path,
-        visited: &mut std::collections::HashSet<PathBuf>,
+        loaded: &mut std::collections::HashSet<PathBuf>,
+        stack: &mut Vec<PathBuf>,
     ) -> Result<()> {
         if self.include.is_empty() {
             return Ok(());
@@ -2670,8 +3036,26 @@ impl AppConfig {
             let canonical = included_path
                 .canonicalize()
                 .unwrap_or_else(|_| included_path.clone());
-            if !visited.insert(canonical) {
-                bail!("circular include detected: '{}'", included_path.display());
+
+            // A file already on the current include chain is a real cycle.
+            if stack.contains(&canonical) {
+                let chain = stack
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .chain(std::iter::once(included_path.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                bail!(
+                    "circular include detected: '{}' (include chain: {})",
+                    included_path.display(),
+                    chain
+                );
+            }
+
+            // A file already loaded elsewhere in the tree (diamond include) is
+            // skipped: its contracts were already added once.
+            if !loaded.insert(canonical.clone()) {
+                continue;
             }
 
             let raw = fs::read_to_string(&included_path).with_context(|| {
@@ -2687,7 +3071,7 @@ impl AppConfig {
 
             for c in &included.contracts {
                 self.contract_files
-                    .insert(c.label.to_lowercase(), included_path.clone());
+                    .insert(c.label.trim().to_lowercase(), included_path.clone());
             }
 
             // Recursive include support
@@ -2697,7 +3081,10 @@ impl AppConfig {
                     include: included.include,
                     ..Default::default()
                 };
-                sub_cfg.resolve_includes(sub_base, visited)?;
+                stack.push(canonical);
+                let result = sub_cfg.resolve_includes(sub_base, loaded, stack);
+                stack.pop();
+                result?;
                 self.loaded_files.extend(sub_cfg.loaded_files);
                 self.contract_files.extend(sub_cfg.contract_files);
                 self.contracts.extend(sub_cfg.contracts);
@@ -2940,6 +3327,10 @@ mod tests {
             rule: r,
             cooldown_seconds: None,
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }
     }
 
@@ -4081,6 +4472,10 @@ mod tests {
             },
             cooldown_seconds: None,
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }
     }
 
@@ -4188,6 +4583,10 @@ mod tests {
             rule: AlertRule::AnyTransaction,
             cooldown_seconds: Some(MAX_COOLDOWN_SECONDS + 1),
             cooldown_summary: false,
+            enabled: true,
+            webhook_url: None,
+            webhook_secret: None,
+            severity: None,
         }];
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("cooldown_seconds"), "got: {}", err);
@@ -4584,11 +4983,11 @@ mod tests {
         )
         .unwrap();
         let d = cfg.contracts[0].destinations();
-        assert!(d[0].accepts(Some("critical"), "AnyTransaction"));
-        assert!(!d[0].accepts(Some("warning"), "AnyTransaction"));
+        assert!(d[0].accepts(Some(&Severity::Critical), "AnyTransaction"));
+        assert!(!d[0].accepts(Some(&Severity::Warning), "AnyTransaction"));
         assert!(!d[0].accepts(None, "AnyTransaction"));
         assert!(d[1].accepts(None, "LargeTransfer"));
-        assert!(!d[1].accepts(Some("critical"), "AnyTransaction"));
+        assert!(!d[1].accepts(Some(&Severity::Critical), "AnyTransaction"));
 
         let err = parse_err(
             r#"
@@ -4852,6 +5251,69 @@ mod tests {
     }
 
     #[test]
+    fn high_fee_validation_is_idempotent_and_round_trips() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::HighFee {
+            threshold_stroops: 0,
+            threshold_xlm: Some(1),
+            computed_threshold_stroops: 0,
+        })];
+        c.validate().unwrap();
+        // Validating the same rule again must succeed (#395).
+        c.validate().unwrap();
+
+        // Serialise the validated config and parse it back: both fields are
+        // emitted, but the skipped computed field is not, so parsing succeeds.
+        let serialised = toml::to_string(&c).unwrap();
+        let mut reparsed: ContractConfig = toml::from_str(&serialised).unwrap();
+        reparsed.validate().unwrap();
+        reparsed.validate().unwrap();
+    }
+
+    #[test]
+    fn high_fee_rejects_both_thresholds() {
+        let mut c = valid_contract();
+        c.rules = vec![rule(AlertRule::HighFee {
+            threshold_stroops: 10_000_000,
+            threshold_xlm: Some(1),
+            computed_threshold_stroops: 0,
+        })];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("not both"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_real_muxed_addresses() {
+        // Muxed addresses from the Stellar documentation.
+        for addr in [
+            "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+            "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK",
+        ] {
+            assert_eq!(addr.len(), 69, "{}", addr);
+            assert!(
+                validate_stellar_address(addr, "test", "c").is_ok(),
+                "{}",
+                addr
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_muxed_addresses_of_wrong_length_or_checksum() {
+        let valid = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK";
+        // Wrong length (72-76 chars used to be accepted).
+        let too_long = format!("{}AAA", valid);
+        assert!(validate_stellar_address(&too_long, "test", "c").is_err());
+        let too_short = &valid[..68];
+        assert!(validate_stellar_address(too_short, "test", "c").is_err());
+        // Wrong checksum: flip the last character.
+        let mut bad = valid.to_owned();
+        bad.pop();
+        bad.push('A');
+        assert!(validate_stellar_address(&bad, "test", "c").is_err());
+    }
+
+    #[test]
     fn validate_contract_id_reports_each_failure_distinctly() {
         let valid = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
         assert_eq!(
@@ -4874,6 +5336,127 @@ mod tests {
             validate_contract_id(&mistyped),
             Err(ContractIdError::Checksum { .. })
         ));
+    }
+
+    #[test]
+    fn template_referencing_optional_field_is_rejected_at_load() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ source_account }}".into()),
+            ..Default::default()
+        }];
+        // The synthetic payload provides `source_account` as null, so a plain
+        // reference renders; a missing field still fails.
+        assert!(c.validate().is_ok());
+
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ definitely_not_a_field }}".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].template"), "got: {}", err);
+    }
+
+    #[test]
+    fn missing_client_cert_file_is_reported_with_field_path() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            client_cert: Some("/nonexistent/txwatch-cert.pem".into()),
+            client_key: Some("/nonexistent/txwatch-key.pem".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].client_cert"), "got: {}", err);
+        assert!(err.contains("webhooks[0].client_key"), "got: {}", err);
+    fn content_type_is_optional_and_only_valid_with_template_format() {
+        let mut destination = WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{\"text\": {{ alert | tojson }}}".into()),
+            ..Default::default()
+        };
+        assert_eq!(destination.content_type(), "application/json");
+        assert!(destination.template_json_escape());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("application/x-www-form-urlencoded".into());
+        assert_eq!(
+            destination.content_type(),
+            "application/x-www-form-urlencoded"
+        );
+        assert!(!destination.template_json_escape());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("text/plain; charset=utf-8".into());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("not-a-media-type".into());
+        let err = destination.validate().unwrap_err().to_string();
+        assert!(err.contains("content_type"), "got: {}", err);
+
+        destination.content_type = Some("  ".into());
+        assert!(destination.validate().is_err());
+
+        destination.content_type = Some("text/plain\r\nX-Evil: 1".into());
+        assert!(destination.validate().is_err());
+
+        let mut non_template = WebhookDestination {
+            url: "https://example.com/hook".into(),
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        let err = non_template.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("only used when format is \"template\""),
+            "got: {}",
+            err
+        );
+        non_template.content_type = None;
+        assert!(non_template.validate().is_ok());
+    }
+
+    #[test]
+    fn compiled_templates_are_cached_per_destination() {
+        let destinations = vec![
+            WebhookDestination {
+                url: "https://example.com/a".into(),
+                format: WebhookFormat::Template,
+                template: Some("{\"text\": {{ alert | tojson }}}".into()),
+                ..Default::default()
+            },
+            WebhookDestination {
+                url: "https://example.com/b".into(),
+                ..Default::default()
+            },
+            WebhookDestination {
+                url: "https://example.com/c".into(),
+                format: WebhookFormat::Template,
+                template: Some("{{ alert | tojson }}".into()),
+                ..Default::default()
+            },
+        ];
+        let (compiled, errors) = CompiledTemplates::compile(&destinations);
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(compiled.len(), 2);
+        assert!(compiled.get(0).is_some());
+        assert!(compiled.get(1).is_none());
+        assert!(compiled.get(2).is_some());
+
+        let broken = vec![WebhookDestination {
+            url: "https://example.com/d".into(),
+            format: WebhookFormat::Template,
+            template: Some("{% if %}".into()),
+            ..Default::default()
+        }];
+        let (compiled, errors) = CompiledTemplates::compile(&broken);
+        assert!(compiled.is_empty());
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]
@@ -5261,6 +5844,7 @@ mod tests {
         let event_rule = AlertRule::EventEmitted {
             topic: "mint".into(),
             topics: vec!["*".into()],
+            data: Vec::new(),
         };
         let not_event = AlertRule::Not {
             rule: Box::new(RuleEntry {
@@ -5318,6 +5902,7 @@ mod tests {
                 rule: AlertRule::EventEmitted {
                     topic: "mint".into(),
                     topics: vec!["*".into()],
+                    data: Vec::new(),
                 },
                 enabled: true,
                 webhook_url: None,
@@ -5330,5 +5915,144 @@ mod tests {
             err.contains("EventEmitted rules need a Soroban RPC endpoint"),
             "got: {err}"
         );
+    }
+
+    // ── Rule type aliases and labels (#367, #368) ───────────────────────────
+
+    /// `(PascalCase, snake_case, extra TOML body)` for every `AlertRule` variant.
+    const RULE_SPELLINGS: &[(&str, Option<&str>, &str)] = &[
+        ("AnyTransaction", Some("any_transaction"), ""),
+        ("TransactionFailed", Some("transaction_failed"), ""),
+        (
+            "LargeTransfer",
+            Some("large_transfer"),
+            "threshold_xlm = 5\ndirection = \"in\"",
+        ),
+        (
+            "FunctionCalled",
+            Some("function_called"),
+            "function_name = \"withdraw\"\nmatch_mode = \"prefix\"\nargs = [{ index = 0, eq = \"a\" }]",
+        ),
+        (
+            "AdminFunctionCalled",
+            Some("admin_function_called"),
+            "function_names = [\"upgrade\"]",
+        ),
+        ("HighFee", Some("high_fee"), "threshold_stroops = 100"),
+        (
+            "SourceAccount",
+            Some("source_account"),
+            "mode = \"not_in\"\nfield = \"fee_account\"\naccounts = [\"GABC\"]",
+        ),
+        ("All", Some("all"), "rules = [{ type = \"AnyTransaction\" }]"),
+        ("Any", Some("any"), "rules = [{ type = \"AnyTransaction\" }]"),
+        ("Not", Some("not"), "rule = { type = \"AnyTransaction\" }"),
+        ("NoActivity", Some("no_activity"), "minutes = 10"),
+        (
+            "EventEmitted",
+            Some("event_emitted"),
+            "topic = \"transfer\"\ntopics = [\"*\"]",
+        ),
+        ("ContractUpgraded", Some("contract_upgraded"), ""),
+        (
+            "Rate",
+            None,
+            "rule = { type = \"AnyTransaction\" }\ncount = 3\nwindow_seconds = 60",
+        ),
+        ("Memo", None, "memo_type = \"text\"\nprefix = \"inv-\""),
+    ];
+
+    fn parse_alert_rule(type_name: &str, body: &str) -> AlertRule {
+        toml::from_str(&format!("type = \"{}\"\n{}", type_name, body))
+            .unwrap_or_else(|e| panic!("failed to parse {}: {}", type_name, e))
+    }
+
+    #[test]
+    fn every_rule_alias_spelling_round_trips() {
+        for (pascal, snake, body) in RULE_SPELLINGS {
+            let canonical = parse_alert_rule(pascal, body);
+            if let Some(snake) = snake {
+                assert_eq!(
+                    parse_alert_rule(snake, body),
+                    canonical,
+                    "alias {} should parse like {}",
+                    snake,
+                    pascal
+                );
+            }
+            let json = serde_json::to_string(&canonical).unwrap();
+            let back: AlertRule = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("failed to re-parse {}: {}", json, e));
+            assert_eq!(back, canonical, "round trip of {}", pascal);
+        }
+    }
+
+    #[test]
+    fn large_transfer_accepts_threshold_stroops() {
+        let rule = parse_alert_rule("large_transfer", "threshold_stroops = 50000000");
+        assert_eq!(
+            rule,
+            AlertRule::LargeTransfer {
+                threshold_xlm: 5,
+                direction: "any".into(),
+                threshold_stroops: 50_000_000,
+            }
+        );
+        assert!(toml::from_str::<AlertRule>(
+            "type = \"LargeTransfer\"\nthreshold_xlm = 5\nthreshold_stroops = 50000000"
+        )
+        .is_err());
+        assert!(toml::from_str::<AlertRule>("type = \"LargeTransfer\"").is_err());
+    }
+
+    #[test]
+    fn function_called_alias_keeps_match_mode_and_args() {
+        let rule = parse_alert_rule(
+            "function_called",
+            "function_name = \"withdraw\"\nmatch_mode = \"glob\"\nargs = [{ index = 1, eq = \"x\" }]",
+        );
+        assert_eq!(
+            rule,
+            AlertRule::FunctionCalled {
+                function_name: "withdraw".into(),
+                match_mode: FunctionMatchMode::Glob,
+                args: vec![ArgMatcher {
+                    index: 1,
+                    eq: "x".into()
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn label_snapshot_covers_every_rule_variant() {
+        let expected = [
+            "AnyTransaction",
+            "TransactionFailed",
+            "LargeTransfer(>=5XLM)",
+            "FunctionCalled(prefix:withdraw)([0]=a)",
+            "AdminFunctionCalled([upgrade])",
+            "HighFee(>=100 stroops)",
+            "SourceAccount(field=fee_account, not_in: [GABC])",
+            "All(AnyTransaction)",
+            "Any(AnyTransaction)",
+            "Not(AnyTransaction)",
+            "NoActivity(10min)",
+            "EventEmitted(transfer, *)",
+            "ContractUpgraded",
+            "Rate(3x AnyTransaction in 60s)",
+            "Memo(text:^inv-)",
+        ];
+        assert_eq!(RULE_SPELLINGS.len(), expected.len());
+        for ((pascal, _, body), want) in RULE_SPELLINGS.iter().zip(expected) {
+            assert_eq!(parse_alert_rule(pascal, body).label(), want);
+        }
+    }
+
+    #[test]
+    fn app_config_default_initialises_every_field() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.concurrency, None);
+        assert_eq!(cfg.state_file, None);
     }
 }

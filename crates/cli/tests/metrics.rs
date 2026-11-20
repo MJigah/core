@@ -123,3 +123,97 @@ fn watch_serves_prometheus_metrics() {
         );
     }
 }
+
+const WEBHOOK_READINESS_CONFIG: &str = r#"
+poll_interval_seconds = 3600
+readiness_include_webhooks = true
+
+[[contracts]]
+label       = "Webhook Readiness Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "http://127.0.0.1:1/unreachable"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
+#[test]
+fn metrics_expose_webhook_destination_unhealthy_and_readyz_fails() {
+    let config = env::temp_dir().join("txwatch_webhook_readiness_cli_test.toml");
+    fs::write(&config, WEBHOOK_READINESS_CONFIG).unwrap();
+    let port = free_port();
+
+    let _child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_txwatch"))
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "watch",
+                "--dry-run",
+                "--metrics-addr",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to start txwatch"),
+    );
+
+    // Wait for the metrics endpoint to come up.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(response) = http_get(port, "/metrics") {
+            if response.contains("txwatch_build_info") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/metrics never served txwatch_build_info"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // The webhook destination gauge must be exposed with contract and
+    // destination labels.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let metrics = loop {
+        let response = http_get(port, "/metrics").expect("/metrics request failed");
+        if response.contains("txwatch_webhook_destination_unhealthy{") {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/metrics never exposed txwatch_webhook_destination_unhealthy"
+        );
+        thread::sleep(Duration::from_millis(200));
+    };
+    let gauge_line = metrics
+        .lines()
+        .find(|line| line.starts_with("txwatch_webhook_destination_unhealthy{"))
+        .expect("txwatch_webhook_destination_unhealthy line missing from /metrics");
+    assert!(
+        gauge_line.contains("contract=\""),
+        "gauge missing contract label: {gauge_line}"
+    );
+    assert!(
+        gauge_line.contains("destination=\""),
+        "gauge missing destination label: {gauge_line}"
+    );
+
+    // With readiness_include_webhooks = true and an unreachable destination,
+    // /readyz must report not-ready (503).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = http_get(port, "/readyz").expect("/readyz request failed");
+        if response.starts_with("HTTP/1.1 503") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/readyz never returned 503 for unhealthy webhook destination: {response}"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+}

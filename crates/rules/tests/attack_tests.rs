@@ -20,7 +20,10 @@ fn dummy_tx(hash: &str, successful: bool, fee_charged: Option<&str>) -> HorizonT
         envelope_xdr: None,
         result_xdr: None,
         source_account: None,
+        source_account_muxed: None,
+        source_account_muxed_id: None,
         fee_account: None,
+        fee_account_muxed: None,
         ledger: None,
         memo: None,
         memo_type: None,
@@ -89,6 +92,90 @@ fn test_attack_case_spoofing_admin_function() {
         payloads.len(),
         1,
         "AdminFunctionCalled must catch case variations of sensitive functions"
+    );
+}
+
+#[test]
+fn test_admin_function_called_label_preserves_configured_case() {
+    // Issue #396: the alert label must show the configured function name with
+    // its original casing, even though matching is case-insensitive.
+    let raw = dummy_tx("admin_label_tx", true, None);
+    let enriched =
+        EnrichedTransaction::from_horizon(raw, vec!["setAdmin".into()], None, None).unwrap();
+
+    let rules = vec![RuleConfig {
+        rule: AlertRule::AdminFunctionCalled {
+            function_names: vec!["setAdmin".into()],
+        },
+        cooldown_seconds: None,
+        cooldown_summary: false,
+    }];
+    let payloads = evaluate(&test_ctx(), &rules, &enriched, None);
+    assert_eq!(payloads.len(), 1, "mixed-case function must still match");
+
+    let label = &payloads[0].rule_triggered;
+    assert!(
+        label.contains("setAdmin"),
+        "label must preserve configured casing, got {label:?}"
+    );
+    assert!(
+        !label.contains("setadmin"),
+        "label must not lowercase the configured name, got {label:?}"
+    );
+}
+
+#[test]
+fn test_source_account_muxed_matches_muxed_entry() {
+    // Issue #398: an `M…` entry must match the muxed source account, while
+    // Horizon reports the base `G…` account in `source_account`.
+    let muxed = "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK";
+    let base = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ";
+
+    let mut raw = dummy_tx("muxed_tx", true, None);
+    raw.source_account = Some(base.into());
+    raw.source_account_muxed = Some(muxed.into());
+    raw.source_account_muxed_id = Some("1234".into());
+    let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+
+    let muxed_rules = vec![RuleConfig {
+        rule: AlertRule::SourceAccount {
+            accounts: vec![muxed.into()],
+        },
+        cooldown_seconds: None,
+        cooldown_summary: false,
+    }];
+    assert_eq!(
+        evaluate(&test_ctx(), &muxed_rules, &enriched, None).len(),
+        1,
+        "M… entry must match the muxed source account"
+    );
+
+    let base_rules = vec![RuleConfig {
+        rule: AlertRule::SourceAccount {
+            accounts: vec![base.into()],
+        },
+        cooldown_seconds: None,
+        cooldown_summary: false,
+    }];
+    assert_eq!(
+        evaluate(&test_ctx(), &base_rules, &enriched, None).len(),
+        1,
+        "G… entry must match the base source account"
+    );
+
+    let other_rules = vec![RuleConfig {
+        rule: AlertRule::SourceAccount {
+            accounts: vec![
+                "MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK"
+                    .replace("MA7Q", "MB7Q"),
+            ],
+        },
+        cooldown_seconds: None,
+        cooldown_summary: false,
+    }];
+    assert!(
+        evaluate(&test_ctx(), &other_rules, &enriched, None).is_empty(),
+        "a different muxed address must not match"
     );
 }
 

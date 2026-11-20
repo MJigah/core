@@ -122,6 +122,31 @@ impl PollHealth {
         self.webhook_unhealthy
     }
 
+    /// Whether any webhook receiver is currently considered unhealthy.
+    ///
+    /// Used by the readiness handler when `readiness_include_webhooks` is
+    /// enabled, so a persistent delivery outage can fail `/readyz` instead of
+    /// staying green while every alert is dropped.
+    pub(crate) fn any_webhook_unhealthy<'a, I>(healths: I) -> bool
+    where
+        I: IntoIterator<Item = &'a PollHealth>,
+    {
+        healths.into_iter().any(PollHealth::webhook_unhealthy)
+    }
+
+    /// Contract IDs whose webhook receivers are currently unhealthy, for
+    /// exposing `txwatch_webhook_destination_unhealthy{contract,destination}`.
+    pub(crate) fn unhealthy_webhook_contracts<'a, I>(healths: I) -> Vec<&'a str>
+    where
+        I: IntoIterator<Item = (&'a str, &'a PollHealth)>,
+    {
+        healths
+            .into_iter()
+            .filter(|(_, health)| health.webhook_unhealthy())
+            .map(|(contract_id, _)| contract_id)
+            .collect()
+    }
+
     /// Time since the last successful poll, or `None` if there has been none.
     pub(crate) fn since_last_success(&self) -> Option<Duration> {
         self.last_success.map(|t| t.elapsed())
@@ -279,6 +304,30 @@ mod tests {
         assert!(!health.record_webhook_outcome(0));
         assert!(!health.webhook_unhealthy());
         assert_eq!(health.consecutive_webhook_failures(), 0);
+    }
+
+    #[test]
+    fn unhealthy_webhook_contracts_are_listed() {
+        let mut healthy = PollHealth::default();
+        let mut unhealthy = PollHealth::default();
+        for _ in 0..WEBHOOK_UNHEALTHY_THRESHOLD {
+            unhealthy.record_webhook_outcome(1);
+        }
+        healthy.record_webhook_outcome(0);
+        assert!(unhealthy.webhook_unhealthy());
+
+        let healths = [("A", &healthy), ("B", &unhealthy)];
+        assert!(PollHealth::any_webhook_unhealthy(healths.iter().map(|(_, h)| *h)));
+        assert_eq!(
+            PollHealth::unhealthy_webhook_contracts(healths.iter().copied()),
+            vec!["B"]
+        );
+
+        let all_healthy = [("A", &healthy)];
+        assert!(!PollHealth::any_webhook_unhealthy(
+            all_healthy.iter().map(|(_, h)| *h)
+        ));
+        assert!(PollHealth::unhealthy_webhook_contracts(all_healthy.iter().copied()).is_empty());
     }
 
     #[test]
