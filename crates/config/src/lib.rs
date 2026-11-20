@@ -1841,16 +1841,11 @@ impl fmt::Debug for WebhookDestination {
 impl WebhookDestination {
     /// Whether an alert with this severity and rule type passes the
     /// destination's `min_severity` and `rule_types` filters.
-    pub fn accepts(&self, severity: Option<&str>, rule_type: &str) -> bool {
+    pub fn accepts(&self, severity: Option<&Severity>, rule_type: &str) -> bool {
         if let Some(min) = &self.min_severity {
-            let severity = match severity {
-                Some("info") => Severity::Info,
-                Some("warning") => Severity::Warning,
-                Some("critical") => Severity::Critical,
+            match severity {
+                Some(sev) if sev >= min => {}
                 _ => return false,
-            };
-            if severity < *min {
-                return false;
             }
         }
         self.rule_types.is_empty() || self.rule_types.iter().any(|t| t == rule_type)
@@ -4963,11 +4958,11 @@ mod tests {
         )
         .unwrap();
         let d = cfg.contracts[0].destinations();
-        assert!(d[0].accepts(Some("critical"), "AnyTransaction"));
-        assert!(!d[0].accepts(Some("warning"), "AnyTransaction"));
+        assert!(d[0].accepts(Some(&Severity::Critical), "AnyTransaction"));
+        assert!(!d[0].accepts(Some(&Severity::Warning), "AnyTransaction"));
         assert!(!d[0].accepts(None, "AnyTransaction"));
         assert!(d[1].accepts(None, "LargeTransfer"));
-        assert!(!d[1].accepts(Some("critical"), "AnyTransaction"));
+        assert!(!d[1].accepts(Some(&Severity::Critical), "AnyTransaction"));
 
         let err = parse_err(
             r#"
