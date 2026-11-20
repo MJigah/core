@@ -1577,6 +1577,7 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     error = %error,
                     "failed to fetch a later page; continuing from the saved cursor next cycle"
                 );
+                state.backlogged = true;
                 break;
             }
             Err(error) if pages_fetched == 0 => return Err(error),
