@@ -2158,6 +2158,171 @@ async fn long_retry_after_does_not_block_shutdown() {
     let _ = std::fs::remove_file(&cursor_file);
 }
 
+/// Issue #490: crash-restart harness. Runs `run_with_reload` against wiremock
+/// with several contracts, aborts the task without a shutdown signal, then
+/// restarts from the same state file and asserts that no transaction is
+/// skipped and none is double-alerted.
+#[tokio::test]
+async fn crash_restart_does_not_skip_or_double_alert() {
+    use std::collections::HashSet;
+
+    const CONTRACTS: usize = 3;
+
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // Each contract sees its own transaction; the paging token is the tx hash
+    // so the state file records exactly which transactions were processed.
+    let mut contracts = Vec::new();
+    for i in 0..CONTRACTS {
+        let hash = format!("crash_tx_{i}");
+        Mock::given(method("GET"))
+            .and(path_regex(format!("/accounts/.*/transactions")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page(
+                &hash,
+                &hash,
+                true,
+            )))
+            .up_to_n_times(1)
+            .mount(&horizon)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/transactions/{hash}/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+            .mount(&horizon)
+            .await;
+
+        let mut contract = helpers::contract(
+            &format!("{}/hook", receiver.uri()),
+            vec![AlertRule::AnyTransaction],
+        );
+        contract.label = format!("crash-{i}");
+        contract.contract_id = format!("C{:0>55}", format!("{:X}", i + 1));
+        contract.horizon_base_url_override = Some(horizon.uri());
+        contracts.push(contract);
+    }
+
+    // Subsequent polls return empty pages.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let state_file = std::env::temp_dir().join(format!(
+        "txwatch_crash_restart_{}_{}.json",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&state_file);
+
+    let make_cfg = |contracts: Vec<_>| AppConfig {
+        poll_interval_seconds: 1,
+        contracts,
+        cursor_file: None,
+        state_file: Some(state_file.display().to_string()),
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
+    };
+
+    // First run: start the poller and abort it as soon as every contract has
+    // been polled at least once. No shutdown signal is sent, so this models a
+    // crash.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (_reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+    let run = tokio::spawn(txwatch_poller::run_with_reload(
+        make_cfg(contracts.clone()),
+        true,
+        shutdown_rx,
+        reload_rx,
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let polls = horizon
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/transactions"))
+            .count();
+        if polls >= CONTRACTS {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "poller did not poll all contracts before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    run.abort();
+    let _ = run.await;
+    drop(shutdown_tx);
+
+    // The state file must have been written before the abort so the restart
+    // can resume from it.
+    let raw = std::fs::read_to_string(&state_file).expect("state file written before crash");
+    let state: serde_json::Value = serde_json::from_str(&raw).expect("state file is JSON");
+    assert!(
+        state.get("version").is_some(),
+        "state file must be versioned, got: {raw}"
+    );
+
+    // Restart from the same state file. The mock now serves empty pages, so
+    // any transaction the poller re-processes would be a double alert.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (_reload_tx, reload_rx) = tokio::sync::mpsc::channel(1);
+    let run = tokio::spawn(txwatch_poller::run_with_reload(
+        make_cfg(contracts.clone()),
+        true,
+        shutdown_rx,
+        reload_rx,
+    ));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    shutdown_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), run).await;
+
+    // Every contract's cursor must have advanced to its served paging token,
+    // so no transaction is skipped on restart.
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+    for contract in &contracts {
+        let key = contract.cursor_key();
+        assert_eq!(
+            persisted[&key],
+            format!("crash_tx_{}", contract.label.trim_start_matches("crash-")),
+            "cursor for {} must be persisted across the crash",
+            contract.label
+        );
+    }
+
+    // No transaction may be alerted twice: each hash appears at most once in
+    // the webhook bodies.
+    let mut seen: HashSet<String> = HashSet::new();
+    for request in receiver.received_requests().await.unwrap() {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        if let Some(hash) = body["tx_hash"].as_str() {
+            assert!(
+                seen.insert(hash.to_string()),
+                "transaction {hash} was alerted more than once across the restart"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
 /// Issue #281: cooldown and `NoActivity` state must survive a restart via the
 /// versioned state file, so `watch --once` (cron) can enforce cooldowns across
 /// runs and a `NoActivity` recovery is still sent after a restart.
@@ -2236,6 +2401,147 @@ async fn state_file_persists_cooldown_and_no_activity_across_restart() {
     // Second run loads the persisted state without error.
     let report = txwatch_poller::run_once(cfg, true).await.unwrap();
     assert_eq!(report.poll_failures, 0);
+
+    let _ = std::fs::remove_file(&state_file);
+}
+
+/// Issue #403: a `NoActivity` incident fires in a cycle with no new
+/// transactions, so the cursor never advances. The `Alerting` state must still
+/// be persisted, otherwise a crash (`kill -9`) forgets the incident: it fires
+/// again and the eventual recovery has no `incident_alert_id` to correlate
+/// with.
+///
+/// The "crash" is simulated by dropping the runtime without ever signalling
+/// shutdown, so no graceful flush runs; only what the poll cycle itself wrote
+/// survives.
+#[tokio::test]
+async fn no_activity_incident_survives_a_crash() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // No transactions, ever: the cursor never advances.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::NoActivity {
+            threshold_minutes: 0,
+            ..Default::default()
+        }],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let state_file = std::env::temp_dir().join(format!(
+        "txwatch_no_activity_crash_{}_{}.json",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&state_file);
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract.clone()],
+        cursor_file: None,
+        state_file: Some(state_file.display().to_string()),
+        http_pool_max_idle_per_host: 10,
+        http_tcp_keepalive_secs: 30,
+        http_connection_verbose: None,
+        max_contracts: None,
+        max_pages_per_cycle: None,
+        readiness_policy: Default::default(),
+        ..Default::default()
+    };
+
+    // Drive the loop inside a dedicated runtime and drop it without any
+    // shutdown signal: this is the simulated crash.
+    let state_file_for_run = state_file.clone();
+    let crash = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_millis(1500),
+                txwatch_poller::run(cfg),
+            )
+            .await;
+        });
+        // Dropping `rt` here aborts the poll loop without a graceful flush.
+        drop(rt);
+        state_file_for_run
+    });
+    let state_file = crash.join().expect("crash thread panicked");
+
+    // The incident must have been persisted even though the cursor never moved.
+    let state = txwatch_poller::load_state(&state_file)
+        .expect("state file must be readable after the crash");
+    let entry = state
+        .contracts
+        .get(&contract.cursor_key())
+        .unwrap_or_else(|| {
+            panic!(
+                "no persisted state for {}; state file: {}",
+                contract.cursor_key(),
+                std::fs::read_to_string(&state_file).unwrap_or_default()
+            )
+        });
+    let no_activity = entry
+        .no_activity
+        .as_ref()
+        .expect("NoActivity state must be persisted after the crash");
+    assert!(
+        no_activity.alerting,
+        "the NoActivity incident must still be in the Alerting state after the crash"
+    );
+    let incident_id = no_activity
+        .incident_alert_id
+        .clone()
+        .expect("the incident must carry an alert id so the recovery can correlate");
+
+    // A subsequent run must not re-fire the same incident.
+    let report = txwatch_poller::run_once(
+        AppConfig {
+            poll_interval_seconds: 3600,
+            contracts: vec![contract.clone()],
+            cursor_file: None,
+            state_file: Some(state_file.display().to_string()),
+            http_pool_max_idle_per_host: 10,
+            http_tcp_keepalive_secs: 30,
+            http_connection_verbose: None,
+            max_contracts: None,
+            max_pages_per_cycle: None,
+            readiness_policy: Default::default(),
+            ..Default::default()
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.poll_failures, 0);
+
+    let state = txwatch_poller::load_state(&state_file).expect("state file still readable");
+    let entry = state.contracts.get(&contract.cursor_key()).unwrap();
+    let no_activity = entry.no_activity.as_ref().unwrap();
+    assert!(
+        no_activity.alerting,
+        "the incident must remain active, not be re-fired as a new one"
+    );
+    assert_eq!(
+        no_activity.incident_alert_id.as_deref(),
+        Some(incident_id.as_str()),
+        "the incident id must be stable across the restart"
+    );
 
     let _ = std::fs::remove_file(&state_file);
 }

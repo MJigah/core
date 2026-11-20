@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
@@ -1425,6 +1426,54 @@ impl From<AlertRule> for RuleConfig {
     }
 }
 
+/// Templates compiled once per config generation, keyed by destination index
+/// (the position of the destination in the contract's `destinations()` list).
+/// Rendering an alert reuses the compiled environment instead of parsing the
+/// template again for every delivery.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledTemplates {
+    environments: BTreeMap<usize, minijinja::Environment<'static>>,
+}
+
+impl CompiledTemplates {
+    /// Compiles every template destination in `destinations`, recording any
+    /// template that fails to compile. Returns the cache and the errors.
+    pub fn compile(destinations: &[WebhookDestination]) -> (Self, Vec<String>) {
+        let mut environments = BTreeMap::new();
+        let mut errors = Vec::new();
+        for (index, destination) in destinations.iter().enumerate() {
+            if destination.format != WebhookFormat::Template {
+                continue;
+            }
+            let Some(source) = destination.template.as_deref() else {
+                continue;
+            };
+            let mut env = minijinja::Environment::new();
+            match env.add_template_owned("body", source.to_owned()) {
+                Ok(()) => {
+                    environments.insert(index, env);
+                }
+                Err(e) => errors.push(format!("webhooks[{}].template is invalid: {}", index, e)),
+            }
+        }
+        (Self { environments }, errors)
+    }
+
+    /// The compiled environment for the destination at `index`, if it has one.
+    pub fn get(&self, index: usize) -> Option<&minijinja::Environment<'static>> {
+        self.environments.get(&index)
+    }
+
+    /// Number of cached templates.
+    pub fn len(&self) -> usize {
+        self.environments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.environments.is_empty()
+    }
+}
+
 impl AsRef<AlertRule> for AlertRule {
     fn as_ref(&self) -> &AlertRule {
         self
@@ -1450,6 +1499,7 @@ pub const REDACTED: &str = "<redacted>";
 
 /// Body shape sent to a webhook destination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookFormat {
     /// TxWatch's own alert JSON.
@@ -1477,6 +1527,36 @@ impl WebhookFormat {
             WebhookFormat::Teams => "teams",
             WebhookFormat::Template => "template",
         }
+    }
+
+    /// Every format, in declaration order. Used to build CLI help text and
+    /// error messages so new variants are never left out.
+    pub const ALL: &'static [WebhookFormat] = &[
+        WebhookFormat::Txwatch,
+        WebhookFormat::Slack,
+        WebhookFormat::Discord,
+        WebhookFormat::Pagerduty,
+        WebhookFormat::Teams,
+        WebhookFormat::Template,
+    ];
+
+    /// `txwatch, slack, discord, pagerduty, teams, template` — the accepted
+    /// `--format` values, generated from [`WebhookFormat::ALL`].
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|format| format.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parses a format name (case-insensitive), returning `None` when unknown.
+    pub fn from_name(name: &str) -> Option<WebhookFormat> {
+        let name = name.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.as_str().eq_ignore_ascii_case(name))
     }
 }
 
@@ -1529,6 +1609,45 @@ fn is_reserved_header(name: &str) -> bool {
     ) || name.starts_with("x-txwatch-")
 }
 
+/// Checks that `value` is a syntactically valid media type such as
+/// `application/json` or `text/plain; charset=utf-8`; returns a description of
+/// the problem otherwise.
+pub fn check_media_type(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return Some("must not be blank".to_owned());
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Some("must not contain control characters".to_owned());
+    }
+    let essence = value.split(';').next().unwrap_or("").trim();
+    let (type_, subtype) = match essence.split_once('/') {
+        Some((t, s)) => (t.trim(), s.trim()),
+        None => {
+            return Some(format!(
+                "{:?} is not a valid media type (expected type/subtype, e.g. application/json)",
+                value
+            ))
+        }
+    };
+    if type_.is_empty() || subtype.is_empty() {
+        return Some(format!(
+            "{:?} is not a valid media type (expected type/subtype, e.g. application/json)",
+            value
+        ));
+    }
+    if !type_.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        || !subtype
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    {
+        return Some(format!(
+            "{:?} is not a valid media type (type and subtype must be RFC 9110 tokens)",
+            value
+        ));
+    }
+    None
+}
+
 /// RFC 9110 token: the characters allowed in a header name.
 fn is_header_name(name: &str) -> bool {
     !name.is_empty()
@@ -1572,6 +1691,11 @@ pub struct WebhookDestination {
     /// Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_file: Option<String>,
+    /// `Content-Type` sent with the body for `format = "template"`, e.g.
+    /// `application/x-www-form-urlencoded`, `text/plain` or `application/xml`.
+    /// Defaults to `application/json`. Only valid with `format = "template"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// PEM client certificate for mutual TLS; requires `client_key`.
     /// Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1593,6 +1717,46 @@ pub struct WebhookDestination {
     pub rule_types: Vec<String>,
 }
 
+/// Reads and parses a PEM file, returning a short description of the problem
+/// (never the file contents) when it cannot be read or parsed.
+fn check_pem_file(path: &str, kind: &str) -> Option<String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(format!("cannot be read: {}", e)),
+    };
+    if bytes.is_empty() {
+        return Some("is empty".to_owned());
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return Some("is not valid UTF-8 PEM text".to_owned()),
+    };
+    let begin = format!("-----BEGIN {}-----", kind);
+    let end = format!("-----END {}-----", kind);
+    if !text.contains(&begin) || !text.contains(&end) {
+        return Some(format!("does not contain a {} PEM block", kind));
+    }
+    None
+}
+
+/// Warns (on Unix) when a private key file is readable by group or others.
+fn key_permission_warning(path: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Some(format!(
+                "is accessible by group or others (mode {:04o}); consider chmod 600",
+                mode & 0o777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
+}
+
 impl fmt::Debug for WebhookDestination {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebhookDestination")
@@ -1603,6 +1767,7 @@ impl fmt::Debug for WebhookDestination {
             .field("routing_key", &self.routing_key.as_ref().map(|_| REDACTED))
             .field("template", &self.template)
             .field("template_file", &self.template_file)
+            .field("content_type", &self.content_type)
             .field("client_cert", &self.client_cert)
             .field("client_key", &self.client_key)
             .field("ca_cert", &self.ca_cert)
@@ -1633,6 +1798,23 @@ impl WebhookDestination {
     /// Whether this destination needs its own TLS client.
     pub fn has_tls_config(&self) -> bool {
         self.client_cert.is_some() || self.client_key.is_some() || self.ca_cert.is_some()
+    }
+
+    /// `Content-Type` sent with the body: the configured `content_type` for
+    /// `format = "template"`, otherwise `application/json`.
+    pub fn content_type(&self) -> &str {
+        match (self.format, self.content_type.as_deref()) {
+            (WebhookFormat::Template, Some(content_type)) => content_type,
+            _ => "application/json",
+        }
+    }
+
+    /// Whether the template body should be rendered with JSON auto-escaping,
+    /// i.e. the destination sends `application/json`.
+    pub fn template_json_escape(&self) -> bool {
+        let essence = self.content_type().split(';').next().unwrap_or("").trim();
+        essence.eq_ignore_ascii_case("application/json")
+            || essence.to_ascii_lowercase().ends_with("+json")
     }
 
     /// Validates a stand-alone destination (e.g. one built from CLI flags).
@@ -1710,8 +1892,15 @@ impl WebhookDestination {
             )),
             (WebhookFormat::Template, Some(template)) => {
                 let mut env = minijinja::Environment::new();
-                if let Err(e) = env.add_template("body", template) {
-                    problems.push(format!("{} is invalid: {}", field("template"), e));
+                match env.add_template("body", template) {
+                    Err(e) => {
+                        problems.push(format!("{} is invalid: {}", field("template"), e));
+                    }
+                    Ok(_) => {
+                        if let Err(e) = check_template_renders(template) {
+                            problems.push(format!("{} {}", field("template"), e));
+                        }
+                    }
                 }
             }
             (_, Some(_)) => problems.push(format!(
@@ -1720,12 +1909,41 @@ impl WebhookDestination {
             )),
             _ => {}
         }
+        match (self.format, &self.content_type) {
+            (WebhookFormat::Template, Some(content_type)) => {
+                if let Some(problem) = check_media_type(content_type) {
+                    problems.push(format!("{} {}", field("content_type"), problem));
+                }
+            }
+            (WebhookFormat::Template, None) => {}
+            (_, Some(_)) => problems.push(format!(
+                "{} is only used when format is \"template\"",
+                field("content_type")
+            )),
+        }
         if self.client_cert.is_some() != self.client_key.is_some() {
             problems.push(format!(
                 "{} and {} must be set together",
                 field("client_cert"),
                 field("client_key")
             ));
+        }
+        if let Some(cert) = &self.client_cert {
+            if let Some(problem) = check_pem_file(cert, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("client_cert"), problem));
+            }
+        }
+        if let Some(key) = &self.client_key {
+            if let Some(problem) = check_pem_file(key, "PRIVATE KEY") {
+                problems.push(format!("{} {}", field("client_key"), problem));
+            } else if let Some(warning) = key_permission_warning(key) {
+                problems.push(format!("{} {}", field("client_key"), warning));
+            }
+        }
+        if let Some(ca) = &self.ca_cert {
+            if let Some(problem) = check_pem_file(ca, "CERTIFICATE") {
+                problems.push(format!("{} {}", field("ca_cert"), problem));
+            }
         }
         if self.has_tls_config() && !self.url.starts_with("https://") {
             problems.push(format!(
@@ -1829,6 +2047,72 @@ impl fmt::Display for ValidationErrors {
 }
 
 impl std::error::Error for ValidationErrors {}
+
+/// Renders `template` against a synthetic payload for every rule type, so a
+/// template that references an optional field (absent for e.g. `NoActivity`)
+/// fails at config load instead of at delivery time.
+fn check_template_renders(template: &str) -> std::result::Result<(), String> {
+    let mut env = minijinja::Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+    env.add_template("body", template)
+        .map_err(|e| format!("is invalid: {}", e))?;
+    let tmpl = env
+        .get_template("body")
+        .map_err(|e| format!("is invalid: {}", e))?;
+    for rule_type in SYNTHETIC_RULE_TYPES {
+        let payload = synthetic_payload(rule_type);
+        tmpl.render(&payload)
+            .map_err(|e| format!("fails to render for {} alerts: {}", rule_type, e))?;
+    }
+    Ok(())
+}
+
+/// Rule types a synthetic payload is rendered for.
+const SYNTHETIC_RULE_TYPES: &[&str] = &[
+    "AnyTransaction",
+    "TransactionFailed",
+    "LargeTransfer",
+    "FunctionCalled",
+    "AdminFunctionCalled",
+    "HighFee",
+    "SourceAccount",
+    "All",
+    "Any",
+    "Not",
+    "NoActivity",
+    "EventEmitted",
+    "ContractUpgraded",
+    "Rate",
+    "Memo",
+];
+
+/// A payload with every optional field present (as `null` where the real
+/// payload would omit it), so templates referencing them still render.
+fn synthetic_payload(rule_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "rule_type": rule_type,
+        "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        "label": "synthetic",
+        "network": "testnet",
+        "tx_hash": "0".repeat(64),
+        "source_account": null,
+        "severity": null,
+        "memo": null,
+        "ledger": null,
+        "fee_account": null,
+        "old_wasm_hash": null,
+        "new_wasm_hash": null,
+        "function_name": null,
+        "amount": null,
+        "asset": null,
+        "topic": null,
+        "topics": [],
+        "data": null,
+        "suppressed_count": 0,
+        "timestamp": "1970-01-01T00:00:00Z",
+        "explorer_url": null,
+    })
+}
 
 /// Checks that `value` is an http(s) URL with a host; returns a description
 /// of the problem otherwise.
@@ -2601,11 +2885,16 @@ impl AppConfig {
         let mut cfg: AppConfig = deserialize_toml_with_field_context(raw, source)
             .with_context(|| format!("failed to parse config file '{}'", source.display()))?;
 
-        let mut visited = std::collections::HashSet::new();
+        // `loaded` holds every file already read (so diamond-shaped includes
+        // load a shared file once), while `stack` holds the chain of files
+        // currently being resolved (so only a real cycle is reported).
+        let mut loaded = std::collections::HashSet::new();
+        let mut stack = Vec::new();
         let canon = source
             .canonicalize()
             .unwrap_or_else(|_| source.to_path_buf());
-        visited.insert(canon);
+        loaded.insert(canon.clone());
+        stack.push(canon);
         cfg.loaded_files.push(source.to_path_buf());
 
         for c in &cfg.contracts {
@@ -2614,17 +2903,25 @@ impl AppConfig {
         }
 
         let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
-        cfg.resolve_includes(base_dir, &mut visited)?;
+        cfg.resolve_includes(base_dir, &mut loaded, &mut stack)?;
 
         cfg.resolve_env_vars()?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Resolves `include` patterns relative to `base_dir`.
+    ///
+    /// `loaded` records every file already read so a file reached through two
+    /// different include paths (a diamond, e.g. `a` includes `b` and `c`, both
+    /// of which include `shared`) is loaded exactly once. `stack` records the
+    /// chain of files currently being resolved; only a file that is already on
+    /// that chain is a genuine circular include.
     fn resolve_includes(
         &mut self,
         base_dir: &Path,
-        visited: &mut std::collections::HashSet<PathBuf>,
+        loaded: &mut std::collections::HashSet<PathBuf>,
+        stack: &mut Vec<PathBuf>,
     ) -> Result<()> {
         if self.include.is_empty() {
             return Ok(());
@@ -2674,8 +2971,26 @@ impl AppConfig {
             let canonical = included_path
                 .canonicalize()
                 .unwrap_or_else(|_| included_path.clone());
-            if !visited.insert(canonical) {
-                bail!("circular include detected: '{}'", included_path.display());
+
+            // A file already on the current include chain is a real cycle.
+            if stack.contains(&canonical) {
+                let chain = stack
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .chain(std::iter::once(included_path.display().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                bail!(
+                    "circular include detected: '{}' (include chain: {})",
+                    included_path.display(),
+                    chain
+                );
+            }
+
+            // A file already loaded elsewhere in the tree (diamond include) is
+            // skipped: its contracts were already added once.
+            if !loaded.insert(canonical.clone()) {
+                continue;
             }
 
             let raw = fs::read_to_string(&included_path).with_context(|| {
@@ -2701,7 +3016,10 @@ impl AppConfig {
                     include: included.include,
                     ..Default::default()
                 };
-                sub_cfg.resolve_includes(sub_base, visited)?;
+                stack.push(canonical);
+                let result = sub_cfg.resolve_includes(sub_base, loaded, stack);
+                stack.pop();
+                result?;
                 self.loaded_files.extend(sub_cfg.loaded_files);
                 self.contract_files.extend(sub_cfg.contract_files);
                 self.contracts.extend(sub_cfg.contracts);
@@ -4878,6 +5196,127 @@ mod tests {
             validate_contract_id(&mistyped),
             Err(ContractIdError::Checksum { .. })
         ));
+    }
+
+    #[test]
+    fn template_referencing_optional_field_is_rejected_at_load() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ source_account }}".into()),
+            ..Default::default()
+        }];
+        // The synthetic payload provides `source_account` as null, so a plain
+        // reference renders; a missing field still fails.
+        assert!(c.validate().is_ok());
+
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{{ definitely_not_a_field }}".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].template"), "got: {}", err);
+    }
+
+    #[test]
+    fn missing_client_cert_file_is_reported_with_field_path() {
+        let mut c = valid_contract();
+        c.webhooks = vec![WebhookDestination {
+            url: "https://example.com/hook".into(),
+            client_cert: Some("/nonexistent/txwatch-cert.pem".into()),
+            client_key: Some("/nonexistent/txwatch-key.pem".into()),
+            ..Default::default()
+        }];
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("webhooks[0].client_cert"), "got: {}", err);
+        assert!(err.contains("webhooks[0].client_key"), "got: {}", err);
+    fn content_type_is_optional_and_only_valid_with_template_format() {
+        let mut destination = WebhookDestination {
+            url: "https://example.com/hook".into(),
+            format: WebhookFormat::Template,
+            template: Some("{\"text\": {{ alert | tojson }}}".into()),
+            ..Default::default()
+        };
+        assert_eq!(destination.content_type(), "application/json");
+        assert!(destination.template_json_escape());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("application/x-www-form-urlencoded".into());
+        assert_eq!(
+            destination.content_type(),
+            "application/x-www-form-urlencoded"
+        );
+        assert!(!destination.template_json_escape());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("text/plain; charset=utf-8".into());
+        assert!(destination.validate().is_ok());
+
+        destination.content_type = Some("not-a-media-type".into());
+        let err = destination.validate().unwrap_err().to_string();
+        assert!(err.contains("content_type"), "got: {}", err);
+
+        destination.content_type = Some("  ".into());
+        assert!(destination.validate().is_err());
+
+        destination.content_type = Some("text/plain\r\nX-Evil: 1".into());
+        assert!(destination.validate().is_err());
+
+        let mut non_template = WebhookDestination {
+            url: "https://example.com/hook".into(),
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        let err = non_template.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("only used when format is \"template\""),
+            "got: {}",
+            err
+        );
+        non_template.content_type = None;
+        assert!(non_template.validate().is_ok());
+    }
+
+    #[test]
+    fn compiled_templates_are_cached_per_destination() {
+        let destinations = vec![
+            WebhookDestination {
+                url: "https://example.com/a".into(),
+                format: WebhookFormat::Template,
+                template: Some("{\"text\": {{ alert | tojson }}}".into()),
+                ..Default::default()
+            },
+            WebhookDestination {
+                url: "https://example.com/b".into(),
+                ..Default::default()
+            },
+            WebhookDestination {
+                url: "https://example.com/c".into(),
+                format: WebhookFormat::Template,
+                template: Some("{{ alert | tojson }}".into()),
+                ..Default::default()
+            },
+        ];
+        let (compiled, errors) = CompiledTemplates::compile(&destinations);
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(compiled.len(), 2);
+        assert!(compiled.get(0).is_some());
+        assert!(compiled.get(1).is_none());
+        assert!(compiled.get(2).is_some());
+
+        let broken = vec![WebhookDestination {
+            url: "https://example.com/d".into(),
+            format: WebhookFormat::Template,
+            template: Some("{% if %}".into()),
+            ..Default::default()
+        }];
+        let (compiled, errors) = CompiledTemplates::compile(&broken);
+        assert!(compiled.is_empty());
+        assert_eq!(errors.len(), 1);
     }
 
     #[test]

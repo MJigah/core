@@ -334,6 +334,66 @@ async fn test_rule_webhook_override_replaces_destinations_shorthand() {
     override_server.verify().await;
 }
 
+/// Templates that reference optional fields (which are omitted from the
+/// serialized payload via `skip_serializing_if`) must still render for alert
+/// kinds where those fields are absent, such as `NoActivity` and
+/// cooldown-summary alerts. Otherwise those alerts are never delivered.
+#[test]
+fn test_template_optional_fields_render_for_no_activity_and_cooldown() {
+    let template = "{{ source_account }} {{ severity }} {{ memo }} {{ ledger }} {{ fee_account }} {{ old_wasm_hash }}";
+
+    let mut no_activity = test_payload("NoActivity");
+    no_activity.source_account = None;
+    no_activity.severity = None;
+    no_activity.memo = None;
+    no_activity.ledger = None;
+    no_activity.fee_account = None;
+    no_activity.old_wasm_hash = None;
+
+    let rendered = txwatch_notifier::format::render_template(template, &no_activity);
+    assert!(
+        rendered.is_ok(),
+        "template referencing optional fields must render for NoActivity, got: {rendered:?}"
+    );
+
+    let mut cooldown = test_payload("CooldownSummary");
+    cooldown.source_account = None;
+    cooldown.severity = None;
+    cooldown.memo = None;
+    cooldown.ledger = None;
+    cooldown.fee_account = None;
+    cooldown.old_wasm_hash = None;
+
+    let rendered = txwatch_notifier::format::render_template(template, &cooldown);
+    assert!(
+        rendered.is_ok(),
+        "template referencing optional fields must render for cooldown summary, got: {rendered:?}"
+    );
+}
+
+/// Config validation must reject a template that fails to render against any
+/// synthetic rule-type payload, so broken templates are caught at load time
+/// rather than at delivery time.
+#[test]
+fn test_template_validation_rejects_unrenderable_template() {
+    // A syntactically valid template that references a field absent from every
+    // synthetic payload must be rejected by load-time validation.
+    let template = "{{ this_field_does_not_exist_anywhere }}";
+    let result = txwatch_notifier::format::validate_template(template);
+    assert!(
+        result.is_err(),
+        "validation must reject a template that cannot render against synthetic payloads"
+    );
+
+    // A template referencing only optional fields must be accepted.
+    let template = "{{ source_account }} {{ severity }} {{ memo }}";
+    let result = txwatch_notifier::format::validate_template(template);
+    assert!(
+        result.is_ok(),
+        "validation must accept a template referencing optional fields, got: {result:?}"
+    );
+}
+
 /// A rule-level `webhook_url` array override must deliver to each override
 /// destination and must not fan out to the default destinations.
 #[tokio::test]
@@ -378,4 +438,319 @@ async fn test_rule_webhook_override_replaces_destinations_array() {
     first_server.verify().await;
     second_server.verify().await;
     default_server.verify().await;
+}
+
+/// PagerDuty Events API v2 rejects `payload.summary` longer than 1024
+/// characters. A composite rule with a huge account list must be truncated
+/// (with an ellipsis) rather than rejected, and `source` / `custom_details`
+/// must be capped as well.
+#[test]
+fn test_pagerduty_oversized_label_is_truncated() {
+    let mut payload = test_payload("SourceAccount");
+    let huge_label = format!(
+        "SourceAccount(Any({}))",
+        (0..200)
+            .map(|i| format!("G{:055}", i))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    payload.label = huge_label;
+
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
+
+    let summary = value["payload"]["summary"]
+        .as_str()
+        .expect("summary must be a string");
+    assert!(
+        summary.chars().count() <= 1024,
+        "summary must be capped at 1024 characters, got {}",
+        summary.chars().count()
+    );
+    assert!(
+        summary.ends_with('…'),
+        "truncated summary must end with an ellipsis, got: {summary}"
+    );
+
+    let source = value["payload"]["source"]
+        .as_str()
+        .expect("source must be a string");
+    assert!(
+        source.chars().count() <= 1024,
+        "source must be capped, got {} characters",
+        source.chars().count()
+    );
+
+    let custom_details = value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+    let details_len: usize = custom_details
+        .iter()
+        .map(|(k, v)| k.chars().count() + v.to_string().chars().count())
+        .sum();
+    assert!(
+        details_len <= 8192,
+        "custom_details must be capped, got {details_len} characters"
+    );
+}
+
+/// Snapshot test: a fully populated payload must surface all alert context in
+/// `custom_details` (so responders see it) and must omit `null` fields.
+#[test]
+fn test_pagerduty_custom_details_snapshot() {
+    let mut payload = test_payload("LargeTransfer");
+    payload.alert_id = "alert-123".to_string();
+    payload.rule_type = "LargeTransfer".to_string();
+    payload.severity = Some("critical".to_string());
+    payload.source_account = Some("GSOURCE".to_string());
+    payload.fee_account = Some("GFEE".to_string());
+    payload.memo = Some("memo-text".to_string());
+    payload.ledger = Some(12345);
+    payload.matched_events = Some(3);
+    payload.suppressed_count = Some(2);
+    payload.observed_count = Some(7);
+    payload.resolved = true;
+    payload.enrichment_incomplete = true;
+
+    let value = txwatch_notifier::format::pagerduty(&payload, "pd-key");
+    let custom_details = value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+
+    for key in [
+        "alert_id",
+        "rule_type",
+        "severity",
+        "source_account",
+        "fee_account",
+        "memo",
+        "ledger",
+        "matched_events",
+        "suppressed_count",
+        "observed_count",
+        "resolved",
+        "enrichment_incomplete",
+    ] {
+        assert!(
+            custom_details.contains_key(key),
+            "custom_details must include {key}, got: {custom_details:?}"
+        );
+    }
+
+    assert_eq!(custom_details["alert_id"], "alert-123");
+    assert_eq!(custom_details["rule_type"], "LargeTransfer");
+    assert_eq!(custom_details["severity"], "critical");
+    assert_eq!(custom_details["source_account"], "GSOURCE");
+    assert_eq!(custom_details["fee_account"], "GFEE");
+    assert_eq!(custom_details["memo"], "memo-text");
+    assert_eq!(custom_details["ledger"], 12345);
+    assert_eq!(custom_details["matched_events"], 3);
+    assert_eq!(custom_details["suppressed_count"], 2);
+    assert_eq!(custom_details["observed_count"], 7);
+    assert_eq!(custom_details["resolved"], true);
+    assert_eq!(custom_details["enrichment_incomplete"], true);
+
+    // Nulls must be skipped.
+    let mut sparse = test_payload("LargeTransfer");
+    sparse.severity = None;
+    sparse.source_account = None;
+    sparse.fee_account = None;
+    sparse.memo = None;
+    sparse.ledger = None;
+    sparse.matched_events = None;
+    sparse.suppressed_count = None;
+    sparse.observed_count = None;
+    let sparse_value = txwatch_notifier::format::pagerduty(&sparse, "pd-key");
+    let sparse_details = sparse_value["payload"]["custom_details"]
+        .as_object()
+        .expect("custom_details must be an object");
+    for key in [
+        "severity",
+        "source_account",
+        "fee_account",
+        "memo",
+        "ledger",
+        "matched_events",
+        "suppressed_count",
+        "observed_count",
+    ] {
+        assert!(
+            !sparse_details.contains_key(key),
+            "custom_details must omit null {key}, got: {sparse_details:?}"
+        );
+    }
+/// Teams Incoming Webhooks / Workflows reject payloads over roughly 28 KB.
+/// A 50-alert digest with long rule labels and long fact values must be
+/// truncated (fact titles/values) and fact-count capped so the rendered body
+/// stays under the limit instead of failing the request.
+#[test]
+fn test_teams_digest_body_stays_under_size_limit() {
+    const TEAMS_LIMIT: usize = 28 * 1024;
+
+    let long_label = "X".repeat(512);
+    let long_value = "Y".repeat(4096);
+
+    let mut payload = test_payload("TeamsDigestSizeLimit");
+    payload.alerts = (0..50)
+        .map(|i| {
+            let mut alert = test_payload(&format!("{long_label}-{i}"));
+            alert.rule_name = Some(format!("{long_label}-{i}"));
+            alert.contract_id = Some(format!("{long_label}-{i}"));
+            alert.message = Some(long_value.clone());
+            alert
+        })
+        .collect();
+
+    let body = txwatch_notifier::format::teams_digest(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams digest body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+    );
+
+    let body = txwatch_notifier::format::teams(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+/// Discord enforces a 6000-character total embed budget and at most 25 fields.
+/// An oversized payload (long label, many matched events, many details) must
+/// be trimmed so the resulting embed stays within both limits.
+#[test]
+fn test_discord_embed_respects_limits() {
+    let mut payload = test_payload("OversizedDiscord");
+    payload.label = Some("L".repeat(2000));
+    payload.rule_triggered = "R".repeat(2000);
+    payload.memo = Some("M".repeat(2000));
+    payload.matched_events = (0..50).map(|i| format!("event-{i}-{}", "x".repeat(100))).collect();
+
+    let value = txwatch_notifier::format::discord(&payload);
+    let embed = &value["embeds"][0];
+
+    let fields = embed["fields"].as_array().expect("embed must have fields");
+    assert!(
+        fields.len() <= 25,
+        "embed must have at most 25 fields, got {}",
+        fields.len()
+    );
+
+    let mut total = 0usize;
+    if let Some(title) = embed["title"].as_str() {
+        total += title.chars().count();
+    }
+    if let Some(desc) = embed["description"].as_str() {
+        total += desc.chars().count();
+    }
+    if let Some(footer) = embed["footer"]["text"].as_str() {
+        total += footer.chars().count();
+    }
+    for field in fields {
+        if let Some(name) = field["name"].as_str() {
+            total += name.chars().count();
+        }
+        if let Some(val) = field["value"].as_str() {
+            total += val.chars().count();
+        }
+    }
+    assert!(
+        total <= 6000,
+        "embed total text must stay under 6000 chars, got {total}"
+    );
+}
+
+/// Memos come from untrusted on-chain senders. Discord markdown in
+/// interpolated values must be escaped so masked links, spoilers and code
+/// fences cannot break formatting or smuggle links into the channel.
+#[test]
+fn test_discord_escapes_markdown_in_memo() {
+    let mut payload = test_payload("MarkdownInjection");
+    payload.memo = Some("[click here](https://evil.example) ||spoiler|| ```fence```".to_string());
+    payload.label = Some("_label_ *bold* ~strike~ > quote".to_string());
+
+    let value = txwatch_notifier::format::discord(&payload);
+    let serialized = value.to_string();
+
+    assert!(
+        !serialized.contains("[click here](https://evil.example)"),
+        "masked link markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        !serialized.contains("||spoiler||"),
+        "spoiler markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        !serialized.contains("```fence```"),
+        "code fence markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        serialized.contains("\\[click here\\]"),
+        "brackets must be backslash-escaped, got: {serialized}"
+    );
+}
+
+/// A Slack digest with many alerts must truncate on line boundaries and never
+/// cut inside `<url|text>` markup, appending a "… and N more" notice.
+#[test]
+fn test_slack_digest_truncates_on_line_boundaries() {
+    let alerts: Vec<txwatch_notifier::Alert> = (0..100)
+        .map(|i| {
+            let mut payload = test_payload("DigestAlert");
+            payload.tx_hash = format!("{i:064x}");
+            payload
+        })
+        .collect();
+
+    let body = txwatch_notifier::format::slack_digest(&alerts);
+    assert!(
+        body.chars().count() <= 3000,
+        "digest must stay within 3000 chars, got {}",
+        body.chars().count()
+    );
+
+    // Every `<` must be matched by a later `>`; no unterminated markup.
+    let mut open = false;
+    for ch in body.chars() {
+        match ch {
+            '<' => {
+                assert!(!open, "nested '<' in digest markup: {body}");
+                open = true;
+            }
+            '>' => {
+                assert!(open, "unmatched '>' in digest markup: {body}");
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    assert!(!open, "digest ended inside unterminated '<…>' markup: {body}");
+    assert!(
+        body.contains("more"),
+        "truncated digest must include a '… and N more' notice, got: {body}"
+    );
+}
+
+/// `send_webhook` must make exactly `MAX_ATTEMPTS` attempts (initial + retries)
+/// and back off between them, matching the documented behavior.
+#[tokio::test]
+async fn test_send_webhook_attempt_count_matches_docs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let url = format!("{}/hook", server.uri());
+    let payload = test_payload("RetryCount");
+    let (_tx, rx) = oneshot::channel();
+
+    let result = send_webhook(&client, &url, &payload, Some("secret"), rx).await;
+    assert!(result.is_err(), "500 flood must exhaust retries");
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        txwatch_notifier::MAX_ATTEMPTS,
+        "send_webhook must make exactly MAX_ATTEMPTS attempts"
+    );
 }

@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AlertBatch",
+  "description": "Batched webhook body containing multiple alerts",
+  "type": "object",
+  "required": [
+    "alerts"
+  ],
+  "properties": {
+    "alerts": {
+      "description": "The alerts contained in this batch",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AlertPayload"
+      }
+    }
+  },
+  "definitions": {
+    "AlertPayload": {
+      "title": "AlertPayload",
+      "description": "A single alert delivered to a webhook receiver",
+      "type": "object",
+      "required": [
+        "id",
+        "rule",
+        "severity",
+        "message",
+        "timestamp"
+      ],
+      "properties": {
+        "id": {
+          "description": "Unique identifier for this alert",
+          "type": "string"
+        },
+        "rule": {
+          "description": "Name of the rule that triggered the alert",
+          "type": "string"
+        },
+        "severity": {
+          "description": "Severity level of the alert",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable alert message",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "Time at which the alert was generated",
+          "type": "string",
+          "format": "date-time"
+        },
+        "labels": {
+          "description": "Additional labels attached to the alert",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

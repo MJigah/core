@@ -5,7 +5,7 @@ The Helm chart in [`deploy/helm/txwatch`](../deploy/helm/txwatch) deploys TxWatc
 | Concern | How the chart handles it |
 |---|---|
 | Config | `values.config` is rendered into a ConfigMap and mounted read-only at `/config/txwatch.toml` (`TXWATCH_CONFIG`). Changing it rolls the pod (config checksum annotation). |
-| Secrets | `secret.values` (or `secret.existingSecret`) is exposed to the container via `envFrom`; reference keys as `${VAR}` in the config, e.g. `webhook_secret = "${WEBHOOK_SECRET}"`. |
+| Secrets | `secret.values` (or `secret.existingSecret`) is exposed to the container via `envFrom`; reference keys as `${VAR}` in the config, e.g. `webhook_secret = "${WEBHOOK_SECRET:-}"`. `${VAR:-}` expands to an empty string when the variable is unset, so the default values start cleanly even without a Secret. |
 | Cursors | A PersistentVolumeClaim is mounted at `/data`; set `cursor_file = "/data/cursors.json"` so restarts resume where they left off. |
 | Readiness | With `metrics.enabled`, `/healthz` is the liveness probe and `/readyz` (200 once a poll has recently succeeded) is the readiness probe. |
 | Single replica | Cursors are per process, so a second replica would send every alert twice. The Deployment is fixed at `replicas: 1` with the `Recreate` strategy, so the old pod is gone before the new one starts. |
@@ -26,6 +26,11 @@ helm install txwatch deploy/helm/txwatch \
 
 Use `secret.create=false` with `secret.existingSecret=<name>` to manage the Secret yourself
 (e.g. with External Secrets or Sealed Secrets).
+
+The default values ship `webhook_secret = "${WEBHOOK_SECRET:-}"` with no Secret, so a bare
+`helm install txwatch deploy/helm/txwatch` starts without crash-looping: an unset
+`WEBHOOK_SECRET` resolves to an empty string rather than a hard error. Set
+`secret.values.WEBHOOK_SECRET` (as above) to actually deliver webhooks.
 
 ## Prometheus Operator
 

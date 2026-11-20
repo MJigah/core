@@ -67,6 +67,13 @@
       },
       "description": "All invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions)."
     },
+    "function_args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "JSON-encoded arguments of the first invoked Soroban function, in call order. Empty when unavailable or for non-Soroban transactions."
+    },
     "amount_xlm": {
       "type": ["integer", "null"],
       "format": "uint64",
@@ -88,6 +95,10 @@
       "format": "uint64",
       "minimum": 0,
       "description": "Fee charged for the transaction in stroops."
+    },
+    "fee_account": {
+      "type": ["string", "null"],
+      "description": "The G-address that paid the transaction fee, when it differs from the source account (fee-bump transactions)."
     },
     "source_account": {
       "type": "string",
@@ -137,6 +148,20 @@
       "format": "uint32",
       "minimum": 0,
       "description": "Total number of operations in the transaction."
+    },
+    "old_wasm_hash": {
+      "type": ["string", "null"],
+      "description": "For ContractUpgraded alerts, the previous WASM hash of the contract, or null when unknown."
+    },
+    "new_wasm_hash": {
+      "type": ["string", "null"],
+      "description": "For ContractUpgraded alerts, the new WASM hash the contract was upgraded to."
+    },
+    "observed_count": {
+      "type": ["integer", "null"],
+      "format": "uint64",
+      "minimum": 0,
+      "description": "For threshold/count-based rules (e.g. HighFee, EventEmitted count rules), the observed count that triggered the alert."
     },
     "resolved": {
       "type": "boolean",

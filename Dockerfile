@@ -46,12 +46,18 @@ ENV TXWATCH_CONFIG=/config/txwatch.toml
 USER txwatch
 WORKDIR /data
 
-# The default image is built with `--features metrics`, so /healthz is served
-# once the process runs as `watch --metrics-addr ...` (e.g. 0.0.0.0:9090).
-# busybox wget ships with alpine, so no extra package is needed. Images built
-# with `--build-arg FEATURES=` (no metrics) never listen on 9090 and will
-# report unhealthy; override or disable the check for those.
+# The default image is built with `--features metrics`, and the default CMD
+# below runs `watch --metrics-addr 0.0.0.0:9090`, so /healthz is served on
+# 127.0.0.1:9090 and this check passes. busybox wget ships with alpine, so no
+# extra package is needed. If you override the command (e.g.
+# `docker run <image> validate`) or build with `--build-arg FEATURES=` (no
+# metrics), nothing listens on 9090: override or disable the healthcheck for
+# those cases (e.g. `--health-cmd` or `--no-healthcheck`).
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD wget -qO- http://127.0.0.1:9090/healthz || exit 1
 
 ENTRYPOINT ["txwatch"]
+# Default command: run the watcher with the metrics server bound to all
+# interfaces on 9090, matching the HEALTHCHECK above. Override it to run
+# another subcommand, e.g. `docker run <image> validate`.
+CMD ["watch", "--metrics-addr", "0.0.0.0:9090"]

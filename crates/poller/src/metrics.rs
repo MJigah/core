@@ -9,11 +9,13 @@
 //! - `txwatch_webhook_failures_total{contract,network}`  — permanent webhook delivery failures
 //! - `txwatch_event_fetch_failures_total{contract,reason}` — event fetches that failed or were unavailable
 //! - `txwatch_horizon_request_duration_seconds{network}` — Horizon request latency
-//! - `txwatch_horizon_rate_limited_total{contract,network}` — Horizon 429 (rate limited) responses
-//! - `txwatch_webhook_delivery_duration_seconds`         — webhook delivery latency (incl. retries)
+//! - `txwatch_horizon_rate_limited_total{network}` — Horizon 429 (rate limited) responses
 //! - `txwatch_webhook_deliveries_total{contract,format,destination,outcome}` — webhook deliveries;
 //!   `destination` is the destination's index in the contract's list, never its URL
 //! - `txwatch_webhook_delivery_duration_seconds{format,outcome}` — webhook delivery latency (incl. retries)
+//! - `txwatch_webhook_destination_unhealthy{contract,destination}` — 1 when a webhook
+//!   destination is persistently failing, 0 otherwise; `destination` is the
+//!   destination's index in the contract's list, never its URL
 //! - `txwatch_last_successful_poll_timestamp_seconds{contract,network}` — data freshness
 //! - `txwatch_consecutive_poll_failures{contract,network}` — current failure streak
 //! - `txwatch_ledger_lag{contract,network}`              — ledgers between Horizon's latest ledger
@@ -28,7 +30,13 @@
 //!   have polled successfully within 2 × their own effective
 //!   `poll_interval_seconds`, `503` otherwise
 //!
-//! Any other path returns `404`, and any other method `405`.
+//! `HEAD` is accepted wherever `GET` is, with an empty body. Any other path
+//! returns `404`, and any other method `405` with an `Allow: GET, HEAD` header.
+//!
+//! The listener is meant for local scraping: bind it to `127.0.0.1` or a
+//! pod-local interface rather than a public address. Connections are bounded
+//! (a semaphore caps concurrency) and each one has a header-read and overall
+//! timeout, so idle or slowloris clients cannot exhaust file descriptors.
 
 use anyhow::{Context, Result};
 use prometheus::{
@@ -38,18 +46,24 @@ use prometheus::{
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use http_body_util::Full;
 use hyper::{
     body::Bytes,
-    header::{HeaderValue, CONTENT_TYPE},
+    header::{HeaderValue, ALLOW, CONTENT_TYPE},
     Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Semaphore},
+};
 use txwatch_config::ReadinessPolicy;
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -195,6 +209,18 @@ fn webhook_delivery_duration() -> &'static HistogramVec {
     })
 }
 
+fn webhook_destination_unhealthy() -> &'static IntGaugeVec {
+    static G: OnceLock<IntGaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge_vec!(
+            "txwatch_webhook_destination_unhealthy",
+            "Whether a webhook destination is persistently failing (1) or not (0), per contract and destination index",
+            &["contract", "destination"]
+        )
+        .expect("register txwatch_webhook_destination_unhealthy")
+    })
+}
+
 fn last_successful_poll() -> &'static IntGaugeVec {
     static G: OnceLock<IntGaugeVec> = OnceLock::new();
     G.get_or_init(|| {
@@ -337,6 +363,14 @@ pub fn record_webhook_delivery(
         .observe(seconds);
 }
 
+/// Set `txwatch_webhook_destination_unhealthy` for a contract's destination.
+/// `destination` is the destination's index, never its URL.
+pub fn set_webhook_destination_unhealthy(contract: &str, destination: &str, unhealthy: bool) {
+    webhook_destination_unhealthy()
+        .with_label_values(&[contract, destination])
+        .set(i64::from(unhealthy));
+}
+
 /// Set `txwatch_ledger_lag` for a contract.
 pub fn set_ledger_lag(contract: &str, network: &str, lag: u64) {
     ledger_lag()
@@ -353,6 +387,28 @@ pub fn remove_contract(contract: &str, network: &str) {
         ledger_lag(),
     ] {
         let _ = gauge.remove_label_values(&[contract, network]);
+    }
+    // The destination index is not known here, so drop every series of the
+    // contract by collecting and removing the matching label sets.
+    let gauge = webhook_destination_unhealthy();
+    let stale: Vec<_> = gauge
+        .collect()
+        .into_iter()
+        .flat_map(|family| family.into_metric())
+        .filter(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.name() == "contract" && l.value() == contract)
+        })
+        .filter_map(|m| {
+            m.get_label()
+                .iter()
+                .find(|l| l.name() == "destination")
+                .map(|l| l.value().to_owned())
+        })
+        .collect();
+    for destination in stale {
+        let _ = gauge.remove_label_values(&[contract, &destination]);
     }
     lock_readiness()
         .contracts
@@ -413,87 +469,6 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Record the configured poll interval (called once by the poller at start-up).
-pub fn set_poll_interval(secs: u64) {
-    POLL_INTERVAL_SECS.store(secs, Ordering::Relaxed);
-}
-
-/// Record that a contract poll just succeeded (for readiness).
-pub fn mark_poll_success() {
-    LAST_POLL_SUCCESS.store(now_secs(), Ordering::Relaxed);
-}
-
-/// Ready when a poll succeeded within the last 2 × poll interval.
-fn is_ready() -> bool {
-    let last = LAST_POLL_SUCCESS.load(Ordering::Relaxed);
-    let interval = POLL_INTERVAL_SECS.load(Ordering::Relaxed);
-    if last == 0 || interval == 0 {
-        return false;
-    }
-    now_secs().saturating_sub(last) <= interval.saturating_mul(2)
-}
-
-// ── HTTP server ───────────────────────────────────────────────────────────────
-
-/// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
-///
-/// Binds the listener, starts serving on a background task and returns the
-/// address that was actually bound. Callers may pass port `0`, so the returned
-/// address is the one to scrape. Returns an error only if the listener cannot
-/// be bound.
-pub async fn serve_metrics(
-    addr: SocketAddr,
-    shutdown: watch::Receiver<bool>,
-) -> Result<SocketAddr> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind metrics listener on {addr}"))?;
-    // The caller may pass port 0, so hand back what we actually bound.
-    let bound = listener
-        .local_addr()
-        .with_context(|| format!("read local address of metrics listener on {addr}"))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = accept_loop(listener, shutdown).await {
-            tracing::error!(error = %e, "metrics endpoint stopped");
-        }
-    });
-
-    Ok(bound)
-}
-
-async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    break;
-                }
-            }
-            accepted = listener.accept() => {
-                let (stream, _peer) = match accepted {
-                    Ok(pair) => pair,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "metrics accept failed");
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service = hyper::service::service_fn(handle_request);
-                    if let Err(err) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        tracing::debug!(error = %err, "metrics connection error");
-                    }
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Set the policy `/readyz` applies (called at start-up and on reload).
 pub fn set_readiness_policy(policy: ReadinessPolicy) {
     lock_readiness().policy = policy;
@@ -551,12 +526,22 @@ fn is_ready() -> bool {
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
+/// Maximum number of metrics connections served concurrently.
+const MAX_CONNECTIONS: usize = 64;
+/// How long a client may take to send its request headers.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on the lifetime of a single connection.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Serve `/metrics`, `/healthz` and `/readyz` on `addr` until `shutdown` fires.
 ///
 /// Binds the listener, starts serving on a background task and returns the
 /// address that was actually bound. Callers may pass port `0`, so the returned
 /// address is the one to scrape. Returns an error only if the listener cannot
 /// be bound.
+///
+/// Bind to `127.0.0.1` or a pod-local interface: the endpoint is unauthenticated
+/// and is not meant to be reachable from outside the host or pod.
 pub async fn serve_metrics(
     addr: SocketAddr,
     shutdown: watch::Receiver<bool>,
@@ -579,6 +564,7 @@ pub async fn serve_metrics(
 }
 
 async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+    let permits = std::sync::Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -594,14 +580,27 @@ async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>)
                         continue;
                     }
                 };
+                // Bound concurrency: wait for a free slot before spawning.
+                let permit = match permits.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
                 tokio::spawn(async move {
+                    // Held until the connection task ends.
+                    let _permit = permit;
                     let io = TokioIo::new(stream);
                     let service = hyper::service::service_fn(handle_request);
-                    if let Err(err) = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await
-                    {
-                        tracing::debug!(error = %err, "metrics connection error");
+                    let conn = hyper::server::conn::http1::Builder::new()
+                        .header_read_timeout(HEADER_READ_TIMEOUT)
+                        .serve_connection(io, service);
+                    match tokio::time::timeout(CONNECTION_TIMEOUT, conn).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::debug!(error = %err, "metrics connection error");
+                        }
+                        Err(_) => {
+                            tracing::debug!("metrics connection timed out");
+                        }
                     }
                 });
             }
@@ -613,26 +612,40 @@ async fn accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>)
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    let is_head = req.method() == hyper::Method::HEAD;
     let response = match (req.method().as_str(), req.uri().path()) {
-        ("GET", "/metrics") => text_response(
+        ("GET" | "HEAD", "/metrics") => text_response(
             StatusCode::OK,
             prometheus::TextEncoder::new()
                 .encode_to_string(&prometheus::gather())
                 .unwrap_or_default(),
         ),
-        ("GET", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
-        ("GET", "/readyz") => {
+        ("GET" | "HEAD", "/healthz") => text_response(StatusCode::OK, "ok\n".to_string()),
+        ("GET" | "HEAD", "/readyz") => {
             if is_ready() {
                 text_response(StatusCode::OK, "ready\n".to_string())
             } else {
                 text_response(StatusCode::SERVICE_UNAVAILABLE, "not ready\n".to_string())
             }
         }
-        ("GET", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
-        _ => text_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method not allowed\n".to_string(),
-        ),
+        ("GET" | "HEAD", _) => text_response(StatusCode::NOT_FOUND, "not found\n".to_string()),
+        _ => {
+            let mut response = text_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed\n".to_string(),
+            );
+            response
+                .headers_mut()
+                .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+            response
+        }
+    };
+    // HEAD responses carry the same headers as GET but no body.
+    let response = if is_head {
+        let (parts, _body) = response.into_parts();
+        Response::from_parts(parts, Full::new(Bytes::new()))
+    } else {
+        response
     };
     Ok(response)
 }

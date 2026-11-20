@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 #![warn(missing_docs)]
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
@@ -102,7 +103,12 @@ pub struct ContractEvent {
 /// comparison and `value` is the expected value as a string.
 pub use txwatch_config::DataMatcher;
 
-pub trait DataMatcherExt {
+/// Internal helper trait adding a `matches` method to [`DataMatcher`].
+///
+/// This exists only to attach the method to the re-exported config type, so
+/// it is deliberately private to this crate.
+trait DataMatcherExt {
+    /// Does `data` satisfy this matcher?
     fn matches(&self, data: &Value) -> bool;
 }
 
@@ -264,6 +270,19 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
     }
 }
 
+// ── Batched webhook body (issue #482) ─────────────────────────────────────────
+
+/// The body of a batched webhook delivery, sent when a receiver enables
+/// `batch_alerts`: `{"alerts": [AlertPayload, …]}`.
+///
+/// The JSON Schema for this type is published as `docs/alert-batch.schema.json`
+/// and can be printed with `txwatch schema --batch`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AlertBatch {
+    /// The alerts delivered together in this webhook call, in evaluation order.
+    pub alerts: Vec<AlertPayload>,
+}
+
 // ── ScVal decoding (issue #266) ───────────────────────────────────────────────
 
 /// Decode a Soroban `ScVal` (in its JSON form) into a plain string for
@@ -273,7 +292,11 @@ fn topic_value_matches(value: &Value, pattern: &str) -> bool {
 pub fn decode_scval(value: &Value) -> String {
     match value {
         Value::Object(map) if map.len() == 1 => {
-            let (key, inner) = map.iter().next().expect("map has one entry");
+            // `map.len() == 1` guarantees an entry, but avoid `expect` so this
+            // can never panic on untrusted chain data.
+            let Some((key, inner)) = map.iter().next() else {
+                return value.to_string();
+            };
             match (key.as_str(), inner) {
                 ("address", Value::String(s))
                 | ("symbol", Value::String(s))
@@ -1356,6 +1379,8 @@ pub enum NoActivityState {
     /// The threshold was exceeded and an alert was fired.  We're in the quiet
     /// window; we will fire a recovery alert the next time a transaction arrives.
     Alerting {
+        /// `alert_id` of the incident alert that opened this quiet window;
+        /// reused as the `alert_id` of the recovery alert.
         #[serde(default)]
         incident_alert_id: String,
     },
@@ -1576,6 +1601,7 @@ impl From<CooldownTracker> for Vec<((String, String), CooldownState)> {
 }
 
 impl CooldownTracker {
+    /// An empty tracker with no recorded cooldown state.
     pub fn new() -> Self {
         Self::default()
     }
@@ -4630,5 +4656,191 @@ mod suppressor_tests {
         assert!(tracker
             .check_summaries(&rules, &eval_ctx, clock.now())
             .is_empty());
+    }
+}
+
+// ── Property-based tests for stateful trackers (#490) ─────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tracker_prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use txwatch_config::AlertRule;
+
+    /// A single match attempt: how many ledger seconds elapse before it and
+    /// whether it actually matches the rule.
+    #[derive(Debug, Clone, Copy)]
+    struct MatchAttempt {
+        /// Ledger-time seconds elapsed since the previous attempt.
+        delta_secs: u64,
+        /// Whether this attempt produced a match.
+        matched: bool,
+    }
+
+    fn arb_attempts() -> impl Strategy<Value = Vec<MatchAttempt>> {
+        proptest::collection::vec(
+            (0u64..=120u64, proptest::bool::ANY).prop_map(|(delta_secs, matched)| {
+                MatchAttempt {
+                    delta_secs,
+                    matched,
+                }
+            }),
+            0..40,
+        )
+    }
+
+    /// Drive a `CooldownTracker` through `attempts`, returning the ledger
+    /// timestamps of every alert that was let through and the total number of
+    /// suppressed matches reported across those alerts.
+    fn drive_cooldown(
+        tracker: &mut CooldownTracker,
+        cooldown_secs: u64,
+        attempts: &[MatchAttempt],
+        start: DateTime<Utc>,
+    ) -> (Vec<DateTime<Utc>>, u64) {
+        let mut now = start;
+        let mut fired_at = Vec::new();
+        let mut reported_suppressed = 0u64;
+        for attempt in attempts {
+            now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
+            if !attempt.matched {
+                continue;
+            }
+            if let Some(suppressed) = tracker.check("CA", "AnyTransaction", cooldown_secs, now) {
+                reported_suppressed += suppressed;
+                fired_at.push(now);
+            }
+        }
+        (fired_at, reported_suppressed)
+    }
+
+    proptest! {
+        /// A cooldown never lets two alerts through within `cooldown_seconds`
+        /// of ledger time, and every alert after the first reports the exact
+        /// number of matches dropped since the previous alert.
+        #[test]
+        fn cooldown_never_fires_twice_within_window(
+            cooldown_secs in 1u64..=600u64,
+            attempts in arb_attempts(),
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = CooldownTracker::new();
+            let (fired_at, reported_suppressed) =
+                drive_cooldown(&mut tracker, cooldown_secs, &attempts, start);
+
+            // Invariant 1: consecutive alerts are at least `cooldown_secs` apart.
+            for pair in fired_at.windows(2) {
+                let gap = (pair[1] - pair[0]).num_seconds();
+                prop_assert!(
+                    gap >= cooldown_secs as i64,
+                    "two alerts let through {}s apart with cooldown {}s",
+                    gap,
+                    cooldown_secs
+                );
+            }
+
+            // Invariant 2: suppressed_count totals equal the dropped matches.
+            let total_matches = attempts.iter().filter(|a| a.matched).count() as u64;
+            let dropped = total_matches - fired_at.len() as u64;
+            prop_assert_eq!(
+                reported_suppressed,
+                dropped,
+                "suppressed_count total must equal dropped matches"
+            );
+        }
+
+        /// With a disabled (zero) cooldown every match is let through and
+        /// nothing is ever reported as suppressed.
+        #[test]
+        fn zero_cooldown_lets_every_match_through(attempts in arb_attempts()) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = CooldownTracker::new();
+            let (fired_at, reported_suppressed) = drive_cooldown(&mut tracker, 0, &attempts, start);
+            let total_matches = attempts.iter().filter(|a| a.matched).count();
+            prop_assert_eq!(fired_at.len(), total_matches);
+            prop_assert_eq!(reported_suppressed, 0);
+        }
+
+        /// `RateTracker` fires at most `floor(matches / count)` times, and
+        /// exactly that many times once the window has fully elapsed.
+        #[test]
+        fn rate_tracker_fires_at_most_floor_matches_over_count(
+            count in 1u32..=20u32,
+            window_secs in 1u64..=3600u64,
+            matches in 0u32..=200u32,
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = RateTracker::new();
+            let mut fired = 0u32;
+            // All matches land at the same ledger instant, so the window
+            // never rolls over during the burst.
+            for _ in 0..matches {
+                if tracker.check("CA", "AnyTransaction", count, window_secs, start) {
+                    fired += 1;
+                }
+            }
+            let expected = matches / count;
+            prop_assert_eq!(
+                fired,
+                expected,
+                "RateTracker fired {} times for {} matches with count {}",
+                fired,
+                matches,
+                count
+            );
+            prop_assert!(fired <= matches / count);
+        }
+
+        /// `RateTracker` never fires more than `count` times inside a single
+        /// window, regardless of how the matches are spread over ledger time.
+        #[test]
+        fn rate_tracker_respects_window(
+            count in 1u32..=10u32,
+            window_secs in 1u64..=600u64,
+            attempts in arb_attempts(),
+        ) {
+            let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+            let mut tracker = RateTracker::new();
+            let mut now = start;
+            let mut fired_at = Vec::new();
+            for attempt in &attempts {
+                now += chrono::TimeDelta::seconds(attempt.delta_secs as i64);
+                if attempt.matched
+                    && tracker.check("CA", "AnyTransaction", count, window_secs, now)
+                {
+                    fired_at.push(now);
+                }
+            }
+            // Any `count + 1` consecutive fires must span more than one window.
+            for window in fired_at.windows(count as usize + 1) {
+                let span = (window[count as usize] - window[0]).num_seconds();
+                prop_assert!(
+                    span >= window_secs as i64,
+                    "{} fires within {}s with count {} and window {}s",
+                    count + 1,
+                    span,
+                    count,
+                    window_secs
+                );
+            }
+        }
+    }
+
+    /// Sanity check that the strategies above actually exercise the trackers.
+    #[test]
+    fn cooldown_tracker_helpers_are_exercised() {
+        let start: DateTime<Utc> = "2024-01-15T12:00:00Z".parse().unwrap();
+        let attempts = vec![
+            MatchAttempt { delta_secs: 0, matched: true },
+            MatchAttempt { delta_secs: 10, matched: true },
+            MatchAttempt { delta_secs: 60, matched: true },
+        ];
+        let mut tracker = CooldownTracker::new();
+        let (fired_at, suppressed) = drive_cooldown(&mut tracker, 60, &attempts, start);
+        assert_eq!(fired_at.len(), 2);
+        assert_eq!(suppressed, 1);
+        // Keep the unused import warning-free.
+        let _ = AlertRule::AnyTransaction;
     }
 }

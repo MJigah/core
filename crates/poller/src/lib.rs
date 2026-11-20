@@ -717,21 +717,15 @@ async fn poll_contract_forever(
         mut cooldowns,
         mut health,
     } = runtime;
-    // Poll state and cooldowns live as long as this contract's task.
-    let mut state = ContractPollState::default();
     // Issue #281: restore this contract's NoActivity states from the persisted
     // document so a restart does not re-fire open incidents.
     if let Some(saved) = lock(&persist.no_activity).get(&key) {
         state.no_activity_states = saved.clone();
     }
-    // A single tracker for this contract's lifetime, so cooldowns survive
-    // across poll cycles rather than deduping only within one.
-    let mut cooldowns = CooldownTracker::new();
     // Issue #281: restore persisted cooldown windows for this contract.
     if let Some(saved) = lock(&persist.cooldowns).get(&key) {
         cooldowns = saved.clone();
     }
-    let mut health = PollHealth::default();
     let lag_threshold = ledger_lag_warn_threshold_from_env();
     // Polls are paced by a fixed-period ticker, so the period stays at
     // `interval` however long a cycle takes. The first poll happens
@@ -741,6 +735,11 @@ async fn poll_contract_forever(
     let mut ticker = poll_ticker(interval, offset);
     loop {
         let cycle_started = std::time::Instant::now();
+        // Issue #403: a NoActivity incident fires in a cycle with no new
+        // transactions, so the cursor does not advance. Snapshot the alerting
+        // state before the poll so a change can be persisted even then.
+        let no_activity_before = state.no_activity_states.clone();
+        let cooldowns_before = cooldowns.clone();
         match poll_contract(
             &client,
             &HorizonSource::new(&client, poll_base_url(&contract)),
@@ -787,6 +786,10 @@ async fn poll_contract_forever(
                     metrics::record_poll_success(&contract.label, network);
                     metrics::mark_poll_success(&contract.label, network, interval.as_secs());
                 }
+                // Issue #403: an incident (or a cooldown window) may have
+                // changed even though the cursor did not, so persist on either.
+                let alerting_changed = state.no_activity_states != no_activity_before
+                    || cooldowns != cooldowns_before;
                 // Issue #5: persist the cursor as soon as it advances, so a
                 // restart does not replay transactions we have already seen.
                 // Issue #278: hand the update to the coalescing writer task
@@ -794,7 +797,7 @@ async fn poll_contract_forever(
                 if persist.path.is_some() {
                     if let Some(latest) = cursors.get(&key) {
                         // Scope the lock so no guard is held across an await.
-                        let changed = {
+                        let cursor_changed = {
                             let mut guard = lock(&persist.cursors);
                             if guard.get(&key) == Some(latest) {
                                 false
@@ -803,7 +806,7 @@ async fn poll_contract_forever(
                                 true
                             }
                         };
-                        if changed {
+                        if cursor_changed || alerting_changed {
                             // Issue #281: snapshot cooldown and NoActivity state
                             // alongside the cursor so it survives a restart.
                             let cooldowns = lock(&persist.cooldowns)
@@ -1635,6 +1638,8 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                         error = %error,
                         "could not fetch operation details — evaluating rules without them"
                     );
+                    #[cfg(feature = "metrics")]
+                    metrics::inc_transactions_degraded(&contract.label, contract.network.as_str());
                     SorobanDetails::default()
                 }
             };
