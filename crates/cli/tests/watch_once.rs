@@ -290,6 +290,58 @@ async fn once_polls_contracts_concurrently() {
 }
 
 #[tokio::test]
+async fn once_honors_explicit_concurrency_flag() {
+    const CONTRACTS: usize = 4;
+    const DELAY_MS: u64 = 300;
+    const CONCURRENCY: usize = 1;
+
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(DELAY_MS))
+                .set_body_json(empty_page()),
+        )
+        .mount(&horizon)
+        .await;
+
+    let (config_path, _) = write_multi_config("explicit_concurrency", CONTRACTS);
+
+    let started = std::time::Instant::now();
+    let output = txwatch_bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--horizon-url",
+            &horizon.uri(),
+            "watch",
+            "--once",
+            "--concurrency",
+            &CONCURRENCY.to_string(),
+        ])
+        .output()
+        .await
+        .expect("failed to run txwatch");
+    let elapsed = started.elapsed();
+
+    assert!(
+        output.status.success(),
+        "expected exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // With concurrency 1 the polls must be sequential: at least
+    // CONTRACTS * DELAY_MS. The default (8) would finish in ~DELAY_MS.
+    let sequential = std::time::Duration::from_millis(DELAY_MS * CONTRACTS as u64);
+    assert!(
+        elapsed >= sequential,
+        "expected --concurrency {CONCURRENCY} to serialize polls, took {elapsed:?} \
+         (sequential would be {sequential:?})"
+    );
+}
+
+#[tokio::test]
 async fn once_fails_fast_when_cursor_lock_is_held() {
     let horizon = MockServer::start().await;
     mount_one_transaction(&horizon).await;
