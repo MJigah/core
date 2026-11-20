@@ -9,11 +9,6 @@
 //!   is the alert's `alert_id`.
 //! - `teams`: a Microsoft Teams Incoming Webhook / Workflows message carrying
 //!   one Adaptive Card.
-//!
-//! Batched delivery (`batch_alerts = true`) renders a digest per destination
-//! via [`render_batch_body`]: chat formats get a single digest message and
-//! PagerDuty gets one `trigger` event per alert (Events API v2 has no batch
-//! envelope), so no format silently drops alerts.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -138,32 +133,6 @@ pub fn render_body_with_content_type(
     })
 }
 
-/// Renders the request body for a batch of alerts destined for one
-/// destination. `routing_key` is required for PagerDuty and ignored otherwise.
-///
-/// - `txwatch`: a JSON array of payloads.
-/// - `slack` / `discord`: a single digest message summarising every alert.
-/// - `pagerduty`: a JSON array of `trigger` events (one per alert).
-pub fn render_batch_body(
-    format: WebhookFormat,
-    payloads: &[AlertPayload],
-    routing_key: Option<&str>,
-) -> Result<String> {
-    let body = match format {
-        WebhookFormat::Txwatch | WebhookFormat::Template => serde_json::to_value(payloads)?,
-        WebhookFormat::Slack => slack_digest(payloads),
-        WebhookFormat::Discord => discord_digest(payloads),
-        WebhookFormat::Teams => teams_digest(payloads),
-        WebhookFormat::Pagerduty => {
-            let key =
-                routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?;
-            Value::Array(payloads.iter().map(|p| pagerduty(p, key)).collect())
-        }
-        WebhookFormat::Template => serde_json::to_value(payloads)?,
-    };
-    Ok(serde_json::to_string(&body)?)
-}
-
 /// Renders a user-defined body template. Every [`AlertPayload`] field is a
 /// variable. When `content_type` is JSON, values are JSON-escaped, so
 /// `{"text": {{ label }}}` yields `{"text": "My Contract"}`; for any other
@@ -286,6 +255,44 @@ fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max - 1).collect();
     out.push('…');
     out
+}
+
+/// Truncates a multi-line block on a line boundary, appending
+/// `… and N more` for the dropped lines. Never cuts inside `<…>` markup: if
+/// the last kept line would end mid-markup it is dropped too.
+fn truncate_lines(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in &lines {
+        let extra = if kept.is_empty() { 0 } else { 1 };
+        if used + extra + line.chars().count() > max {
+            break;
+        }
+        used += extra + line.chars().count();
+        kept.push(line);
+    }
+    // Drop a trailing line whose `<…>` markup is unterminated.
+    while let Some(last) = kept.last() {
+        let opens = last.matches('<').count();
+        let closes = last.matches('>').count();
+        if opens > closes {
+            kept.pop();
+        } else {
+            break;
+        }
+    }
+    let dropped = lines.len() - kept.len();
+    let suffix = format!("… and {} more", dropped);
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&suffix);
+    truncate(&out, max)
 }
 
 /// Normalises the configured rule severity to one of `info`, `warning`,
@@ -437,7 +444,7 @@ pub fn slack_digest(payloads: &[AlertPayload]) -> Value {
             },
             {
                 "type": "section",
-                "text": { "type": "mrkdwn", "text": truncate(&lines.join("\n"), SLACK_TEXT_MAX) },
+                "text": { "type": "mrkdwn", "text": truncate_lines(&lines.join("\n"), SLACK_TEXT_MAX) },
             },
         ],
     })
@@ -462,40 +469,98 @@ fn discord_color(p: &AlertPayload) -> u32 {
     }
 }
 
+/// Escapes the characters Discord treats as markdown so untrusted values
+/// (labels, rule text, memos) can never inject masked links, spoilers or
+/// formatting.
+fn discord_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(
+            c,
+            '\\' | '*' | '_' | '~' | '|' | '>' | '[' | ']' | '(' | ')' | '`'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Discord embed limits; exceeding any of them makes Discord answer HTTP 400.
+const DISCORD_FIELD_MAX: usize = 1024;
+const DISCORD_FIELDS_MAX: usize = 25;
+const DISCORD_EMBED_TOTAL_MAX: usize = 6000;
+
 /// Discord webhook message.
 pub fn discord(p: &AlertPayload) -> Value {
-    let mut fields = vec![
-        json!({ "name": "Contract", "value": format!("`{}`", p.contract_id), "inline": false }),
-        json!({
-            "name": "Transaction",
-            "value": truncate(&format!("[{}]({})", p.transaction_hash, p.explorer_link), 1024),
-            "inline": false,
-        }),
-    ];
+    let title = truncate(
+        &if p.resolved {
+            format!("✅ Resolved: {}", discord_escape(&p.rule_triggered))
+        } else {
+            discord_escape(&p.rule_triggered)
+        },
+        256,
+    );
+    let description = truncate(
+        &format!(
+            "{} ({})",
+            discord_escape(&p.label),
+            discord_escape(&p.network)
+        ),
+        4096,
+    );
+
+    // Running total of embed text: title, description, field names and values.
+    let mut used = title.chars().count() + description.chars().count();
+
+    let mut fields: Vec<Value> = Vec::new();
+    let mut push_field = |name: &str, value: String, inline: bool, used: &mut usize| {
+        if fields.len() >= DISCORD_FIELDS_MAX {
+            return;
+        }
+        let value = truncate(&value, DISCORD_FIELD_MAX);
+        let cost = name.chars().count() + value.chars().count();
+        if *used + cost > DISCORD_EMBED_TOTAL_MAX {
+            return;
+        }
+        *used += cost;
+        fields.push(json!({ "name": name, "value": value, "inline": inline }));
+    };
+
+    push_field(
+        "Contract",
+        format!("`{}`", discord_escape(&p.contract_id)),
+        false,
+        &mut used,
+    );
+    push_field(
+        "Transaction",
+        format!(
+            "[{}]({})",
+            discord_escape(&p.transaction_hash),
+            p.explorer_link
+        ),
+        false,
+        &mut used,
+    );
     for (name, value) in details(p) {
-        fields.push(json!({ "name": name, "value": truncate(&value, 1024), "inline": true }));
+        push_field(name, discord_escape(&value), true, &mut used);
     }
-    fields.push(json!({
-        "name": "Horizon",
-        "value": truncate(&format!("[transaction]({})", p.horizon_link), 1024),
-        "inline": true,
-    }));
+    push_field(
+        "Horizon",
+        format!("[transaction]({})", p.horizon_link),
+        true,
+        &mut used,
+    );
 
     json!({
         "username": "TxWatch",
-        "content": truncate(&headline(p), 2000),
+        "content": truncate(&discord_escape(&headline(p)), 2000),
         "allowed_mentions": { "parse": [] },
         "embeds": [{
-            "title": truncate(
-                &if p.resolved {
-                    format!("✅ Resolved: {}", p.rule_triggered)
-                } else {
-                    p.rule_triggered.clone()
-                },
-                256,
-            ),
+            "title": title,
             "url": p.explorer_link,
-            "description": truncate(&format!("{} ({})", p.label, p.network), 4096),
+            "description": description,
             "color": discord_color(p),
             "timestamp": p.timestamp_iso,
             "fields": fields,
@@ -510,7 +575,11 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
     for p in payloads {
         lines.push(format!(
             "• {} on {} ({}) — [{}]({})",
-            p.rule_triggered, p.label, p.network, p.transaction_hash, p.explorer_link
+            discord_escape(&p.rule_triggered),
+            discord_escape(&p.label),
+            discord_escape(&p.network),
+            discord_escape(&p.transaction_hash),
+            p.explorer_link
         ));
     }
     json!({
@@ -527,6 +596,13 @@ pub fn discord_digest(payloads: &[AlertPayload]) -> Value {
 }
 
 // ── Microsoft Teams ───────────────────────────────────────────────────────────
+
+/// Teams Incoming Webhooks and Workflows reject payloads over roughly 28 KB,
+/// so fact titles and values are truncated and the digest's fact count is
+/// capped to keep the rendered body well under that limit.
+const TEAMS_FACT_TITLE_MAX: usize = 120;
+const TEAMS_FACT_VALUE_MAX: usize = 300;
+const TEAMS_DIGEST_FACTS_MAX: usize = 40;
 
 /// Wraps an Adaptive Card body in the message envelope accepted by Teams
 /// Incoming Webhooks and Workflows ("Post to a channel when a webhook request
@@ -564,13 +640,16 @@ fn teams_color(p: &AlertPayload) -> &'static str {
 /// Microsoft Teams message with one Adaptive Card.
 pub fn teams(p: &AlertPayload) -> Value {
     let mut facts = vec![
-        json!({ "title": "Contract", "value": p.contract_id }),
-        json!({ "title": "Transaction", "value": p.transaction_hash }),
+        json!({ "title": "Contract", "value": truncate(&p.contract_id, TEAMS_FACT_VALUE_MAX) }),
+        json!({ "title": "Transaction", "value": truncate(&p.transaction_hash, TEAMS_FACT_VALUE_MAX) }),
     ];
     for (name, value) in details(p) {
-        facts.push(json!({ "title": name, "value": value }));
+        facts.push(json!({
+            "title": truncate(name, TEAMS_FACT_TITLE_MAX),
+            "value": truncate(&value, TEAMS_FACT_VALUE_MAX),
+        }));
     }
-    facts.push(json!({ "title": "Time", "value": p.timestamp_iso }));
+    facts.push(json!({ "title": "Time", "value": truncate(&p.timestamp_iso, TEAMS_FACT_VALUE_MAX) }));
 
     teams_message(
         vec![
@@ -598,30 +677,47 @@ pub fn teams(p: &AlertPayload) -> Value {
     )
 }
 
-/// Microsoft Teams digest message summarising a batch of alerts.
+/// Microsoft Teams digest message summarising a batch of alerts. Fact titles
+/// and values are truncated and the fact count is capped so the body stays
+/// under the Teams payload limit.
 pub fn teams_digest(payloads: &[AlertPayload]) -> Value {
     let facts: Vec<Value> = payloads
         .iter()
+        .take(TEAMS_DIGEST_FACTS_MAX)
         .map(|p| {
             json!({
-                "title": format!("{} on {} ({})", p.rule_triggered, p.label, p.network),
-                "value": format!("[{}]({})", p.transaction_hash, p.explorer_link),
+                "title": truncate(
+                    &format!("{} on {} ({})", p.rule_triggered, p.label, p.network),
+                    TEAMS_FACT_TITLE_MAX,
+                ),
+                "value": truncate(
+                    &format!("[{}]({})", p.transaction_hash, p.explorer_link),
+                    TEAMS_FACT_VALUE_MAX,
+                ),
             })
         })
         .collect();
-    teams_message(
-        vec![
-            json!({
-                "type": "TextBlock",
-                "text": format!("TxWatch: {} alert(s)", payloads.len()),
-                "weight": "Bolder",
-                "size": "Medium",
-                "wrap": true,
-            }),
-            json!({ "type": "FactSet", "facts": facts }),
-        ],
-        vec![],
-    )
+    let mut body = vec![json!({
+        "type": "TextBlock",
+        "text": format!("TxWatch: {} alert(s)", payloads.len()),
+        "weight": "Bolder",
+        "size": "Medium",
+        "wrap": true,
+    })];
+    if payloads.len() > TEAMS_DIGEST_FACTS_MAX {
+        body.push(json!({
+            "type": "TextBlock",
+            "text": format!(
+                "…and {} more alert(s)",
+                payloads.len() - TEAMS_DIGEST_FACTS_MAX
+            ),
+            "isSubtle": true,
+            "size": "Small",
+            "wrap": true,
+        }));
+    }
+    body.push(json!({ "type": "FactSet", "facts": facts }));
+    teams_message(body, vec![])
 }
 
 // ── PagerDuty ─────────────────────────────────────────────────────────────────
@@ -783,46 +879,19 @@ mod tests {
     }
 
     #[test]
-    fn txwatch_batch_is_array_of_payloads() {
+    fn slack_digest_is_single_message() {
         let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Txwatch, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value.as_array().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn slack_batch_is_single_digest() {
-        let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Slack, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
+        let value = slack_digest(&payloads);
         assert!(value["text"].as_str().unwrap().contains("2 alert(s)"));
         assert!(value["blocks"].is_array());
     }
 
     #[test]
-    fn discord_batch_is_single_digest() {
+    fn discord_digest_is_single_message() {
         let payloads = vec![fixture()];
-        let body = render_batch_body(WebhookFormat::Discord, &payloads, None).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
+        let value = discord_digest(&payloads);
         assert!(value["content"].as_str().unwrap().contains("1 alert(s)"));
         assert_eq!(value["allowed_mentions"]["parse"], json!([]));
-    }
-
-    #[test]
-    fn pagerduty_batch_is_array_of_events() {
-        let payloads = vec![fixture(), fixture()];
-        let body = render_batch_body(WebhookFormat::Pagerduty, &payloads, Some("rk")).unwrap();
-        let value: Value = serde_json::from_str(&body).unwrap();
-        let events = value.as_array().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["routing_key"], "rk");
-        assert_eq!(events[0]["event_action"], "trigger");
-    }
-
-    #[test]
-    fn pagerduty_batch_requires_routing_key() {
-        let payloads = vec![fixture()];
-        assert!(render_batch_body(WebhookFormat::Pagerduty, &payloads, None).is_err());
     }
 
     #[test]
@@ -941,6 +1010,29 @@ mod tests {
     }
 
     #[test]
+    fn template_requires_a_body() {
+        let err = render_body(WebhookFormat::Template, &fixture(), None, None).unwrap_err();
+        assert!(err.to_string().contains("template"), "got: {}", err);
+    }
+
+    #[test]
+    fn template_body_from_file_like_string_renders() {
+        // Mirrors the CLI flow: the body is read from `--template-file` (or
+        // `--template`) and handed to `render_body` unchanged.
+        let file_contents = "{\n  \"content\": \"{{ rule_triggered }} on {{ label }}\",\n  \"tx\": \"{{ transaction_hash }}\"\n}\n";
+        let body = render_body(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some(file_contents),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["content"], "LargeTransfer(>=10000XLM) on Escrow <main> & co");
+        assert_eq!(v["tx"], "abc123");
+    }
+
+    #[test]
     fn pagerduty_requires_a_routing_key() {
         let err = render_body(WebhookFormat::Pagerduty, &fixture(), None, None).unwrap_err();
         assert!(err.to_string().contains("routing_key"), "got: {}", err);
@@ -970,8 +1062,7 @@ mod tests {
             .unwrap()
             .starts_with("*Time*"));
 
-        let digest = render_batch_body(WebhookFormat::Slack, &vec![p; 50], None).unwrap();
-        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let digest = slack_digest(&vec![p; 50]);
         assert!(
             digest["blocks"][1]["text"]["text"]
                 .as_str()
@@ -1090,12 +1181,128 @@ mod tests {
         );
         assert_eq!(render(WebhookFormat::Teams, &p), expected);
 
-        let digest =
-            render_batch_body(WebhookFormat::Teams, &[fixture(), fixture()], None).unwrap();
-        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let digest = teams_digest(&[fixture(), fixture()]);
         let card = &digest["attachments"][0]["content"];
         assert_eq!(card["body"][0]["text"], "TxWatch: 2 alert(s)");
         assert_eq!(card["body"][1]["facts"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn teams_digest_stays_under_the_payload_limit() {
+        let mut p = fixture();
+        p.rule_triggered = "r".repeat(500);
+        p.label = "l".repeat(500);
+        p.network = "n".repeat(500);
+        p.transaction_hash = "t".repeat(500);
+        p.explorer_link = format!("https://x.example/{}", "u".repeat(500));
+        let payloads = vec![p; 50];
+        let digest = teams_digest(&payloads);
+        let body = serde_json::to_string(&digest).unwrap();
+        assert!(body.len() < 28 * 1024, "body was {} bytes", body.len());
+        let card = &digest["attachments"][0]["content"];
+        let facts = card["body"][2]["facts"].as_array().unwrap();
+        assert_eq!(facts.len(), TEAMS_DIGEST_FACTS_MAX);
+        assert!(facts.iter().all(|f| f["title"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= TEAMS_FACT_TITLE_MAX));
+        assert!(facts.iter().all(|f| f["value"]
+            .as_str()
+            .unwrap()
+            .chars()
+            .count()
+            <= TEAMS_FACT_VALUE_MAX));
+        assert!(card["body"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("10 more alert(s)"));
+    fn discord_enforces_embed_limits() {
+        let mut p = fixture();
+        p.rule_triggered = "x".repeat(5000);
+        p.label = "y".repeat(4000);
+        p.function_names = vec!["f".repeat(3000)];
+        p.source_account = Some("G".repeat(2000));
+        p.ledger = Some(1);
+        p.memo = Some("m".repeat(2000));
+        p.severity = Some("critical".into());
+        p.suppressed_count = 2;
+        p.amount_xlm_decimal = Some("1.5".into());
+        p.matched_events = (0..10)
+            .map(|i| txwatch_rules::MatchedEvent {
+                topics: vec![json!(format!("event-{}-{}", i, "z".repeat(200)))],
+                data: Value::Null,
+            })
+            .collect();
+        let discord = render(WebhookFormat::Discord, &p);
+        let embed = &discord["embeds"][0];
+        let fields = embed["fields"].as_array().unwrap();
+        assert!(fields.len() <= 25);
+        let mut total = embed["title"].as_str().unwrap().chars().count()
+            + embed["description"].as_str().unwrap().chars().count();
+        for f in fields {
+            let name = f["name"].as_str().unwrap();
+            let value = f["value"].as_str().unwrap();
+            assert!(value.chars().count() <= 1024);
+            total += name.chars().count() + value.chars().count();
+        }
+        assert!(total <= 6000, "embed total was {}", total);
+    }
+
+    #[test]
+    fn discord_escapes_markdown_in_untrusted_values() {
+        let mut p = fixture();
+        p.label = "[click here](https://evil.example)".into();
+        p.rule_triggered = "||spoiler|| `fence`".into();
+        p.memo = Some("*bold* _it_ ~strike~ > quote \\".into());
+        let discord = render(WebhookFormat::Discord, &p);
+        let description = discord["embeds"][0]["description"].as_str().unwrap();
+        assert!(description.contains("\\[click here\\]\\(https://evil.example\\)"));
+        let title = discord["embeds"][0]["title"].as_str().unwrap();
+        assert!(title.contains("\\|\\|spoiler\\|\\|"));
+        assert!(title.contains("\\`fence\\`"));
+        let memo = discord["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "Memo")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(memo.contains("\\*bold\\*"));
+        assert!(memo.contains("\\_it\\_"));
+        assert!(memo.contains("\\~strike\\~"));
+        assert!(memo.contains("\\> quote"));
+        assert!(memo.contains("\\\\"));
+
+        let digest = render_batch_body(WebhookFormat::Discord, &[p], None).unwrap();
+        let digest: Value = serde_json::from_str(&digest).unwrap();
+        let desc = digest["embeds"][0]["description"].as_str().unwrap();
+        assert!(desc.contains("\\[click here\\]"));
+    }
+
+    #[test]
+    fn slack_digest_truncates_on_line_boundaries() {
+        let payloads: Vec<AlertPayload> = (0..100)
+            .map(|i| {
+                let mut p = fixture();
+                p.transaction_hash = format!("hash{}", i);
+                p
+            })
+            .collect();
+        let body = render_batch_body(WebhookFormat::Slack, &payloads, None).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let text = value["blocks"][1]["text"]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= 3000);
+        assert!(text.contains("… and "));
+        assert!(text.ends_with(" more"));
+        // Every kept line is a complete alert line with balanced link markup.
+        for line in text.lines().filter(|l| l.starts_with('•')) {
+            assert_eq!(line.matches('<').count(), line.matches('>').count());
+            assert!(line.ends_with('>'));
+        }
     }
 
     #[test]

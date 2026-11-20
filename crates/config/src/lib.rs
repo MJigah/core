@@ -1496,6 +1496,7 @@ pub const REDACTED: &str = "<redacted>";
 
 /// Body shape sent to a webhook destination.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookFormat {
     /// TxWatch's own alert JSON.
@@ -1523,6 +1524,36 @@ impl WebhookFormat {
             WebhookFormat::Teams => "teams",
             WebhookFormat::Template => "template",
         }
+    }
+
+    /// Every format, in declaration order. Used to build CLI help text and
+    /// error messages so new variants are never left out.
+    pub const ALL: &'static [WebhookFormat] = &[
+        WebhookFormat::Txwatch,
+        WebhookFormat::Slack,
+        WebhookFormat::Discord,
+        WebhookFormat::Pagerduty,
+        WebhookFormat::Teams,
+        WebhookFormat::Template,
+    ];
+
+    /// `txwatch, slack, discord, pagerduty, teams, template` — the accepted
+    /// `--format` values, generated from [`WebhookFormat::ALL`].
+    pub fn names() -> String {
+        Self::ALL
+            .iter()
+            .map(|format| format.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parses a format name (case-insensitive), returning `None` when unknown.
+    pub fn from_name(name: &str) -> Option<WebhookFormat> {
+        let name = name.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|format| format.as_str().eq_ignore_ascii_case(name))
     }
 }
 

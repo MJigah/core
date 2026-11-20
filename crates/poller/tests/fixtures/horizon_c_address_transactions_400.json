@@ -1,10 +1,10 @@
 {
-  "type": "https://stellar.org/horizon-errors/bad_request",
-  "title": "Bad Request",
+  "type": "https://stellar.org/horizon-errors/invalid_field",
+  "title": "Invalid Field",
   "status": 400,
-  "detail": "The request you sent was invalid in some way.",
+  "detail": "The field 'account_id' is invalid.",
   "extras": {
     "invalid_field": "account_id",
-    "reason": "Account ID must start with `G` and contain 56 alphanum characters"
+    "reason": "Account IDs must start with 'G', but got 'C'."
   }
 }

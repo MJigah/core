@@ -518,4 +518,179 @@ fn test_pagerduty_custom_details_snapshot() {
             "custom_details must omit null {key}, got: {sparse_details:?}"
         );
     }
+/// Teams Incoming Webhooks / Workflows reject payloads over roughly 28 KB.
+/// A 50-alert digest with long rule labels and long fact values must be
+/// truncated (fact titles/values) and fact-count capped so the rendered body
+/// stays under the limit instead of failing the request.
+#[test]
+fn test_teams_digest_body_stays_under_size_limit() {
+    const TEAMS_LIMIT: usize = 28 * 1024;
+
+    let long_label = "X".repeat(512);
+    let long_value = "Y".repeat(4096);
+
+    let mut payload = test_payload("TeamsDigestSizeLimit");
+    payload.alerts = (0..50)
+        .map(|i| {
+            let mut alert = test_payload(&format!("{long_label}-{i}"));
+            alert.rule_name = Some(format!("{long_label}-{i}"));
+            alert.contract_id = Some(format!("{long_label}-{i}"));
+            alert.message = Some(long_value.clone());
+            alert
+        })
+        .collect();
+
+    let body = txwatch_notifier::format::teams_digest(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams digest body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+    );
+
+    let body = txwatch_notifier::format::teams(&payload).to_string();
+    assert!(
+        body.len() < TEAMS_LIMIT,
+        "Teams body must stay under {TEAMS_LIMIT} bytes, got {}",
+        body.len()
+/// Discord enforces a 6000-character total embed budget and at most 25 fields.
+/// An oversized payload (long label, many matched events, many details) must
+/// be trimmed so the resulting embed stays within both limits.
+#[test]
+fn test_discord_embed_respects_limits() {
+    let mut payload = test_payload("OversizedDiscord");
+    payload.label = Some("L".repeat(2000));
+    payload.rule_triggered = "R".repeat(2000);
+    payload.memo = Some("M".repeat(2000));
+    payload.matched_events = (0..50).map(|i| format!("event-{i}-{}", "x".repeat(100))).collect();
+
+    let value = txwatch_notifier::format::discord(&payload);
+    let embed = &value["embeds"][0];
+
+    let fields = embed["fields"].as_array().expect("embed must have fields");
+    assert!(
+        fields.len() <= 25,
+        "embed must have at most 25 fields, got {}",
+        fields.len()
+    );
+
+    let mut total = 0usize;
+    if let Some(title) = embed["title"].as_str() {
+        total += title.chars().count();
+    }
+    if let Some(desc) = embed["description"].as_str() {
+        total += desc.chars().count();
+    }
+    if let Some(footer) = embed["footer"]["text"].as_str() {
+        total += footer.chars().count();
+    }
+    for field in fields {
+        if let Some(name) = field["name"].as_str() {
+            total += name.chars().count();
+        }
+        if let Some(val) = field["value"].as_str() {
+            total += val.chars().count();
+        }
+    }
+    assert!(
+        total <= 6000,
+        "embed total text must stay under 6000 chars, got {total}"
+    );
+}
+
+/// Memos come from untrusted on-chain senders. Discord markdown in
+/// interpolated values must be escaped so masked links, spoilers and code
+/// fences cannot break formatting or smuggle links into the channel.
+#[test]
+fn test_discord_escapes_markdown_in_memo() {
+    let mut payload = test_payload("MarkdownInjection");
+    payload.memo = Some("[click here](https://evil.example) ||spoiler|| ```fence```".to_string());
+    payload.label = Some("_label_ *bold* ~strike~ > quote".to_string());
+
+    let value = txwatch_notifier::format::discord(&payload);
+    let serialized = value.to_string();
+
+    assert!(
+        !serialized.contains("[click here](https://evil.example)"),
+        "masked link markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        !serialized.contains("||spoiler||"),
+        "spoiler markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        !serialized.contains("```fence```"),
+        "code fence markup must be escaped, got: {serialized}"
+    );
+    assert!(
+        serialized.contains("\\[click here\\]"),
+        "brackets must be backslash-escaped, got: {serialized}"
+    );
+}
+
+/// A Slack digest with many alerts must truncate on line boundaries and never
+/// cut inside `<url|text>` markup, appending a "… and N more" notice.
+#[test]
+fn test_slack_digest_truncates_on_line_boundaries() {
+    let alerts: Vec<txwatch_notifier::Alert> = (0..100)
+        .map(|i| {
+            let mut payload = test_payload("DigestAlert");
+            payload.tx_hash = format!("{i:064x}");
+            payload
+        })
+        .collect();
+
+    let body = txwatch_notifier::format::slack_digest(&alerts);
+    assert!(
+        body.chars().count() <= 3000,
+        "digest must stay within 3000 chars, got {}",
+        body.chars().count()
+    );
+
+    // Every `<` must be matched by a later `>`; no unterminated markup.
+    let mut open = false;
+    for ch in body.chars() {
+        match ch {
+            '<' => {
+                assert!(!open, "nested '<' in digest markup: {body}");
+                open = true;
+            }
+            '>' => {
+                assert!(open, "unmatched '>' in digest markup: {body}");
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    assert!(!open, "digest ended inside unterminated '<…>' markup: {body}");
+    assert!(
+        body.contains("more"),
+        "truncated digest must include a '… and N more' notice, got: {body}"
+    );
+}
+
+/// `send_webhook` must make exactly `MAX_ATTEMPTS` attempts (initial + retries)
+/// and back off between them, matching the documented behavior.
+#[tokio::test]
+async fn test_send_webhook_attempt_count_matches_docs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let client = build_client().unwrap();
+    let url = format!("{}/hook", server.uri());
+    let payload = test_payload("RetryCount");
+    let (_tx, rx) = oneshot::channel();
+
+    let result = send_webhook(&client, &url, &payload, Some("secret"), rx).await;
+    assert!(result.is_err(), "500 flood must exhaust retries");
+
+    let received = server.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        txwatch_notifier::MAX_ATTEMPTS,
+        "send_webhook must make exactly MAX_ATTEMPTS attempts"
+    );
 }
