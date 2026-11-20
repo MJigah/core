@@ -63,6 +63,7 @@
         "rules": { "type": "array", "items": { "$ref": "#/$defs/AlertRule" }, "minItems": 1, "description": "Alert rules evaluated for this contract." }
       }
     },
+    "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty", "teams", "template"], "default": "txwatch" },
     "WebhookFormat": { "enum": ["txwatch", "slack", "discord", "pagerduty", "teams"], "default": "txwatch" },
     "Severity": { "enum": ["info", "warning", "critical"], "default": "info", "description": "Minimum severity an alert must have to be delivered." },
     "ReadinessPolicy": {
@@ -89,6 +90,12 @@
     "WebhookDestination": {
       "type": "object", "required": ["url"], "additionalProperties": false,
       "properties": {
+        "url": { "type": "string", "format": "uri" },
+        "secret": { "type": ["string", "null"] },
+        "format": { "$ref": "#/$defs/WebhookFormat" },
+        "headers": { "$ref": "#/$defs/WebhookHeaders" },
+        "routing_key": { "type": ["string", "null"], "description": "PagerDuty routing key; required when format = \"pagerduty\"." },
+        "content_type": { "type": ["string", "null"], "description": "Content-Type sent with the request body; only valid when format = \"template\". Defaults to application/json." }
         "url": { "type": "string", "format": "uri", "description": "Destination URL that receives alert POSTs." },
         "secret": { "type": ["string", "null"], "description": "HMAC secret used to sign requests to this destination (sent as the X-TxWatch-Signature header)." },
         "format": { "$ref": "#/$defs/WebhookFormat", "description": "Payload format for this destination. Default: \"txwatch\"." },

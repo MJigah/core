@@ -141,6 +141,9 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_format` | string          | no       | Body shape for `webhook_url`: `txwatch` (default), `slack`, `discord`, `pagerduty`, `teams` or `template`. See [Webhook formats](#webhook-formats). |
 | `webhook_headers` | table          | no       | Extra HTTP headers for `webhook_url`, e.g. `{ "Authorization" = "Bearer ${TOKEN}" }`. See [Custom headers](#custom-headers). |
 | `webhook_routing_key` | string     | no       | PagerDuty integration key; required when `webhook_format = "pagerduty"`, rejected otherwise. Supports interpolation. |
+| `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields), plus `min_severity`, `rule_types`, `template`/`template_file`, `content_type` (only with `format = "template"`) and `client_cert`/`client_key`/`ca_cert`. See [Multiple destinations](#multiple-destinations). |
+| `webhook_url`    | string          | yes      | `http://` or `https://` URL with a host that receives the alert JSON. Supports [environment interpolation](#environment-variable-interpolation). |
+| `poll_interval_seconds` | u64      | no       | Polls this contract at its own interval instead of the top-level `poll_interval_seconds`. Same bounds (5–3600). Contracts are scheduled independently; `txwatch validate` prints each contract's effective interval. |
 | `webhook_template` | string       | no       | Inline body template used when `webhook_format = "template"`. Mutually exclusive with `webhook_template_file`. See [Body templates](#body-templates). |
 | `webhook_template_file` | string  | no       | Path to a body template file read at config load, used when `webhook_format = "template"`. Mutually exclusive with `webhook_template`. |
 | `webhooks`       | array of tables | no       | Additional destinations (`[[contracts.webhooks]]`), each with `url`, optional `secret`, `format`, `headers` and `routing_key` (same meaning as the `webhook_*` fields), plus `min_severity`, `rule_types`, `template`/`template_file` and `client_cert`/`client_key`/`ca_cert`. See [Multiple destinations](#multiple-destinations). |
@@ -237,9 +240,9 @@ its own HTTP client; the paths support `${ENV_VAR}` interpolation.
 | `txwatch`   | Any HTTP endpoint (default) | The [webhook payload](#webhook-payload) below. |
 | `slack`     | [Slack incoming webhook](https://api.slack.com/messaging/webhooks) | `text` fallback plus Block Kit `blocks`: rule, label and network; contract, transaction link, amount, fee, functions, source account, ledger, memo, severity, suppressed count, matched events and time; explorer, Horizon and alert ID. Texts and fields are truncated to Slack's Block Kit limits (3,000 / 2,000 characters, at most 10 fields) and link URLs are escaped. Recovery alerts use a `:white_check_mark: Resolved` headline. |
 | `discord`   | [Discord webhook](https://discord.com/developers/docs/resources/webhook) | `content` plus one embed (title = rule, linked to the explorer; fields for contract, transaction, amount, fee, functions, Horizon). Mentions are disabled, so a label can never ping `@everyone`. Red for `TransactionFailed` / `AdminFunctionCalled`, blue otherwise; green with a "✅ Resolved" title for recovery alerts. |
-| `pagerduty` | [PagerDuty Events API v2](https://developer.pagerduty.com/docs/events-api-v2/trigger-events/) (`https://events.pagerduty.com/v2/enqueue`) | A `trigger` event with the destination's `routing_key` and `dedup_key` = the alert's `alert_id`, so redelivering the same alert updates one incident instead of opening a new one. Severity: `error` for `TransactionFailed`, `critical` for `AdminFunctionCalled`, `warning` otherwise. The full alert is attached as `payload.custom_details`. |
+| `pagerduty` | [PagerDuty Events API v2](https://developer.pagerduty.com/docs/events-api-v2/trigger-events/) (`https://events.pagerduty.com/v2/enqueue`) | A `trigger` event with the destination's `routing_key` and `dedup_key` = the alert's `alert_id`, so redelivering the same alert updates one incident instead of opening a new one. Severity: `error` for `TransactionFailed`, `critical` for `AdminFunctionCalled`, `warning` otherwise. `payload.summary` is truncated to PagerDuty's 1024-character limit (with a trailing `…`), and `source` and `custom_details` are capped in size. `payload.custom_details` carries the alert context: `alert_id`, `rule_type`, `severity`, `source_account`, `fee_account`, `memo`, `ledger`, `matched_events`, `suppressed_count`, `observed_count`, `resolved`, `enrichment_incomplete`, plus rule, label, network, transaction hash, links, amount, fee and function names; fields whose value is `null` are omitted. |
 | `teams`     | [Microsoft Teams](https://learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook) Incoming Webhook or Workflows "When a Teams webhook request is received" | A `message` with one [Adaptive Card](https://adaptivecards.io) (v1.4): a headline coloured by severity (green when resolved), a fact set with contract, transaction, the same details as Slack and time, plus *Explorer* and *Horizon* buttons. Batched delivery sends one card listing every alert. |
-| `template`  | Any HTTP endpoint | The destination's `template` (or the contents of `template_file`), rendered with [minijinja](https://docs.rs/minijinja). See [Body templates](#body-templates). |
+| `template`  | Any HTTP endpoint | The destination's `template` (or the contents of `template_file`), rendered with [minijinja](https://docs.rs/minijinja). The request `Content-Type` is the destination's `content_type` (default `application/json`). See [Body templates](#body-templates). |
 
 Example Slack body:
 
@@ -321,16 +324,37 @@ load). Templates are checked for syntax errors when the config is loaded.
 
 Every field of the [webhook payload](#webhook-payload) is available as a variable (`label`,
 `contract_id`, `network`, `rule_type`, `rule_triggered`, `severity`, `transaction_hash`,
-`amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Values are
-JSON-escaped and quoted automatically, so write `{{ label }}`, not `"{{ label }}"`. Referencing an
+`amount_xlm`, `explorer_link`, `horizon_link`, `timestamp_iso`, `alert_id`, ...). Referencing an
 unknown variable fails the delivery. The engine is sandboxed: templates cannot read files or make
 network requests.
+
+The request's `Content-Type` is set by the optional `content_type` field, which is valid only with
+`format = "template"` (setting it on any other format is rejected). It defaults to
+`application/json`. When the content type is a JSON type (`application/json`, or any `…+json`
+type), values are JSON-escaped and quoted automatically, so write `{{ label }}`, not
+`"{{ label }}"`. For any other content type (for example `application/x-www-form-urlencoded`,
+`text/plain` or `application/xml`) values are rendered as plain text without escaping or quotes,
+so add your own quoting or encoding as the receiver requires.
 
 ```toml
   [[contracts.webhooks]]
   url      = "https://chat.example.com/hooks/abc"
   format   = "template"
   template = '{"text": {{ rule_triggered }}, "contract": {{ label }}, "link": {{ explorer_link }}}'
+
+  # Form-encoded endpoint
+  [[contracts.webhooks]]
+  url          = "https://forms.example.com/submit"
+  format       = "template"
+  content_type = "application/x-www-form-urlencoded"
+  template     = 'alert={{ rule_triggered }}&contract={{ label }}&tx={{ transaction_hash }}'
+
+  # Plain-text chat bridge
+  [[contracts.webhooks]]
+  url          = "https://bridge.example.com/message"
+  format       = "template"
+  content_type = "text/plain"
+  template     = '{{ rule_triggered }} on {{ label }} ({{ network }}): {{ explorer_link }}'
 ```
 
 ### Custom headers
@@ -350,7 +374,8 @@ webhook_headers = { "Authorization" = "Bearer ${ALERTS_API_TOKEN}", "X-Api-Key" 
 - Header values support [environment interpolation](#environment-variable-interpolation), which
   keeps tokens out of the config file and out of the URL (where they would end up in logs).
 - `Content-Type`, `Content-Length` and any `X-TxWatch-*` header are reserved and rejected, as are
-  names that are not valid HTTP header names and values containing control characters.
+  names that are not valid HTTP header names and values containing control characters. To send a
+  non-JSON body, use `format = "template"` with `content_type` (see [Body templates](#body-templates)).
 - Header values are never logged, and `txwatch validate` (text and JSON) prints them as
   `<redacted>`. Validation errors name the header, never its value.
 

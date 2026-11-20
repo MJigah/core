@@ -10,10 +10,69 @@
 //! - `teams`: a Microsoft Teams Incoming Webhook / Workflows message carrying
 //!   one Adaptive Card.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use txwatch_config::WebhookFormat;
 use txwatch_rules::AlertPayload;
+
+/// Content type used when a template destination does not set one.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/json";
+
+/// A rendered request body together with the `Content-Type` the receiver
+/// expects. Callers set the header from `content_type`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedBody {
+    pub body: String,
+    pub content_type: String,
+}
+
+/// Compiled templates, keyed by template source, built once per config
+/// generation. Cloning is cheap (the environments are shared).
+#[derive(Debug, Clone, Default)]
+pub struct TemplateCache {
+    compiled: Arc<Mutex<HashMap<String, Arc<minijinja::Environment<'static>>>>>,
+}
+
+impl TemplateCache {
+    /// Creates an empty cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compiles `template` (if not already cached) and returns the shared
+    /// environment. The environment is configured for strict undefined
+    /// behaviour; auto-escaping is chosen per render.
+    pub fn get(&self, template: &str) -> Result<Arc<minijinja::Environment<'static>>> {
+        if let Some(env) = self
+            .compiled
+            .lock()
+            .map_err(|_| anyhow!("template cache poisoned"))?
+            .get(template)
+            .cloned()
+        {
+            return Ok(env);
+        }
+        let mut env = minijinja::Environment::new();
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.add_template_owned("body", template.to_owned())?;
+        let env = Arc::new(env);
+        self.compiled
+            .lock()
+            .map_err(|_| anyhow!("template cache poisoned"))?
+            .insert(template.to_owned(), env.clone());
+        Ok(env)
+    }
+}
+
+/// Process-wide fallback cache for callers that do not thread a
+/// [`TemplateCache`] through (e.g. ad-hoc rendering).
+fn fallback_cache() -> &'static TemplateCache {
+    static CACHE: OnceLock<TemplateCache> = OnceLock::new();
+    CACHE.get_or_init(TemplateCache::new)
+}
 
 /// Renders the request body for `format`. `routing_key` is required for
 /// PagerDuty and ignored otherwise.
@@ -23,13 +82,42 @@ pub fn render_body(
     routing_key: Option<&str>,
     template: Option<&str>,
 ) -> Result<String> {
+    Ok(render_body_with_content_type(
+        format,
+        payload,
+        routing_key,
+        template,
+        None,
+        None,
+    )?
+    .body)
+}
+
+/// Renders the request body for `format` and returns the content type the
+/// receiver expects. `content_type` only applies to `format = "template"` and
+/// defaults to [`DEFAULT_CONTENT_TYPE`]. `cache` is used to reuse compiled
+/// templates; when `None` a process-wide fallback cache is used.
+pub fn render_body_with_content_type(
+    format: WebhookFormat,
+    payload: &AlertPayload,
+    routing_key: Option<&str>,
+    template: Option<&str>,
+    content_type: Option<&str>,
+    cache: Option<&TemplateCache>,
+) -> Result<RenderedBody> {
+    if format == WebhookFormat::Template {
+        let template =
+            template.ok_or_else(|| anyhow!("template destinations need a template"))?;
+        let content_type = content_type.unwrap_or(DEFAULT_CONTENT_TYPE);
+        let cache = cache.unwrap_or_else(|| fallback_cache());
+        let body = render_template(template, payload, content_type, cache)?;
+        return Ok(RenderedBody {
+            body,
+            content_type: content_type.to_owned(),
+        });
+    }
     let body = match format {
-        WebhookFormat::Template => {
-            return render_template(
-                template.ok_or_else(|| anyhow!("template destinations need a template"))?,
-                payload,
-            )
-        }
+        WebhookFormat::Template => unreachable!("handled above"),
         WebhookFormat::Txwatch => serde_json::to_value(payload)?,
         WebhookFormat::Slack => slack(payload),
         WebhookFormat::Discord => discord(payload),
@@ -39,20 +127,46 @@ pub fn render_body(
             routing_key.ok_or_else(|| anyhow!("PagerDuty destinations need a routing_key"))?,
         ),
     };
-    Ok(serde_json::to_string(&body)?)
+    Ok(RenderedBody {
+        body: serde_json::to_string(&body)?,
+        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+    })
 }
 
 /// Renders a user-defined body template. Every [`AlertPayload`] field is a
-/// variable, and values are JSON-escaped, so `{"text": {{ label }}}` yields
-/// `{"text": "My Contract"}`. The engine is sandboxed: no file or network access.
-fn render_template(template: &str, payload: &AlertPayload) -> Result<String> {
-    let mut env = minijinja::Environment::new();
-    env.set_auto_escape_callback(|_| minijinja::AutoEscape::Json);
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-    env.add_template("body", template)?;
-    Ok(env
-        .get_template("body")?
-        .render(minijinja::Value::from_serialize(payload))?)
+/// variable. When `content_type` is JSON, values are JSON-escaped, so
+/// `{"text": {{ label }}}` yields `{"text": "My Contract"}`; for any other
+/// content type values are rendered verbatim. The engine is sandboxed: no file
+/// or network access. The compiled template is looked up in `cache`.
+fn render_template(
+    template: &str,
+    payload: &AlertPayload,
+    content_type: &str,
+    cache: &TemplateCache,
+) -> Result<String> {
+    let env = cache.get(template)?;
+    let json_escape = is_json_content_type(content_type);
+    Ok(env.get_template("body")?.render_with_auto_escape(
+        minijinja::Value::from_serialize(payload),
+        move |_| {
+            if json_escape {
+                minijinja::AutoEscape::Json
+            } else {
+                minijinja::AutoEscape::None
+            }
+        },
+    )?)
+}
+
+/// Whether `content_type` denotes JSON (ignoring parameters like `charset`).
+fn is_json_content_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json" || essence.ends_with("+json")
 }
 
 /// One-line summary shared by the chat formats. A recovery notification
@@ -624,29 +738,78 @@ fn pagerduty_severity(p: &AlertPayload) -> &'static str {
     }
 }
 
+/// PagerDuty Events API v2 caps `payload.summary` at 1024 characters.
+const PAGERDUTY_SUMMARY_MAX: usize = 1024;
+/// PagerDuty Events API v2 caps `payload.source` at 1024 characters.
+const PAGERDUTY_SOURCE_MAX: usize = 1024;
+/// PagerDuty Events API v2 caps the serialised `custom_details` at 32 KiB.
+const PAGERDUTY_CUSTOM_DETAILS_MAX: usize = 32 * 1024;
+
 /// PagerDuty Events API v2 `trigger` event. The full alert is attached as
 /// `payload.custom_details`.
 pub fn pagerduty(p: &AlertPayload, routing_key: &str) -> Value {
+    let mut custom_details = serde_json::Map::new();
+    let mut insert = |key: &str, value: Value| {
+        if !value.is_null() {
+            custom_details.insert(key.to_owned(), value);
+        }
+    };
+    insert("alert_id", json!(p.alert_id));
+    insert("rule_type", json!(p.rule_type));
+    insert("rule_triggered", json!(p.rule_triggered));
+    insert("label", json!(p.label));
+    insert("network", json!(p.network));
+    insert("severity", json!(p.severity));
+    insert("transaction_hash", json!(p.transaction_hash));
+    insert("explorer_link", json!(p.explorer_link));
+    insert("horizon_link", json!(p.horizon_link));
+    insert("source_account", json!(p.source_account));
+    insert("fee_account", json!(p.fee_account));
+    insert("memo", json!(p.memo));
+    insert("memo_type", json!(p.memo_type));
+    insert("ledger", json!(p.ledger));
+    insert("amount_xlm_decimal", json!(p.amount_xlm_decimal));
+    insert("fee_charged_stroops", json!(p.fee_charged_stroops));
+    insert("function_names", json!(p.function_names));
+    insert("matched_events", json!(p.matched_events));
+    insert("suppressed_count", json!(p.suppressed_count));
+    insert("observed_count", json!(p.observed_count));
+    insert("resolved", json!(p.resolved));
+    insert("enrichment_incomplete", json!(p.enrichment_incomplete));
+
+    // Keep the serialised details under the API's size cap by dropping the
+    // largest values (matched_events first) until it fits.
+    let mut custom_details = Value::Object(custom_details);
+    while serde_json::to_string(&custom_details)
+        .map(|s| s.len())
+        .unwrap_or(0)
+        > PAGERDUTY_CUSTOM_DETAILS_MAX
+    {
+        let Some(obj) = custom_details.as_object_mut() else {
+            break;
+        };
+        let largest = obj
+            .iter()
+            .max_by_key(|(_, v)| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .map(|(k, _)| k.clone());
+        match largest {
+            Some(key) => {
+                obj.remove(&key);
+            }
+            None => break,
+        }
+    }
+
     json!({
         "routing_key": routing_key,
         "event_action": "trigger",
         "dedup_key": p.alert_id,
         "payload": {
-            "summary": headline(p),
-            "source": p.contract_id,
+            "summary": truncate(&headline(p), PAGERDUTY_SUMMARY_MAX),
+            "source": truncate(&p.contract_id, PAGERDUTY_SOURCE_MAX),
             "severity": pagerduty_severity(p),
             "timestamp": p.timestamp_iso,
-            "custom_details": {
-                "rule_triggered": p.rule_triggered,
-                "label": p.label,
-                "network": p.network,
-                "transaction_hash": p.transaction_hash,
-                "explorer_link": p.explorer_link,
-                "horizon_link": p.horizon_link,
-                "amount_xlm_decimal": p.amount_xlm_decimal,
-                "fee_charged_stroops": p.fee_charged_stroops,
-                "function_names": p.function_names,
-            },
+            "custom_details": custom_details,
         },
     })
 }
@@ -793,6 +956,45 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["text"], p.label);
         assert_eq!(v["tx"], p.transaction_hash);
+    }
+
+    #[test]
+    fn template_content_type_defaults_to_json() {
+        let rendered = render_body_with_content_type(
+            WebhookFormat::Template,
+            &fixture(),
+            None,
+            Some(r#"{"text": {{ label }}}"#),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rendered.content_type, "application/json");
+    }
+
+    #[test]
+    fn template_content_type_disables_json_escaping() {
+        let mut p = fixture();
+        p.label = "Quote \" and \\ backslash".into();
+        let rendered = render_body_with_content_type(
+            WebhookFormat::Template,
+            &p,
+            None,
+            Some("label={{ label }}"),
+            Some("text/plain"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(rendered.content_type, "text/plain");
+        assert_eq!(rendered.body, format!("label={}", p.label));
+    }
+
+    #[test]
+    fn template_cache_reuses_compiled_environment() {
+        let cache = TemplateCache::new();
+        let first = cache.get("{{ label }}").unwrap();
+        let second = cache.get("{{ label }}").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
@@ -1118,5 +1320,41 @@ mod tests {
             pd["payload"]["summary"].as_str().unwrap().chars().count(),
             1024
         );
+    }
+
+    #[test]
+    fn pagerduty_truncates_oversized_summary() {
+        let mut p = fixture();
+        p.label = "G".repeat(5000);
+        let pd = render(WebhookFormat::Pagerduty, &p);
+        let summary = pd["payload"]["summary"].as_str().unwrap();
+        assert_eq!(summary.chars().count(), 1024);
+        assert!(summary.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn pagerduty_custom_details_include_all_non_null_fields() {
+        let mut p = fixture();
+        p.severity = Some("critical".into());
+        p.source_account = Some("GSOURCE".into());
+        p.fee_account = Some("GFEE".into());
+        p.memo = Some("invoice-7".into());
+        p.ledger = Some(42);
+        p.suppressed_count = 3;
+        p.resolved = true;
+        p.enrichment_incomplete = true;
+        let pd = render(WebhookFormat::Pagerduty, &p);
+        let details = &pd["payload"]["custom_details"];
+        assert_eq!(details["alert_id"], p.alert_id);
+        assert_eq!(details["rule_type"], "LargeTransfer");
+        assert_eq!(details["severity"], "critical");
+        assert_eq!(details["source_account"], "GSOURCE");
+        assert_eq!(details["fee_account"], "GFEE");
+        assert_eq!(details["memo"], "invoice-7");
+        assert_eq!(details["ledger"], 42);
+        assert_eq!(details["suppressed_count"], 3);
+        assert_eq!(details["resolved"], true);
+        assert_eq!(details["enrichment_incomplete"], true);
+        assert!(details.get("observed_count").is_none());
     }
 }

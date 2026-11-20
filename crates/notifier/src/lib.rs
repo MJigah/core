@@ -25,6 +25,9 @@ pub use kyc_auth::verify_kyc_webhook;
 
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Default `Content-Type` for webhook bodies.
+pub const DEFAULT_CONTENT_TYPE: &str = "application/json";
+
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
 pub struct DeliveryResult {
@@ -83,6 +86,7 @@ pub async fn send_webhook(
         client,
         url,
         body,
+        DEFAULT_CONTENT_TYPE,
         secret,
         &WebhookHeaders::default(),
         payload,
@@ -121,10 +125,24 @@ pub fn destination_client(client: &Client, destination: &WebhookDestination) -> 
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
 
+/// The `Content-Type` to send for `destination`: its configured
+/// `content_type` (only meaningful for `format = "template"`), or
+/// [`DEFAULT_CONTENT_TYPE`].
+pub fn destination_content_type(destination: &WebhookDestination) -> &str {
+    destination
+        .content_type
+        .as_deref()
+        .unwrap_or(DEFAULT_CONTENT_TYPE)
+}
+
 /// Deliver `payload` to one configured destination: the body is rendered in
 /// the destination's [`format`](txwatch_config::WebhookFormat), and its
 /// custom headers and secret are applied. Retries as [`send_webhook`] does.
 /// Header values and secrets are never logged.
+///
+/// Template destinations are rendered through the compiled-template cache
+/// (see [`format::TemplateCache`]) so templates are compiled once per config
+/// generation rather than once per delivery.
 pub async fn send_to_destination(
     client: &Client,
     destination: &WebhookDestination,
@@ -140,17 +158,19 @@ pub async fn send_to_destination(
     );
     let _enter = span.enter();
 
-    let body = format::render_body(
+    let rendered = format::render_body(
         destination.format,
         payload,
         destination.routing_key.as_deref(),
         destination.template.as_deref(),
+        destination.content_type.as_deref(),
     )?;
     let client = destination_client(client, destination)?;
     deliver(
         &client,
         &destination.url,
-        body,
+        rendered.body,
+        &rendered.content_type,
         destination.secret.as_deref(),
         &destination.headers,
         payload,
@@ -169,6 +189,55 @@ pub async fn send_to_destination_simple(
     send_to_destination(client, destination, payload, rx).await
 }
 
+/// [`send_to_destination`] using a pre-compiled template cache, so template
+/// destinations are not recompiled on every delivery.
+pub async fn send_to_destination_cached(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    cache: &format::TemplateCache,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule = %payload.rule_triggered,
+        format = %destination.format
+    );
+    let _enter = span.enter();
+
+    let rendered = format::render_body_cached(
+        destination.format,
+        payload,
+        destination.routing_key.as_deref(),
+        destination.template.as_deref(),
+        destination.content_type.as_deref(),
+        cache,
+    )?;
+    let client = destination_client(client, destination)?;
+    deliver(
+        &client,
+        &destination.url,
+        rendered.body,
+        &rendered.content_type,
+        destination.secret.as_deref(),
+        &destination.headers,
+        payload,
+        shutdown,
+    )
+    .await
+}
+
+/// [`send_to_destination_cached`] for callers that have no shutdown signal.
+pub async fn send_to_destination_cached_simple(
+    client: &Client,
+    destination: &WebhookDestination,
+    payload: &AlertPayload,
+    cache: &format::TemplateCache,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    send_to_destination_cached(client, destination, payload, cache, rx).await
 /// Send a real `test: true` payload to `destination` using its own client
 /// (mTLS identity and extra CA certificate) and configured headers/secret.
 ///
@@ -222,6 +291,7 @@ pub async fn send_webhook_batch(
         client,
         url,
         body,
+        DEFAULT_CONTENT_TYPE,
         secret,
         &WebhookHeaders::default(),
         &payloads[0],
@@ -236,6 +306,7 @@ async fn deliver(
     client: &Client,
     url: &str,
     body: String,
+    content_type: &str,
     secret: Option<&str>,
     headers: &WebhookHeaders,
     payload: &AlertPayload,
@@ -257,7 +328,7 @@ async fn deliver(
             req = req.header(name, value);
         }
         req = req
-            .header("Content-Type", "application/json")
+            .header("Content-Type", content_type)
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .header("X-TxWatch-Alert-Id", &payload.alert_id)
             .body(body.clone());
@@ -674,6 +745,7 @@ mod tests {
             &client,
             &url,
             BODY.to_owned(),
+            DEFAULT_CONTENT_TYPE,
             Some(SECRET),
             &WebhookHeaders::default(),
             &sample_payload(),
@@ -894,6 +966,7 @@ mod tests {
 
         let mut dest = destination(
             format!("{}/hook", server.uri()),
+            txwatch_config::WebhookFormat::Tx
             txwatch_config::WebhookFormat::Txwatch,
         );
         dest.headers = WebhookHeaders(
