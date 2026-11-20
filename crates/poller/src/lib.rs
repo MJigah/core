@@ -1643,6 +1643,9 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                     SorobanDetails::default()
                 }
             };
+            // Issue #400: the transaction-level amount is the sum of every
+            // contract leg; `LargeTransfer` payloads are re-derived from the
+            // rule's direction below.
             let amount_stroops = details
                 .contract_transfers
                 .iter()
@@ -1722,6 +1725,10 @@ async fn poll_contract<S: TransactionSource + ?Sized>(
                 &enriched,
                 chrono::Utc::now(),
             ));
+            // Issue #400: a `LargeTransfer` payload must report the amount that
+            // actually triggered the rule (the configured direction), not the
+            // sum of every in and out leg. The breakdown is attached too.
+            apply_large_transfer_amounts(&contract.contract_id, &contract.rules, &mut payloads);
 
             if payloads.is_empty() {
                 debug!(contract = %contract.label, tx = %tx_hash,
@@ -2065,11 +2072,73 @@ pub async fn replay_transaction(
         enriched = enriched.with_events(events);
     }
 
-    Ok(evaluate_contract(
+    let mut payloads = evaluate_contract(
         contract,
         contract.network.horizon_base_url(),
         &enriched,
-    ))
+    );
+    // Issue #400: keep replay payloads consistent with the live poll path.
+    apply_large_transfer_amounts(&contract.contract_id, &contract.rules, &mut payloads);
+    Ok(payloads)
+}
+
+/// Sum of the contract's transfers in `direction` (`"in"` or `"out"`).
+///
+/// Issue #400: `LargeTransfer` alerts are evaluated per direction, so the
+/// payload must report the amount that fired the rule rather than the sum of
+/// every in and out leg.
+pub fn contract_amount_stroops(
+    transfers: &[txwatch_rules::ContractTransfer],
+    contract_id: &str,
+    direction: &str,
+) -> u64 {
+    transfers
+        .iter()
+        .filter(|t| match direction {
+            "in" => t.to == contract_id,
+            "out" => t.from == contract_id,
+            _ => false,
+        })
+        .map(|t| t.amount_stroops)
+        .fold(0u64, |acc, amount| acc.saturating_add(amount))
+}
+
+/// Rewrites the amount fields of every `LargeTransfer` payload in `payloads`
+/// from the rule's configured direction, and fills in the in/out breakdown.
+///
+/// Shared by the live poll path and `txwatch replay` so both report the same
+/// numbers.
+pub fn apply_large_transfer_amounts(
+    contract_id: &str,
+    rules: &[txwatch_config::AlertRuleConfig],
+    payloads: &mut [txwatch_rules::AlertPayload],
+) {
+    for payload in payloads.iter_mut() {
+        if payload.rule_type != "LargeTransfer" {
+            continue;
+        }
+        let Some(rule) = rules
+            .iter()
+            .find(|r| r.name == payload.rule_triggered)
+            .map(|r| &r.rule)
+        else {
+            continue;
+        };
+        let txwatch_config::AlertRule::LargeTransfer {
+            direction,
+            threshold_xlm: _,
+        } = rule
+        else {
+            continue;
+        };
+        let transfers = payload.contract_transfers.as_deref().unwrap_or(&[]);
+        let amount_in = contract_amount_stroops(transfers, contract_id, "in");
+        let amount_out = contract_amount_stroops(transfers, contract_id, "out");
+        let direction = direction.as_str();
+        payload.amount_stroops = Some(contract_amount_stroops(transfers, contract_id, direction));
+        payload.amount_in_stroops = Some(amount_in);
+        payload.amount_out_stroops = Some(amount_out);
+    }
 }
 
 /// Runs the contract's rules against `tx`, linking to `horizon_base`.
@@ -4487,6 +4556,27 @@ mod amount_and_cursor_tests {
             ]
         );
         assert_eq!(total(&details), Some(50_000_000));
+    }
+
+    /// Issue #400: a `LargeTransfer` alert reports the amount in the rule's
+    /// direction, not the sum of every in and out leg.
+    #[test]
+    fn large_transfer_amount_follows_the_rule_direction() {
+        let transfers = vec![
+            txwatch_rules::ContractTransfer {
+                from: String::new(),
+                to: ID.to_string(),
+                amount_stroops: 10_000_000_000,
+            },
+            txwatch_rules::ContractTransfer {
+                from: ID.to_string(),
+                to: String::new(),
+                amount_stroops: 9_000_000_000,
+            },
+        ];
+        assert_eq!(contract_amount_stroops(&transfers, ID, "in"), 10_000_000_000);
+        assert_eq!(contract_amount_stroops(&transfers, ID, "out"), 9_000_000_000);
+        assert_eq!(contract_amount_stroops(&transfers, ID, "both"), 0);
     }
 
     /// Issue #265: an upgrade through `update_current_contract_wasm` is

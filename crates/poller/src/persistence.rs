@@ -14,8 +14,9 @@ pub struct StateDocument {
     pub cursors: HashMap<String, String>,
     #[serde(default)]
     pub cooldowns: HashMap<String, CooldownTracker>,
+    /// NoActivity states keyed by contract name, then by stable rule identity.
     #[serde(default)]
-    pub no_activity: HashMap<String, Vec<NoActivityState>>,
+    pub no_activity: HashMap<String, HashMap<String, NoActivityState>>,
 }
 
 impl StateDocument {
@@ -30,7 +31,7 @@ impl StateDocument {
     pub fn from_parts(
         cursors: HashMap<String, String>,
         cooldowns: HashMap<String, CooldownTracker>,
-        no_activity: HashMap<String, Vec<NoActivityState>>,
+        no_activity: HashMap<String, HashMap<String, NoActivityState>>,
     ) -> Self {
         Self {
             cursors,
@@ -75,13 +76,38 @@ pub fn load_state(cfg: &AppConfig) -> StateDocument {
     let Ok(content) = fs::read_to_string(path) else {
         return StateDocument::default();
     };
-    if let Ok(doc) = serde_json::from_str::<StateDocument>(&content) {
-        return doc;
+    let doc = if let Ok(doc) = serde_json::from_str::<StateDocument>(&content) {
+        doc
+    } else if let Ok(cursors) = serde_json::from_str::<HashMap<String, String>>(&content) {
+        StateDocument::from_cursors(cursors)
+    } else {
+        StateDocument::default()
+    };
+    prune_state(cfg, doc)
+}
+
+/// Prune persisted tracker entries whose rule no longer exists in the config.
+pub fn prune_state(cfg: &AppConfig, mut doc: StateDocument) -> StateDocument {
+    let mut valid_contracts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut valid_rule_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for contract in &cfg.contracts {
+        valid_contracts.insert(contract.name.clone());
+        for rule in &contract.rules {
+            valid_rule_hashes.insert(txwatch_rules::rule_identity(rule));
+        }
     }
-    if let Ok(cursors) = serde_json::from_str::<HashMap<String, String>>(&content) {
-        return StateDocument::from_cursors(cursors);
-    }
-    StateDocument::default()
+
+    doc.cooldowns.retain(|key, _| valid_contracts.contains(key));
+
+    doc.no_activity.retain(|contract, states| {
+        if !valid_contracts.contains(contract) {
+            return false;
+        }
+        states.retain(|hash, _| valid_rule_hashes.contains(hash));
+        !states.is_empty()
+    });
+
+    doc
 }
 
 pub fn save_state(cfg: &AppConfig, doc: &StateDocument) -> Result<()> {
@@ -132,7 +158,7 @@ pub struct StateUpdate {
     pub cursor_key: String,
     pub cursor: String,
     pub cooldowns: CooldownTracker,
-    pub no_activity: Vec<NoActivityState>,
+    pub no_activity: HashMap<String, NoActivityState>,
 }
 
 #[derive(Clone)]
