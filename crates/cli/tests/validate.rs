@@ -698,6 +698,50 @@ fn validate_json_with_check_horizon_produces_valid_json() {
     );
 }
 
+/// #399: a disabled nested rule must still be validated, so an invalid
+/// `LargeTransfer { threshold_xlm = 0 }` inside a disabled `All` rule fails
+/// `txwatch validate` instead of silently passing.
+#[test]
+fn validate_rejects_invalid_disabled_nested_rule() {
+    const DISABLED_NESTED_CONFIG: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type    = "All"
+  enabled = false
+
+    [[contracts.rules.rules]]
+    type          = "LargeTransfer"
+    threshold_xlm = 0
+"#;
+
+    let path = env::temp_dir().join("txwatch_validate_disabled_nested_test.toml");
+    fs::write(&path, DISABLED_NESTED_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 for invalid disabled nested rule"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LargeTransfer threshold_xlm must be > 0"),
+        "expected nested LargeTransfer threshold error in:\n{}",
+        stderr
+    );
+}
+
 /// Verify that clap no longer treats --format json + --check-webhooks as conflicting.
 /// This is a regression test for issue #226.
 #[test]

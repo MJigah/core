@@ -1340,9 +1340,11 @@ impl RuleEntry {
                 );
             }
         }
-        if self.enabled {
-            self.rule.validate_at_depth(contract_label, depth)?;
-        }
+        // Validate the rule itself regardless of `enabled`: a disabled rule that
+        // is invalid would otherwise only fail when someone flips `enabled = true`
+        // during an incident (and `LargeTransfer` would run with a zero threshold
+        // because the stroop pre-computation never ran).
+        self.rule.validate_at_depth(contract_label, depth)?;
         Ok(())
     }
 }

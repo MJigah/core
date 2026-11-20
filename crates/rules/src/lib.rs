@@ -1251,8 +1251,16 @@ fn rule_label(rule: &AlertRule) -> String {
     match rule {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm, .. } => {
-            format!("LargeTransfer(>={}XLM)", threshold_xlm)
+        AlertRule::LargeTransfer {
+            threshold_xlm,
+            direction,
+            ..
+        } => {
+            if direction == "any" {
+                format!("LargeTransfer(>={}XLM)", threshold_xlm)
+            } else {
+                format!("LargeTransfer({}>={}XLM)", direction, threshold_xlm)
+            }
         }
         // #266: argument matchers are part of the label (see AlertRule::label).
         AlertRule::FunctionCalled { args, .. } if !args.is_empty() => rule.label(),
@@ -1653,6 +1661,14 @@ impl CooldownTracker {
         }
     }
 
+    /// Drop every entry whose `(contract, rule)` key is not present in
+    /// `keys` (issue #401). Called after a config reload so renamed rules,
+    /// removed contracts and stale labels do not accumulate in the persisted
+    /// state document.
+    pub fn prune(&mut self, keys: &std::collections::HashSet<(String, String)>) {
+        self.state.retain(|k, _| keys.contains(k));
+    }
+
     /// Check for any rules where the cooldown window has expired and
     /// `suppressed > 0` with `cooldown_summary = true`.
     /// Emits a summary alert payload for each such rule and resets `suppressed` to 0.
@@ -1825,6 +1841,11 @@ impl RateTracker {
             {
                 hits.pop_front();
             }
+            // #401: never keep more than `count` timestamps per rule.
+            let cap = usize::try_from(*count).unwrap_or(usize::MAX).max(1);
+            while hits.len() > cap {
+                hits.pop_front();
+            }
             let observed = hits.len() as u64;
             if observed < *count {
                 continue;
@@ -1846,6 +1867,12 @@ impl RateTracker {
             }
         }
         out
+    }
+
+    /// Drop every entry whose `(contract, rule)` key is not present in
+    /// `keys` (issue #401).
+    pub fn prune(&mut self, keys: &std::collections::HashSet<(String, String)>) {
+        self.hits.retain(|k, _| keys.contains(k));
     }
 }
 
@@ -4126,6 +4153,51 @@ mod suppressor_tests {
     }
 
     #[test]
+    fn large_transfer_payload_amount_follows_direction() {
+        // #400: amount_stroops must reflect the direction that fired, not the
+        // sum of every in and out transfer.
+        let mut tx = make_tx(true, &[], None);
+        tx.watched_contract_id = "CWATCHED".into();
+        tx.contract_transfers = vec![
+            ContractTransfer {
+                from: "GUSER".into(),
+                to: "CWATCHED".into(),
+                amount_stroops: 10_000_000_000,
+            },
+            ContractTransfer {
+                from: "CWATCHED".into(),
+                to: "GOTHER".into(),
+                amount_stroops: 9_000_000_000,
+            },
+        ];
+        let rule = |direction: &str| {
+            entry(AlertRule::LargeTransfer {
+                threshold_xlm: 1000,
+                threshold_stroops: 10_000_000_000,
+                direction: direction.into(),
+            })
+        };
+
+        let inbound = run(&[rule("in")], &tx);
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].amount_stroops, Some(10_000_000_000));
+        assert_eq!(inbound[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(inbound[0].amount_out_stroops, Some(9_000_000_000));
+
+        let outbound = run(&[rule("out")], &tx);
+        assert_eq!(outbound.len(), 1);
+        assert_eq!(outbound[0].amount_stroops, Some(9_000_000_000));
+        assert_eq!(outbound[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(outbound[0].amount_out_stroops, Some(9_000_000_000));
+
+        let any = run(&[rule("any")], &tx);
+        assert_eq!(any.len(), 1);
+        assert_eq!(any[0].amount_stroops, Some(19_000_000_000));
+        assert_eq!(any[0].amount_in_stroops, Some(10_000_000_000));
+        assert_eq!(any[0].amount_out_stroops, Some(9_000_000_000));
+    }
+
+    #[test]
     fn large_transfer_filters_by_contract_and_direction() {
         let mut tx = make_tx(true, &[], None);
         tx.watched_contract_id = "CWATCHED".into();
@@ -4448,6 +4520,21 @@ mod suppressor_tests {
         let second = fire(&mut tracker, &rules, &clock);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].rule_type, "TransactionFailed");
+    }
+
+    #[test]
+    fn cooldown_prune_drops_removed_rules() {
+        // #401: reloading with fewer rules must shrink the persisted state.
+        let mut tracker = CooldownTracker::new();
+        let now = TestClock::start().now();
+        assert_eq!(tracker.check("CA", "AnyTransaction", 60, now), Some(0));
+        assert_eq!(tracker.check("CA", "TransactionFailed", 60, now), Some(0));
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(("CA".to_owned(), "AnyTransaction".to_owned()));
+        tracker.prune(&keys);
+        let persisted: Vec<((String, String), CooldownState)> = tracker.into();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].0 .1, "AnyTransaction");
     }
 
     #[test]
